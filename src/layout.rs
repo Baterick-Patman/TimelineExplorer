@@ -238,6 +238,9 @@ pub struct LaneDemand {
     pub rows: usize,
     /// Whether the lane has anything at all in the visible window.
     pub active: bool,
+    /// Deepest chain of visible events nested inside one of this lane's
+    /// events, e.g. an event inside an event inside a range event is 2.
+    pub nested_rows: usize,
 }
 
 /// Height of a lane with nothing in the current window. Kept visible but slim,
@@ -290,6 +293,25 @@ pub const LABEL_ROW_HEIGHT: f32 = 20.0;
 pub const LANE_BOTTOM_PAD: f32 = 10.0;
 /// Never grow a lane beyond this many label rows, however dense the data.
 pub const MAX_LABEL_ROWS: usize = 14;
+/// Height of one row of nested events, stacked below the band.
+pub const NESTED_ROW_HEIGHT: f32 = 15.0;
+/// However deep a hand-edited file nests events, never reserve room for more
+/// than this many rows — a chain that long is unreadable anyway.
+pub const MAX_NESTED_ROWS: usize = 4;
+
+/// Deepest chain of *visible* events nested inside `parent`, or 0 if it has
+/// none. Bounded so a corrupt parent cycle cannot hang the UI.
+pub fn nested_depth(doc: &Document, filters: &Filters, ppy: f64, parent: Id, guard: usize) -> usize {
+    if guard > 64 {
+        return 0;
+    }
+    doc.child_events(parent)
+        .into_iter()
+        .filter(|e| event_visible(e, filters, ppy))
+        .map(|e| 1 + nested_depth(doc, filters, ppy, e.id, guard + 1))
+        .max()
+        .unwrap_or(0)
+}
 
 /// Height a lane needs for the given demand.
 pub fn lane_height(plan: &LanePlan, demand: LaneDemand) -> f32 {
@@ -299,7 +321,8 @@ pub fn lane_height(plan: &LanePlan, demand: LaneDemand) -> f32 {
     if !demand.active {
         return DORMANT_LANE_HEIGHT;
     }
-    demand.rows as f32 * LABEL_ROW_HEIGHT + LABEL_BAND_TOP + plan.thickness + LANE_BOTTOM_PAD
+    let nested = demand.nested_rows.min(MAX_NESTED_ROWS) as f32 * NESTED_ROW_HEIGHT;
+    demand.rows as f32 * LABEL_ROW_HEIGHT + LABEL_BAND_TOP + plan.thickness + nested + LANE_BOTTOM_PAD
 }
 
 /// Which entities' events belong on a lane.
@@ -575,24 +598,33 @@ pub fn band_center_at(
     y as f32
 }
 
-/// Sample a band's centre line across the visible range.
+/// The portion of a timeline's band range that actually falls in view, or
+/// `None` if it is scrolled off entirely.
+pub fn band_visible_range(
+    doc: &Document,
+    tl: &Timeline,
+    view_from: f64,
+    view_to: f64,
+) -> Option<(f64, f64)> {
+    let (lo, hi) = timeline_band_range(doc, tl)?;
+    let from = lo.max(view_from);
+    let to = hi.min(view_to);
+    (to > from).then_some((from, to))
+}
+
+/// Sample a band's centre line across an arbitrary sub-range `[from, to]`.
 ///
 /// Returns screen-space points. Sampling is per-pixel-ish rather than analytic
-/// so the same code handles the straight sections and the curves.
-pub fn band_polyline(
-    doc: &Document,
+/// so the same code handles the straight sections and the curves. Used both
+/// for the whole band and for painting one coloured epoch segment within it.
+pub fn band_curve(
     tl: &Timeline,
     own_center: f32,
     centers: &HashMap<Id, f32>,
     axis: &TimeAxis,
-    view_from: f64,
-    view_to: f64,
+    from: f64,
+    to: f64,
 ) -> Vec<(f32, f32)> {
-    let Some((lo, hi)) = timeline_band_range(doc, tl) else {
-        return Vec::new();
-    };
-    let from = lo.max(view_from);
-    let to = hi.min(view_to);
     if to <= from {
         return Vec::new();
     }
@@ -625,6 +657,65 @@ pub fn band_polyline(
             )
         })
         .collect()
+}
+
+/// Sample a band's centre line across the visible range.
+///
+/// Returns screen-space points. Sampling is per-pixel-ish rather than analytic
+/// so the same code handles the straight sections and the curves.
+pub fn band_polyline(
+    doc: &Document,
+    tl: &Timeline,
+    own_center: f32,
+    centers: &HashMap<Id, f32>,
+    axis: &TimeAxis,
+    view_from: f64,
+    view_to: f64,
+) -> Vec<(f32, f32)> {
+    let Some((from, to)) = band_visible_range(doc, tl, view_from, view_to) else {
+        return Vec::new();
+    };
+    band_curve(tl, own_center, centers, axis, from, to)
+}
+
+/// Coloured sub-ranges to paint along a band within `[from, to]`: the
+/// timeline's own epochs, with every gap between/around them filled by its
+/// base colour so the whole range is always covered by exactly one colour.
+///
+/// Epochs need not be sorted or disjoint on input. Where two overlap, the
+/// later-starting one wins: an earlier epoch's painted end is capped at the
+/// next one's start, regardless of its own configured end date. That makes
+/// the common case — entering each era's start date and a rough, possibly
+/// stale end date — behave the way it reads: "Classical starts in 500 BC"
+/// unambiguously ends the Archaic era there too.
+pub fn band_color_segments(tl: &Timeline, from: f64, to: f64) -> Vec<(f64, f64, Rgb)> {
+    if to <= from {
+        return Vec::new();
+    }
+    let mut epochs: Vec<&Epoch> = tl.epochs.iter().collect();
+    epochs.sort_by(|a, b| a.t0().partial_cmp(&b.t0()).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut segments = Vec::new();
+    let mut cursor = from;
+    for (i, e) in epochs.iter().enumerate() {
+        let mut e1 = e.t1().min(to);
+        if let Some(next) = epochs.get(i + 1) {
+            e1 = e1.min(next.t0());
+        }
+        let e0 = e.t0().max(cursor);
+        if e0 >= to || e1 <= e0 {
+            continue; // Outside the range, or fully swallowed by a neighbour.
+        }
+        if e0 > cursor {
+            segments.push((cursor, e0, tl.color));
+        }
+        segments.push((e0, e1, e.color));
+        cursor = e1;
+    }
+    if cursor < to {
+        segments.push((cursor, to, tl.color));
+    }
+    segments
 }
 
 // --- Label placement --------------------------------------------------------
@@ -807,6 +898,7 @@ mod tests {
             span: Span::point(HDate::year(-44)),
             importance,
             categories: vec![],
+            parent: None,
         }
     }
 
@@ -851,6 +943,7 @@ mod tests {
             origin: None,
             merge: None,
             notes: String::new(),
+            epochs: Vec::new(),
         });
         doc.timelines.push(Timeline {
             id: macedon,
@@ -867,6 +960,7 @@ mod tests {
                 label: "Battle of Pydna".into(),
             }),
             notes: String::new(),
+            epochs: Vec::new(),
         });
         let centers = HashMap::from([(rome, 100.0f32), (macedon, 200.0f32)]);
         (doc, centers)
@@ -926,6 +1020,7 @@ mod tests {
             origin: None,
             merge: None,
             notes: String::new(),
+            epochs: Vec::new(),
         });
         let child_tl = Timeline {
             id: child,
@@ -942,6 +1037,7 @@ mod tests {
             }),
             merge: None,
             notes: String::new(),
+            epochs: Vec::new(),
         };
         doc.timelines.push(child_tl.clone());
         let centers = HashMap::from([(parent, 100.0f32), (child, 220.0f32)]);
@@ -1002,6 +1098,7 @@ mod tests {
             origin: None,
             merge: None,
             notes: String::new(),
+            epochs: Vec::new(),
         });
         assert!(timeline_band_range(&doc, &doc.timelines[0]).is_none());
 
@@ -1014,6 +1111,7 @@ mod tests {
             span: Span::point(HDate::year(-814)),
             importance: 5,
             categories: vec![],
+            parent: None,
         });
         let (lo, hi) = timeline_band_range(&doc, &doc.timelines[0]).unwrap();
         assert!(lo <= -814.0 && hi >= -813.0);
@@ -1037,6 +1135,136 @@ mod tests {
         assert!(pts.windows(2).all(|w| w[1].0 >= w[0].0));
     }
 
+    // --- Epoch colour segments -----------------------------------------------
+
+    fn timeline_with_epochs(epochs: Vec<Epoch>) -> Timeline {
+        Timeline {
+            id: Id(1),
+            name: "Greek antiquity".into(),
+            color: [10, 20, 30],
+            visible: true,
+            group: None,
+            order: 0,
+            span: None,
+            origin: None,
+            merge: None,
+            notes: String::new(),
+            epochs,
+        }
+    }
+
+    fn epoch(name: &str, color: Rgb, start: i32, end: i32) -> Epoch {
+        Epoch {
+            name: name.into(),
+            color,
+            start: HDate::year(start),
+            end: HDate::year(end),
+        }
+    }
+
+    #[test]
+    fn no_epochs_means_one_segment_in_the_base_colour() {
+        let tl = timeline_with_epochs(vec![]);
+        let segs = band_color_segments(&tl, -800.0, -300.0);
+        assert_eq!(segs, vec![(-800.0, -300.0, tl.color)]);
+    }
+
+    #[test]
+    fn epochs_split_the_band_and_fill_the_gaps_with_the_base_colour() {
+        let tl = timeline_with_epochs(vec![
+            epoch("Archaic", [1, 1, 1], -800, -500),
+            epoch("Classical", [2, 2, 2], -500, -323),
+        ]);
+        let segs = band_color_segments(&tl, -800.0, -300.0);
+        // Archaic's own end (500 BC's decimal_end, -499.0) is capped at
+        // Classical's start (500 BC's decimal, -500.0) — the two "500 BC"
+        // boundaries a year-only span produces a year apart otherwise.
+        assert_eq!(
+            segs,
+            vec![
+                (-800.0, -500.0, [1, 1, 1]),
+                (-500.0, -322.0, [2, 2, 2]),
+                (-322.0, -300.0, tl.color),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_epoch_outside_the_range_is_dropped_entirely() {
+        let tl = timeline_with_epochs(vec![epoch("Bronze age", [1, 1, 1], -2000, -1200)]);
+        let segs = band_color_segments(&tl, -800.0, -300.0);
+        assert_eq!(segs, vec![(-800.0, -300.0, tl.color)]);
+    }
+
+    #[test]
+    fn overlapping_epochs_let_the_later_one_win() {
+        // Epochs need not be disjoint or sorted. Archaic is deliberately set
+        // to run well past Classical's own end (-200 vs Classical's -323) —
+        // it must still be cut short right where Classical starts.
+        let tl = timeline_with_epochs(vec![
+            epoch("Classical", [2, 2, 2], -500, -323),
+            epoch("Archaic", [1, 1, 1], -800, -200),
+        ]);
+        let segs = band_color_segments(&tl, -800.0, -300.0);
+        assert_eq!(
+            segs,
+            vec![
+                (-800.0, -500.0, [1, 1, 1]),
+                (-500.0, -322.0, [2, 2, 2]),
+                (-322.0, -300.0, tl.color),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_range_produces_no_segments() {
+        let tl = timeline_with_epochs(vec![epoch("Archaic", [1, 1, 1], -800, -500)]);
+        assert!(band_color_segments(&tl, -300.0, -300.0).is_empty());
+        assert!(band_color_segments(&tl, -300.0, -400.0).is_empty());
+    }
+
+    // --- Nested events -------------------------------------------------------
+
+    fn nested_event(id: Id, parent: Option<Id>, importance: u8) -> Event {
+        Event {
+            id,
+            owner: OwnerRef::Timeline(Id(1)),
+            title: "e".into(),
+            description: String::new(),
+            span: Span::point(HDate::year(-400)),
+            importance,
+            categories: vec![],
+            parent,
+        }
+    }
+
+    #[test]
+    fn an_event_with_no_children_has_zero_nested_depth() {
+        let mut doc = Document::default();
+        doc.events.push(nested_event(Id(1), None, 3));
+        assert_eq!(nested_depth(&doc, &Filters::default(), 2.0, Id(1), 0), 0);
+    }
+
+    #[test]
+    fn nested_depth_counts_the_longest_chain() {
+        let mut doc = Document::default();
+        doc.events.push(nested_event(Id(1), None, 3));
+        doc.events.push(nested_event(Id(2), Some(Id(1)), 3));
+        doc.events.push(nested_event(Id(3), Some(Id(2)), 3));
+        assert_eq!(nested_depth(&doc, &Filters::default(), 2.0, Id(1), 0), 2);
+    }
+
+    #[test]
+    fn nested_depth_ignores_children_hidden_by_filters_or_zoom() {
+        let mut doc = Document::default();
+        doc.events.push(nested_event(Id(1), None, 3));
+        // Importance 1 needs to be zoomed in a long way to survive the
+        // zoom-dependent importance threshold.
+        doc.events.push(nested_event(Id(2), Some(Id(1)), 1));
+        assert_eq!(nested_depth(&doc, &Filters::default(), 0.1, Id(1), 0), 0);
+        assert_eq!(nested_depth(&doc, &Filters::default(), 50.0, Id(1), 0), 1);
+    }
+
     // --- Lanes -------------------------------------------------------------
 
     /// Plan + place with no measured label demand, i.e. minimum lane sizes.
@@ -1045,7 +1273,8 @@ mod tests {
         let demands = vec![
             LaneDemand {
                 rows: 0,
-                active: true
+                active: true,
+                nested_rows: 0,
             };
             plans.len()
         ];
@@ -1053,7 +1282,7 @@ mod tests {
     }
 
     fn demands(n: usize, rows: usize) -> Vec<LaneDemand> {
-        vec![LaneDemand { rows, active: true }; n]
+        vec![LaneDemand { rows, active: true, nested_rows: 0 }; n]
     }
 
     fn lane_doc() -> Document {
@@ -1072,6 +1301,7 @@ mod tests {
                 origin: None,
                 merge: None,
                 notes: String::new(),
+                epochs: Vec::new(),
             });
         }
         let b_inline = doc.new_id();
@@ -1205,6 +1435,7 @@ mod tests {
                 origin: None,
                 merge: None,
                 notes: String::new(),
+                epochs: Vec::new(),
             });
         }
         let rome = doc.new_id();
@@ -1219,6 +1450,7 @@ mod tests {
             origin: None,
             merge: None,
             notes: String::new(),
+            epochs: Vec::new(),
         });
         doc
     }
@@ -1423,7 +1655,7 @@ mod tests {
         let awake = place_lanes(&plans, &demands(plans.len(), 3), 0.0);
         let asleep = place_lanes(
             &plans,
-            &vec![LaneDemand { rows: 3, active: false }; plans.len()],
+            &vec![LaneDemand { rows: 3, active: false, nested_rows: 0 }; plans.len()],
             0.0,
         );
         assert!(asleep[0].bottom - asleep[0].top < awake[0].bottom - awake[0].top);
@@ -1446,6 +1678,7 @@ mod tests {
             span: Span::point(HDate::year(-20)),
             importance: 5,
             categories: vec![],
+            parent: None,
         });
         assert!(lane_active(
             &doc,
@@ -1465,6 +1698,7 @@ mod tests {
             .map(|i| LaneDemand {
                 rows: i * 3,
                 active: i % 2 == 0,
+                nested_rows: 0,
             })
             .collect();
         let lanes = place_lanes(&plans, &rows, 5.0);

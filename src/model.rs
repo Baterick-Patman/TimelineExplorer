@@ -505,6 +505,31 @@ pub struct Group {
     pub notes: String,
 }
 
+/// A colour-coded sub-range within a timeline's band — "Archaic",
+/// "Classical", "Hellenistic" within one Greek-antiquity band, say.
+///
+/// Purely cosmetic: it recolours a stretch of an existing band so eras can be
+/// told apart at a glance, without requiring a separate timeline (and a
+/// merge/origin junction just to mark a change of era).
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Epoch {
+    pub name: String,
+    pub color: Rgb,
+    pub start: HDate,
+    pub end: HDate,
+}
+
+impl Epoch {
+    pub fn t0(&self) -> f64 {
+        self.start.decimal()
+    }
+
+    /// Exclusive end on the continuous axis.
+    pub fn t1(&self) -> f64 {
+        self.end.decimal_end().max(self.start.decimal())
+    }
+}
+
 /// A culture, civilisation, institution — anything with its own band.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Timeline {
@@ -530,6 +555,10 @@ pub struct Timeline {
     pub merge: Option<Junction>,
     #[serde(default)]
     pub notes: String,
+    /// Colour-coded eras drawn along this timeline's own band. Ordered by
+    /// start date is not required; painting sorts them.
+    #[serde(default)]
+    pub epochs: Vec<Epoch>,
 }
 
 fn yes() -> bool {
@@ -622,6 +651,12 @@ pub struct Event {
     pub importance: u8,
     #[serde(default)]
     pub categories: Vec<Id>,
+    /// Another event this one nests under — "Peace of Nicias" inside
+    /// "Peloponnesian War" inside the Classical Antiquity timeline. Nesting
+    /// is otherwise unrelated to `owner`, which still names the timeline or
+    /// biography the whole chain ultimately belongs to.
+    #[serde(default)]
+    pub parent: Option<Id>,
 }
 
 // ---------------------------------------------------------------------------
@@ -940,11 +975,62 @@ impl Document {
         self.events.iter().filter(move |e| e.owner == owner)
     }
 
+    /// Direct children of `parent` — "Peace of Nicias" under "Peloponnesian
+    /// War" — ordered by start date.
+    pub fn child_events(&self, parent: Id) -> Vec<&Event> {
+        let mut v: Vec<&Event> = self.events.iter().filter(|e| e.parent == Some(parent)).collect();
+        v.sort_by(|a, b| a.span.t0().partial_cmp(&b.span.t0()).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    }
+
+    /// Would nesting `event` under `new_parent` make it its own ancestor?
+    ///
+    /// Walks defensively, as with [`Self::would_cycle`]: a hand-edited file
+    /// could contain a parent cycle, and this must terminate rather than hang.
+    pub fn would_cycle_event(&self, event: Id, new_parent: Option<Id>) -> bool {
+        let mut cursor = new_parent;
+        let mut hops = 0;
+        while let Some(id) = cursor {
+            if id == event {
+                return true;
+            }
+            hops += 1;
+            if hops > self.events.len() + 1 {
+                return true;
+            }
+            cursor = self.event(id).and_then(|e| e.parent);
+        }
+        false
+    }
+
+    /// An event whose parent no longer exists has nothing to nest under.
+    fn clear_dangling_event_parents(&mut self) {
+        let ids: BTreeSet<Id> = self.events.iter().map(|e| e.id).collect();
+        for e in &mut self.events {
+            if e.parent.is_some_and(|p| !ids.contains(&p)) {
+                e.parent = None;
+            }
+        }
+    }
+
+    /// Remove an event, lifting its children to its own parent rather than
+    /// deleting them — the same "lift contents up" rule as [`Self::delete_group`].
+    pub fn delete_event(&mut self, id: Id) {
+        let parent = self.event(id).and_then(|e| e.parent);
+        for e in &mut self.events {
+            if e.parent == Some(id) {
+                e.parent = parent;
+            }
+        }
+        self.events.retain(|e| e.id != id);
+    }
+
     /// Remove a timeline along with everything that points at it.
     pub fn delete_timeline(&mut self, id: Id) {
         self.timelines.retain(|t| t.id != id);
         self.events
             .retain(|e| e.owner != OwnerRef::Timeline(id));
+        self.clear_dangling_event_parents();
         for t in &mut self.timelines {
             if t.origin.as_ref().is_some_and(|j| j.other == id) {
                 t.origin = None;
@@ -968,6 +1054,7 @@ impl Document {
         self.biographies.retain(|b| b.id != id);
         self.events
             .retain(|e| e.owner != OwnerRef::Biography(id));
+        self.clear_dangling_event_parents();
     }
 
     pub fn delete_category(&mut self, id: Id) {
@@ -1131,6 +1218,7 @@ mod tests {
             origin: None,
             merge: None,
             notes: String::new(),
+            epochs: Vec::new(),
         });
         doc.timelines.push(Timeline {
             id: b,
@@ -1147,6 +1235,7 @@ mod tests {
                 label: String::new(),
             }),
             notes: String::new(),
+            epochs: Vec::new(),
         });
         let bio = doc.new_id();
         doc.biographies.push(Biography {
@@ -1168,5 +1257,107 @@ mod tests {
         assert_eq!(doc.biography(bio).unwrap().timeline, None);
         // Inline has nothing to nest under any more, so it is promoted.
         assert_eq!(doc.biography(bio).unwrap().display, BioDisplay::Lane);
+    }
+
+    fn make_event(id: Id, owner: OwnerRef, title: &str, start: i32, end: i32) -> Event {
+        Event {
+            id,
+            owner,
+            title: title.into(),
+            description: String::new(),
+            span: Span::range(HDate::year(start), HDate::year(end)),
+            importance: 3,
+            categories: vec![],
+            parent: None,
+        }
+    }
+
+    #[test]
+    fn child_events_are_ordered_by_start_date() {
+        let mut doc = Document::default();
+        let owner = OwnerRef::Timeline(Id(1));
+        let war = doc.new_id();
+        let later = doc.new_id();
+        let earlier = doc.new_id();
+        doc.events.push(make_event(war, owner, "War", -431, -404));
+        doc.events.push({
+            let mut e = make_event(later, owner, "Later treaty", -410, -409);
+            e.parent = Some(war);
+            e
+        });
+        doc.events.push({
+            let mut e = make_event(earlier, owner, "Peace of Nicias", -421, -413);
+            e.parent = Some(war);
+            e
+        });
+        let children: Vec<Id> = doc.child_events(war).iter().map(|e| e.id).collect();
+        assert_eq!(children, vec![earlier, later]);
+    }
+
+    #[test]
+    fn nesting_an_event_under_its_own_descendant_is_a_cycle() {
+        let mut doc = Document::default();
+        let owner = OwnerRef::Timeline(Id(1));
+        let grandparent = doc.new_id();
+        let parent = doc.new_id();
+        doc.events.push(make_event(grandparent, owner, "War", -431, -404));
+        doc.events.push({
+            let mut e = make_event(parent, owner, "Treaty", -421, -413);
+            e.parent = Some(grandparent);
+            e
+        });
+        // Grandparent becoming a child of its own descendant is a cycle...
+        assert!(doc.would_cycle_event(grandparent, Some(parent)));
+        // ...but nesting a fresh event under either of them is fine.
+        let child = doc.new_id();
+        assert!(!doc.would_cycle_event(child, Some(parent)));
+    }
+
+    #[test]
+    fn deleting_an_event_lifts_its_children_up_a_level() {
+        let mut doc = Document::default();
+        let owner = OwnerRef::Timeline(Id(1));
+        let war = doc.new_id();
+        let treaty = doc.new_id();
+        let clause = doc.new_id();
+        doc.events.push(make_event(war, owner, "War", -431, -404));
+        doc.events.push({
+            let mut e = make_event(treaty, owner, "Peace of Nicias", -421, -413);
+            e.parent = Some(war);
+            e
+        });
+        doc.events.push({
+            let mut e = make_event(clause, owner, "Return of Pylos", -421, -421);
+            e.parent = Some(treaty);
+            e
+        });
+
+        doc.delete_event(treaty);
+
+        assert!(doc.event(treaty).is_none());
+        // The clause moves up to the treaty's own parent — the war — rather
+        // than being deleted or left dangling.
+        assert_eq!(doc.event(clause).unwrap().parent, Some(war));
+    }
+
+    #[test]
+    fn deleting_a_timeline_clears_dangling_event_parents() {
+        let mut doc = Document::default();
+        let owner = OwnerRef::Timeline(Id(1));
+        let war = doc.new_id();
+        doc.events.push(make_event(war, owner, "War", -431, -404));
+        let other_owner = OwnerRef::Timeline(Id(2));
+        let orphan = doc.new_id();
+        doc.events.push({
+            // Points at `war` even though it belongs to a different timeline —
+            // pathological, but must not be left dangling after `war` is gone.
+            let mut e = make_event(orphan, other_owner, "Orphan", -420, -410);
+            e.parent = Some(war);
+            e
+        });
+
+        doc.delete_timeline(Id(1));
+
+        assert_eq!(doc.event(orphan).unwrap().parent, None);
     }
 }

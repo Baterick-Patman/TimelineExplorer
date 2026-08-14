@@ -376,9 +376,9 @@ impl TimelineApp {
                 self.info("Biography deleted — Ctrl+Z to undo.");
             }
             Confirm::DeleteEvent(id) => {
-                self.mutate(|d| d.events.retain(|e| e.id != id));
+                self.mutate(|d| d.delete_event(id));
                 self.validate_selection();
-                self.info("Event deleted — Ctrl+Z to undo.");
+                self.info("Event deleted; nested events moved up a level — Ctrl+Z to undo.");
             }
             Confirm::DeleteCategory(id) => {
                 self.mutate(|d| d.delete_category(id));

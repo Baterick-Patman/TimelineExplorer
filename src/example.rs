@@ -85,6 +85,7 @@ pub fn build() -> Document {
         origin: None,
         merge: None,
         notes: "From the expulsion of the kings to the Augustan settlement.".into(),
+        epochs: Vec::new(),
     });
 
     let alexander = doc.new_id();
@@ -102,6 +103,7 @@ pub fn build() -> Document {
         origin: None,
         merge: None,
         notes: "Fragmented among the Diadochi after Alexander's death.".into(),
+        epochs: Vec::new(),
     });
 
     // Three successor kingdoms: they split from Alexander's empire and are
@@ -126,6 +128,7 @@ pub fn build() -> Document {
             label: "Pydna".into(),
         }),
         notes: String::new(),
+        epochs: Vec::new(),
     });
 
     let seleucid = doc.new_id();
@@ -148,6 +151,7 @@ pub fn build() -> Document {
             label: "Annexed by Pompey".into(),
         }),
         notes: String::new(),
+        epochs: Vec::new(),
     });
 
     let ptolemaic = doc.new_id();
@@ -170,6 +174,7 @@ pub fn build() -> Document {
             label: "Death of Cleopatra VII".into(),
         }),
         notes: String::new(),
+        epochs: Vec::new(),
     });
 
     // --- Events ------------------------------------------------------------
@@ -188,6 +193,7 @@ pub fn build() -> Document {
             span,
             importance,
             categories,
+            parent: None,
         });
     };
 
@@ -307,6 +313,7 @@ pub fn build() -> Document {
         origin: None,
         merge: None,
         notes: "Democracy, empire and the tragic stage.".into(),
+        epochs: Vec::new(),
     });
     let sparta = doc.new_id();
     doc.timelines.push(Timeline {
@@ -320,6 +327,7 @@ pub fn build() -> Document {
         origin: None,
         merge: None,
         notes: String::new(),
+        epochs: Vec::new(),
     });
 
     let at = OwnerRef::Timeline(athens);

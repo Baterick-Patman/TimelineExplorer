@@ -16,6 +16,7 @@ enum Action {
     Move(Id, i32),
     SetDisplay(Id, BioDisplay),
     AddEventTo(OwnerRef),
+    AddNestedEventTo(OwnerRef, Id),
     NewGroupUnder(Option<Id>),
 }
 
@@ -59,6 +60,9 @@ fn apply(app: &mut TimelineApp, a: Action) {
             }
         }),
         Action::AddEventTo(owner) => app.dialog = Dialog::Event(EventForm::new(owner)),
+        Action::AddNestedEventTo(owner, parent) => {
+            app.dialog = Dialog::Event(EventForm::new_nested(owner, parent))
+        }
         Action::ToggleGroupVisible(id) => app.mutate(|doc| {
             if let Some(g) = doc.group_mut(id) {
                 g.visible = !g.visible;
@@ -491,6 +495,22 @@ fn event_inspector(app: &TimelineApp, ui: &mut egui::Ui, id: Id, actions: &mut V
     ui.heading(&ev.title);
     ui.add_space(4.0);
     header_row(ui, Selection::Event(id), actions);
+
+    // Nested inside another event: make the containment explicit and
+    // navigable, rather than a fact only visible by hunting through dates.
+    if let Some(parent) = ev.parent.and_then(|p| app.doc.event(p)) {
+        ui.horizontal(|ui| {
+            ui.weak("Nested inside:");
+            if ui.link(&parent.title).clicked() {
+                actions.push(Action::Select(Selection::Event(parent.id)));
+            }
+        });
+    }
+    if ev.span.is_range() {
+        if ui.button("+ Add nested event").clicked() {
+            actions.push(Action::AddNestedEventTo(ev.owner, id));
+        }
+    }
     ui.separator();
 
     field(ui, "Date", ev.span.label());
@@ -501,6 +521,18 @@ fn event_inspector(app: &TimelineApp, ui: &mut egui::Ui, id: Id, actions: &mut V
         ui.add_space(6.0);
         ui.separator();
         ui.label(&ev.description);
+    }
+
+    let children = app.doc.child_events(id);
+    if !children.is_empty() {
+        ui.add_space(6.0);
+        ui.separator();
+        ui.weak(format!("Contains {} nested event(s):", children.len()));
+        for child in children {
+            if ui.link(&child.title).clicked() {
+                actions.push(Action::Select(Selection::Event(child.id)));
+            }
+        }
     }
 }
 
@@ -646,6 +678,7 @@ mod tests {
                 origin: None,
                 merge: None,
                 notes: String::new(),
+                epochs: Vec::new(),
             });
         }
         doc

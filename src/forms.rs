@@ -182,6 +182,9 @@ pub struct EventForm {
     pub is_range: bool,
     pub importance: u8,
     pub categories: BTreeSet<Id>,
+    /// Nests this event inside another range event on the same owner —
+    /// "Peace of Nicias" inside "Peloponnesian War".
+    pub parent: Option<Id>,
 }
 
 impl EventForm {
@@ -196,12 +199,22 @@ impl EventForm {
             is_range: false,
             importance: 3,
             categories: BTreeSet::new(),
+            parent: None,
         }
     }
 
     pub fn new_at(owner: OwnerRef, date: HDate) -> Self {
         Self {
             start_text: date.label(),
+            ..Self::new(owner)
+        }
+    }
+
+    /// Start a new event already nested inside `parent`, e.g. from the
+    /// "+ event" button shown alongside a range event.
+    pub fn new_nested(owner: OwnerRef, parent: Id) -> Self {
+        Self {
+            parent: Some(parent),
             ..Self::new(owner)
         }
     }
@@ -217,8 +230,46 @@ impl EventForm {
             is_range: ev.span.is_range(),
             importance: ev.importance,
             categories: ev.categories.iter().copied().collect(),
+            parent: ev.parent,
         }
     }
+}
+
+/// Choose a parent event to nest under. Only range events belonging to the
+/// same owner are offered, since nesting only makes visual sense within one
+/// band; the event being edited and anything that would make it its own
+/// ancestor are excluded.
+fn event_parent_combo(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    owner: OwnerRef,
+    editing: Option<Id>,
+    value: &mut Option<Id>,
+) {
+    let text = value
+        .and_then(|id| doc.event(id))
+        .map(|e| e.title.clone())
+        .unwrap_or_else(|| "— none (top level) —".into());
+    ui.horizontal(|ui| {
+        ui.label("Nested inside:");
+        egui::ComboBox::from_id_salt("event_parent")
+            .selected_text(text)
+            .width(220.0)
+            .show_ui(ui, |ui| {
+                ui.selectable_value(value, None, "— none (top level) —");
+                for e in doc.events_of(owner) {
+                    if !e.span.is_range() {
+                        continue;
+                    }
+                    if let Some(editing) = editing {
+                        if e.id == editing || doc.would_cycle_event(editing, Some(e.id)) {
+                            continue;
+                        }
+                    }
+                    ui.selectable_value(value, Some(e.id), &e.title);
+                }
+            });
+    });
 }
 
 fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm) -> bool {
@@ -243,6 +294,14 @@ fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm
             );
         });
         owner_picker(ui, &app.doc, &mut form.owner);
+        // A parent from a different owner is meaningless once the owner
+        // changes — the combo below only ever offers same-owner events.
+        if let Some(pid) = form.parent {
+            if app.doc.event(pid).map(|e| e.owner) != Some(form.owner) {
+                form.parent = None;
+            }
+        }
+        event_parent_combo(ui, &app.doc, form.owner, form.editing, &mut form.parent);
         ui.add_space(6.0);
 
         let start = date_field(ui, "Date:  ", &mut form.start_text, false);
@@ -291,6 +350,13 @@ fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm
                 let owner = form.owner;
                 match form.editing {
                     Some(id) => {
+                        // Guard again at save time: the tree may have changed
+                        // while the dialog was open.
+                        let parent = if app.doc.would_cycle_event(id, form.parent) {
+                            None
+                        } else {
+                            form.parent
+                        };
                         app.mutate(|doc| {
                             if let Some(ev) = doc.event_mut(id) {
                                 ev.title = title;
@@ -299,11 +365,13 @@ fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm
                                 ev.importance = importance;
                                 ev.categories = cats;
                                 ev.owner = owner;
+                                ev.parent = parent;
                             }
                         });
                         app.info("Event updated");
                     }
                     None => {
+                        let parent = form.parent;
                         let mut new_id = None;
                         app.mutate(|doc| {
                             let id = doc.new_id();
@@ -316,6 +384,7 @@ fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm
                                 span,
                                 importance,
                                 categories: cats,
+                                parent,
                             });
                         });
                         app.selection = new_id.map(Selection::Event);
@@ -494,6 +563,39 @@ fn group_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut GroupForm
 // Timeline form
 // ---------------------------------------------------------------------------
 
+/// One staged row in the epoch editor, kept as text until the form is saved
+/// so a date can be mid-edit without losing the rest of the row.
+#[derive(Clone)]
+pub struct EpochRow {
+    pub name: String,
+    pub color: Rgb,
+    pub start_text: String,
+    pub end_text: String,
+}
+
+impl EpochRow {
+    fn new(color: Rgb) -> Self {
+        Self {
+            name: String::new(),
+            color,
+            start_text: String::new(),
+            end_text: String::new(),
+        }
+    }
+
+    fn parse(&self) -> Option<Epoch> {
+        if self.name.trim().is_empty() {
+            return None;
+        }
+        Some(Epoch {
+            name: self.name.trim().to_string(),
+            color: self.color,
+            start: HDate::parse(&self.start_text)?,
+            end: HDate::parse(&self.end_text)?,
+        })
+    }
+}
+
 pub struct TimelineForm {
     pub editing: Option<Id>,
     pub name: String,
@@ -511,6 +613,7 @@ pub struct TimelineForm {
     pub merge_date: String,
     pub merge_label: String,
     pub notes: String,
+    pub epochs: Vec<EpochRow>,
 }
 
 impl TimelineForm {
@@ -532,6 +635,7 @@ impl TimelineForm {
             merge_date: String::new(),
             merge_label: String::new(),
             notes: String::new(),
+            epochs: Vec::new(),
         }
     }
 
@@ -561,6 +665,16 @@ impl TimelineForm {
             merge_date: t.merge.as_ref().map(|j| j.date.label()).unwrap_or_default(),
             merge_label: t.merge.as_ref().map(|j| j.label.clone()).unwrap_or_default(),
             notes: t.notes.clone(),
+            epochs: t
+                .epochs
+                .iter()
+                .map(|e| EpochRow {
+                    name: e.name.clone(),
+                    color: e.color,
+                    start_text: e.start.label(),
+                    end_text: e.end.label(),
+                })
+                .collect(),
         }
     }
 }
@@ -698,6 +812,58 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
             Ok(None)
         };
 
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Epochs").strong());
+        ui.weak("Colour-code eras along this band — \"Archaic\", \"Classical\" — without splitting it into separate timelines.");
+        ui.add_space(4.0);
+
+        let mut remove_epoch = None;
+        let mut epochs_ready = true;
+        for (i, row) in form.epochs.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.color_edit_button_srgb(&mut row.color);
+                ui.add(
+                    egui::TextEdit::singleline(&mut row.name)
+                        .desired_width(110.0)
+                        .hint_text("e.g. Archaic"),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut row.start_text)
+                        .desired_width(85.0)
+                        .hint_text("start"),
+                );
+                ui.label("–");
+                ui.add(
+                    egui::TextEdit::singleline(&mut row.end_text)
+                        .desired_width(85.0)
+                        .hint_text("end"),
+                );
+                if ui.small_button("Delete").clicked() {
+                    remove_epoch = Some(i);
+                }
+            });
+            let name_ok = !row.name.trim().is_empty();
+            let dates_ok = HDate::parse(&row.start_text).is_some() && HDate::parse(&row.end_text).is_some();
+            if !name_ok || !dates_ok {
+                epochs_ready = false;
+                ui.indent("epoch_err", |ui| {
+                    ui.colored_label(BAD_RED, "needs a name and two valid dates");
+                });
+            }
+        }
+        if let Some(i) = remove_epoch {
+            form.epochs.remove(i);
+        }
+        if ui.small_button("+ Epoch").clicked() {
+            let color = form
+                .epochs
+                .last()
+                .map(|e| e.color)
+                .unwrap_or(form.color);
+            form.epochs.push(EpochRow::new(color));
+        }
+
         ui.add_space(8.0);
         ui.label("Notes:");
         ui.add(
@@ -718,7 +884,8 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
             && start.is_ok()
             && end.is_ok()
             && origin_ready
-            && merge_ready;
+            && merge_ready
+            && epochs_ready;
 
         match dialog_buttons(ui, can_save, "Save") {
             Some(true) => {
@@ -746,6 +913,8 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
                 let color = form.color;
                 let notes = form.notes.trim().to_string();
                 let group = form.group;
+                // Already validated by `epochs_ready` above.
+                let epochs: Vec<Epoch> = form.epochs.iter().filter_map(EpochRow::parse).collect();
 
                 match form.editing {
                     Some(id) => {
@@ -758,6 +927,7 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
                                 t.origin = origin;
                                 t.merge = merge;
                                 t.notes = notes;
+                                t.epochs = epochs;
                             }
                         });
                         app.info("Timeline updated");
@@ -780,6 +950,7 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
                                 origin,
                                 merge,
                                 notes,
+                                epochs,
                             });
                         });
                         app.selection = new_id.map(Selection::Timeline);
@@ -1164,6 +1335,7 @@ mod tests {
             }),
             importance: 5,
             categories: vec![Id(9)],
+            parent: None,
         };
         let form = EventForm::edit(&ev);
         assert_eq!(form.editing, Some(Id(3)));
@@ -1184,6 +1356,7 @@ mod tests {
             span: Span::range(HDate::year(-218), HDate::year(-201)),
             importance: 5,
             categories: vec![],
+            parent: None,
         };
         let form = EventForm::edit(&ev);
         assert!(form.is_range);
@@ -1208,6 +1381,7 @@ mod tests {
                 label: "Pydna".into(),
             }),
             notes: String::new(),
+            epochs: Vec::new(),
         };
         let form = TimelineForm::edit(&tl);
         assert!(form.merge_on);
@@ -1230,6 +1404,7 @@ mod tests {
             origin: None,
             merge: None,
             notes: String::new(),
+            epochs: Vec::new(),
         };
         let form = TimelineForm::edit(&tl);
         assert!(!form.use_span);

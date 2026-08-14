@@ -397,6 +397,28 @@ fn paint_timeline_band(
         Stroke::new(lane.thickness, with_alpha(color, 235)),
     ));
 
+    // Colour-coded eras — "Archaic", "Classical" — painted as separate
+    // strokes over the base band. Each is sampled independently so it still
+    // follows the curve through a merge/origin transition.
+    if !tl.epochs.is_empty() {
+        if let Some((from, to)) = band_visible_range(doc, tl, view_from, view_to) {
+            for (seg_from, seg_to, seg_color) in band_color_segments(tl, from, to) {
+                if seg_color == tl.color {
+                    continue;
+                }
+                let seg_pts = band_curve(tl, lane.center, centers, axis, seg_from, seg_to);
+                if seg_pts.len() < 2 {
+                    continue;
+                }
+                let seg_points: Vec<Pos2> = seg_pts.iter().map(|(x, y)| Pos2::new(*x, *y)).collect();
+                p.add(egui::Shape::line(
+                    seg_points,
+                    Stroke::new(lane.thickness, with_alpha(to_color(seg_color), 235)),
+                ));
+            }
+        }
+    }
+
     // Rounded caps, plus emphasis at a junction so the merge point reads as an
     // event rather than the line just stopping.
     let r = lane.thickness * 0.5;
@@ -496,6 +518,9 @@ fn paint_biography_band(
 
 /// Events belonging on a lane that survive the filters and fall in view,
 /// ordered most-important-first so the scarce label rows go to what matters.
+///
+/// Only root events (no `parent`) are returned — an event nested inside
+/// another is drawn in its own nested row instead, by [`paint_nested_events`].
 fn visible_events<'a>(
     doc: &'a Document,
     kind: LaneKind,
@@ -509,6 +534,7 @@ fn visible_events<'a>(
         .events
         .iter()
         .filter(|e| owners.contains(&e.owner))
+        .filter(|e| e.parent.is_none())
         .filter(|e| event_visible(e, filters, axis.ppy))
         .filter(|e| e.span.t1() >= view_from && e.span.t0() <= view_to)
         .collect();
@@ -544,10 +570,24 @@ fn measure_lanes(
         .map(|plan| {
             let active = plan.header_only
                 || lane_active(doc, plan.kind, filters, axis.ppy, view_from, view_to);
-            let demand = |rows| LaneDemand { rows, active };
-            if plan.header_only || !active || !doc.view.show_labels {
-                return demand(0);
+            if plan.header_only || !active {
+                return LaneDemand { rows: 0, active, nested_rows: 0 };
             }
+
+            let roots = visible_events(doc, plan.kind, filters, axis, view_from, view_to);
+            // Nested rows are markers, not just labels, so they need room
+            // below the band whether or not text labels are switched on.
+            let nested_rows = roots
+                .iter()
+                .filter(|e| e.span.is_range())
+                .map(|e| nested_depth(doc, filters, axis.ppy, e.id, 0))
+                .max()
+                .unwrap_or(0);
+
+            if !doc.view.show_labels {
+                return LaneDemand { rows: 0, active, nested_rows };
+            }
+
             let mut packer = LabelPacker::new();
             let mut used = 0usize;
 
@@ -566,10 +606,10 @@ fn measure_lanes(
                 }
             };
 
-            for ev in visible_events(doc, plan.kind, filters, axis, view_from, view_to) {
+            for ev in roots {
                 claim(&ev.title, ev.importance, axis.x(ev.span.t0()));
             }
-            demand(used)
+            LaneDemand { rows: used, active, nested_rows }
         })
         .collect()
 }
@@ -645,6 +685,23 @@ fn paint_lane_events(
             sel: Selection::Event(ev.id),
         });
 
+        if ev.span.is_range() {
+            paint_nested_events(
+                p,
+                app,
+                doc,
+                filters,
+                ev,
+                marker_rect,
+                axis,
+                lane_color,
+                lane.bottom - LANE_BOTTOM_PAD,
+                theme,
+                1,
+                hits,
+            );
+        }
+
         if !doc.view.show_labels {
             continue;
         }
@@ -698,6 +755,110 @@ fn paint_lane_events(
     }
 }
 
+/// Paint events nested inside `parent` — "Peace of Nicias" inside
+/// "Peloponnesian War" — as a row of small bars/markers directly below its
+/// own bar, with a tether line back up to it so the containment reads at a
+/// glance. Recurses one row further down for grandchildren.
+#[allow(clippy::too_many_arguments)]
+fn paint_nested_events(
+    p: &egui::Painter,
+    app: &TimelineApp,
+    doc: &Document,
+    filters: &Filters,
+    parent: &Event,
+    parent_rect: Rect,
+    axis: &TimeAxis,
+    lane_color: Color32,
+    lane_bottom_limit: f32,
+    theme: &Theme,
+    depth: usize,
+    hits: &mut Vec<Hit>,
+) {
+    if depth > MAX_NESTED_ROWS {
+        return;
+    }
+    let children: Vec<&Event> = doc
+        .child_events(parent.id)
+        .into_iter()
+        .filter(|e| event_visible(e, filters, axis.ppy))
+        .collect();
+    if children.is_empty() {
+        return;
+    }
+
+    let row_top = parent_rect.bottom() + 3.0;
+    let row_h = (NESTED_ROW_HEIGHT - 5.0).max(6.0);
+    if row_top + row_h > lane_bottom_limit {
+        return; // Out of reserved room — deeper nesting is dropped, not overlapped.
+    }
+
+    for child in children {
+        let alpha = importance_alpha(child.importance);
+        let selected = app.selection == Some(Selection::Event(child.id));
+        let fill = with_alpha(shade(lane_color, 0.2), alpha);
+
+        let rect = if child.span.is_range() {
+            let x0 = axis.x(child.span.t0());
+            let x1 = axis.x(child.span.t1()).max(x0 + 3.0);
+            Rect::from_min_max(Pos2::new(x0, row_top), Pos2::new(x1, row_top + row_h))
+        } else {
+            let cx = axis.x(child.span.t0());
+            Rect::from_center_size(
+                Pos2::new(cx, row_top + row_h * 0.5),
+                Vec2::splat(row_h * 0.8),
+            )
+        };
+
+        // A tether ties the child back to the parent bar it belongs to.
+        let tether_x = rect.center().x.clamp(parent_rect.left(), parent_rect.right());
+        p.line_segment(
+            [Pos2::new(tether_x, parent_rect.bottom()), Pos2::new(tether_x, rect.top())],
+            Stroke::new(1.0, with_alpha(lane_color, 100)),
+        );
+
+        if selected {
+            p.rect_filled(rect.expand(2.0), CornerRadius::same(2), with_alpha(theme.selection, 100));
+        }
+        p.rect_filled(rect, CornerRadius::same(2), fill);
+        p.rect_stroke(
+            rect,
+            CornerRadius::same(2),
+            Stroke::new(1.0, with_alpha(shade(lane_color, -0.3), alpha)),
+            StrokeKind::Outside,
+        );
+
+        hits.push(Hit {
+            rect: rect.expand(2.0),
+            sel: Selection::Event(child.id),
+        });
+
+        // A short title next to the marker when there is obviously room for
+        // one; dense clusters fall back to the hover tooltip instead of
+        // fighting over space the way top-level labels do.
+        if doc.view.show_labels {
+            let font = FontId::proportional((row_h - 2.0).max(9.0));
+            let color = with_alpha(theme.text_dim, alpha);
+            let galley = p.layout_no_wrap(child.title.clone(), font, color);
+            p.galley(Pos2::new(rect.right() + 3.0, rect.top()), galley, theme.text_dim);
+        }
+
+        paint_nested_events(
+            p,
+            app,
+            doc,
+            filters,
+            child,
+            rect,
+            axis,
+            lane_color,
+            lane_bottom_limit,
+            theme,
+            depth + 1,
+            hits,
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_point(
     p: &egui::Painter,
@@ -729,6 +890,10 @@ fn paint_point(
     if selected {
         p.circle_filled(center, r + 4.0, with_alpha(theme.selection, 110));
     }
+    // A background-tinted halo separates the marker from the band behind it —
+    // without it, a marker in the band's own colour nearly disappears where a
+    // curve (e.g. near a merge) puts band and marker at the same hue.
+    p.circle_filled(center, r + 2.0, with_alpha(theme.canvas_bg, 235));
     p.circle_filled(center, r, with_alpha(shade(lane_color, 0.25), alpha));
     if let Some(rc) = ring {
         p.circle_stroke(center, r + 1.5, Stroke::new(2.0, with_alpha(rc, alpha)));

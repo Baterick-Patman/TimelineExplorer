@@ -219,6 +219,7 @@ mod tests {
             origin: None,
             merge: None,
             notes: String::new(),
+            epochs: Vec::new(),
         });
         doc
     }
