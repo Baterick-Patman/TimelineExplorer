@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BIN_NAME: timeline_explorer
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --target ${{ env.TARGET }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ env.TARGET }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $stagingDir = "staging"
+          New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+          Copy-Item "target/${{ env.TARGET }}/release/${{ env.BIN_NAME }}.exe" "$stagingDir/${{ env.BIN_NAME }}.exe"
+          Copy-Item "README.md" "$stagingDir/README.md"
+          $zipName = "${{ env.BIN_NAME }}-$version-windows-x86_64.zip"
+          Compress-Archive -Path "$stagingDir/*" -DestinationPath $zipName
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
