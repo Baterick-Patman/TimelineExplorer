@@ -2,7 +2,8 @@
 
 use crate::canvas;
 use crate::example;
-use crate::forms::{BiographyForm, CategoryEditor, Dialog, EventForm, GroupForm, TimelineForm};
+use crate::export::{self, ExportFormat, ExportJob, ExportStage};
+use crate::forms::{BiographyForm, CategoryEditor, Dialog, EventForm, ExportForm, GroupForm, TimelineForm};
 use crate::layout::{self, Lane, TimeAxis};
 use crate::model::*;
 use crate::panels;
@@ -82,6 +83,11 @@ pub struct TimelineApp {
     pub bio_search: String,
     pub bio_group_by: BioGroupBy,
 
+    /// An export in progress — see `export.rs`. While `Some`, the normal
+    /// panel layout is replaced with just the canvas so the screenshot it
+    /// eventually takes contains nothing else.
+    pub export_job: Option<ExportJob>,
+
     undo: Vec<Document>,
     redo: Vec<Document>,
 }
@@ -123,6 +129,7 @@ impl TimelineApp {
             timeline_search: String::new(),
             bio_search: String::new(),
             bio_group_by: BioGroupBy::default(),
+            export_job: None,
             undo: Vec::new(),
             redo: Vec::new(),
         }
@@ -304,6 +311,109 @@ impl TimelineApp {
         self.mark_dirty();
     }
 
+    // --- Export -------------------------------------------------------
+
+    /// Kick off an export: swap in the already-filtered document, frame the
+    /// chosen date range, and let `tick_export` drive the rest across the
+    /// following frames. Deliberately bypasses `mutate`/`mark_dirty` — this
+    /// is a transient render, not an edit, and must not enter the undo
+    /// stack or trigger a real autosave of the filtered document.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_export(
+        &mut self,
+        ctx: &egui::Context,
+        mut export_doc: Document,
+        from: f64,
+        to: f64,
+        width_px: f32,
+        format: ExportFormat,
+        path: PathBuf,
+    ) {
+        let (axis, _) = export::export_axis(from, to, width_px);
+        export_doc.view.left_year = axis.left_year;
+        export_doc.view.pixels_per_year = axis.ppy;
+
+        let restore_window_size = ctx.content_rect().size();
+        self.export_job = Some(ExportJob {
+            stage: ExportStage::Preparing,
+            format,
+            path,
+            width_px,
+            restore_doc: std::mem::replace(&mut self.doc, export_doc),
+            restore_y_offset: self.y_offset,
+            restore_window_size,
+            restore_selection: self.selection.take(),
+        });
+        self.y_offset = 0.0;
+        ctx.request_repaint();
+    }
+
+    /// Advance the export state machine by one tick. See `ExportStage` for
+    /// why `Preparing` cannot read `last_lanes` on the same frame the
+    /// document was swapped in.
+    fn tick_export(&mut self, ctx: &egui::Context) {
+        let Some(job) = &mut self.export_job else { return };
+        match job.stage {
+            ExportStage::Preparing => {
+                job.stage = ExportStage::Measuring;
+                ctx.request_repaint();
+            }
+            ExportStage::Measuring => {
+                let content_bottom = self.last_lanes.iter().map(|l| l.bottom).fold(0.0f32, f32::max);
+                let height = (content_bottom + 24.0).max(160.0);
+                let size = egui::Vec2::new(job.width_px, height);
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                job.stage = ExportStage::Settling(4);
+                ctx.request_repaint();
+            }
+            ExportStage::Settling(0) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+                job.stage = ExportStage::Capturing;
+                ctx.request_repaint();
+            }
+            ExportStage::Settling(n) => {
+                job.stage = ExportStage::Settling(n - 1);
+                ctx.request_repaint();
+            }
+            ExportStage::Capturing => {
+                let image = ctx.input(|i| {
+                    i.events.iter().find_map(|e| match e {
+                        egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                        _ => None,
+                    })
+                });
+                match image {
+                    Some(image) => self.finish_export(ctx, &image),
+                    None => ctx.request_repaint(),
+                }
+            }
+        }
+    }
+
+    fn finish_export(&mut self, ctx: &egui::Context, image: &egui::ColorImage) {
+        let Some(job) = self.export_job.take() else { return };
+        let [w, h] = image.size;
+        let rgba: Vec<u8> = image
+            .pixels
+            .iter()
+            .flat_map(|c| [c.r(), c.g(), c.b(), c.a()])
+            .collect();
+        let result = match job.format {
+            ExportFormat::Png => export::save_png(&job.path, &rgba, w as u32, h as u32),
+            ExportFormat::Pdf => export::save_pdf(&job.path, &rgba, w as u32, h as u32),
+        };
+
+        self.doc = job.restore_doc;
+        self.y_offset = job.restore_y_offset;
+        self.selection = job.restore_selection;
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(job.restore_window_size));
+
+        match result {
+            Ok(()) => self.info(format!("Export gespeichert unter {}", job.path.display())),
+            Err(e) => self.error(e),
+        }
+    }
+
     pub fn open_editor_for(&mut self, sel: Selection) {
         self.selection = Some(sel);
         self.dialog = match sel {
@@ -424,6 +534,17 @@ impl eframe::App for TimelineApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         apply_style(&ctx, self.doc.view.dark_mode);
+
+        let exporting = self.export_job.is_some();
+        if exporting {
+            // Nothing but the canvas while a screenshot is pending — the
+            // capture must contain exactly what is being exported, not the
+            // sidebar or toolbar around it.
+            egui::CentralPanel::no_frame().show(ui, |ui| canvas::draw(self, ui));
+            self.tick_export(&ctx);
+            return;
+        }
+
         self.handle_shortcuts(&ctx);
 
         egui::Panel::top("toolbar")
@@ -454,6 +575,9 @@ impl eframe::App for TimelineApp {
         self.show_confirm(&ctx);
         self.show_help_window(&ctx);
 
+        // Never autosave the export's filtered document over the real
+        // library — but this branch is only reached when `exporting` is
+        // already false, so there is nothing to guard here beyond that.
         self.autosave_if_due();
         // Keep waking up so the autosave timer fires while the app sits idle.
         if self.dirty {
@@ -465,8 +589,10 @@ impl eframe::App for TimelineApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Last line of defence against losing the final edit.
-        if self.dirty {
+        // Last line of defence against losing the final edit. Never while an
+        // export is in flight — `self.doc` is the filtered export document
+        // until the capture completes and swaps the real one back in.
+        if self.dirty && self.export_job.is_none() {
             let _ = store::save(&self.path, &self.doc);
         }
     }
@@ -566,6 +692,11 @@ impl TimelineApp {
                         }
                     }
                 });
+                ui.separator();
+                if ui.button("Ausschnitt exportieren…").clicked() {
+                    self.dialog = Dialog::Export(ExportForm::new(&self.doc));
+                    ui.close();
+                }
                 ui.separator();
                 if ui.button("Datenordner anzeigen").clicked() {
                     store::reveal_in_explorer(&self.path);

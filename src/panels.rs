@@ -19,6 +19,12 @@ enum Action {
     AddEventTo(OwnerRef),
     AddNestedEventTo(OwnerRef, Id),
     NewGroupUnder(Option<Id>),
+    /// Bulk show/hide for every biography in one sidebar cluster (a culture
+    /// or a category) — the "collapse a group" bundling `Group` already has,
+    /// extended to biographies since they have no single `visible` flag to
+    /// toggle, only a three-way `display`.
+    ShowCluster(Vec<Id>),
+    HideCluster(Vec<Id>),
 }
 
 pub fn sidebar(app: &mut TimelineApp, ui: &mut egui::Ui) {
@@ -91,6 +97,29 @@ fn apply(app: &mut TimelineApp, a: Action) {
             form.parent = parent;
             app.dialog = Dialog::Group(form);
         }
+        Action::HideCluster(ids) => app.mutate(|doc| {
+            for id in ids {
+                if let Some(b) = doc.biography_mut(id) {
+                    b.display = BioDisplay::Hidden;
+                }
+            }
+        }),
+        Action::ShowCluster(ids) => app.mutate(|doc| {
+            for id in ids {
+                if let Some(b) = doc.biography_mut(id) {
+                    // Only restore ones that were hidden — an already-shown
+                    // biography's own display choice (Inline vs. Lane) is
+                    // left alone rather than clobbered by a bulk action.
+                    if b.display == BioDisplay::Hidden {
+                        b.display = if b.timeline.is_some() {
+                            BioDisplay::Inline
+                        } else {
+                            BioDisplay::Lane
+                        };
+                    }
+                }
+            }
+        }),
     }
 }
 
@@ -477,6 +506,12 @@ fn biographies_section(
 }
 
 /// One collapsible cluster of biographies, sorted by birth year.
+/// One collapsible cluster of biographies, sorted by birth year, with two
+/// bundled quick actions in its header — "alle anzeigen"/"alle ausblenden"
+/// set every member's `display` at once, the same bundled show/hide a
+/// `Group`'s own visibility checkbox already gives timelines. A biography
+/// has no single visible flag to toggle (only the three-way `display`), so
+/// this needs its own bulk actions rather than reusing `ToggleGroupVisible`.
 fn bio_cluster(
     ui: &mut egui::Ui,
     app: &TimelineApp,
@@ -487,10 +522,28 @@ fn bio_cluster(
     actions: &mut Vec<Action>,
 ) {
     bios.sort_by(|a, b| a.birth.decimal().partial_cmp(&b.birth.decimal()).unwrap_or(std::cmp::Ordering::Equal));
-    egui::CollapsingHeader::new(format!("{label} ({})", bios.len()))
-        .id_salt((id_salt, cluster_key))
-        .default_open(true)
-        .show(ui, |ui| {
+    let ids: Vec<Id> = bios.iter().map(|b| b.id).collect();
+
+    let id = ui.make_persistent_id((id_salt, cluster_key));
+    egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, true)
+        .show_header(ui, |ui| {
+            ui.label(format!("{label} ({})", bios.len()));
+            if ui
+                .small_button("alle anzeigen")
+                .on_hover_text("Jede ausgeblendete Biografie hier auf ihre normale Anzeige zurücksetzen")
+                .clicked()
+            {
+                actions.push(Action::ShowCluster(ids.clone()));
+            }
+            if ui
+                .small_button("alle ausblenden")
+                .on_hover_text("Alle Biografien hier ausblenden")
+                .clicked()
+            {
+                actions.push(Action::HideCluster(ids.clone()));
+            }
+        })
+        .body(|ui| {
             for b in bios {
                 biography_row(app, ui, b, actions);
             }

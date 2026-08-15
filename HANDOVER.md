@@ -18,11 +18,85 @@ the colour), nestable events, nestable categories (ticking a parent category
 in the filter cascades onto its subcategories), European `14.07.1789`-style
 date entry alongside ISO, biography bands with a category-driven fill and a
 culture-driven border, a sidebar Timelines/Biographies search with
-biographies collapsible by culture or by category, and a full German UI.
+biographies collapsible by culture or by category — each cluster also
+getting a bundled "alle anzeigen"/"alle ausblenden" pair, the same bulk
+show/hide a `Group`'s own visibility checkbox already gives timelines — a
+full German UI, and export of a chosen slice (timelines, date range, minimum
+importance, with or without biographies) to PNG or PDF — item 1 from the
+original planning document's open questions, previously deliberately left
+undone.
 
-- **~9,300 lines** of Rust across 10 files in `src/`.
-- **114 tests**, all passing, no compiler warnings.
-- Release binary: `target/release/timeline_explorer.exe`, ~6.4 MB, single file.
+**One-parent-many-children splits/merges were already fully supported and
+needed no new code** — `Timeline.origin`/`.merge` are per-timeline fields, so
+several timelines can split from the same parent (at the same or different
+dates) and each independently merge into a different target at a different
+date; `layout::tests::several_timelines_can_split_from_one_parent_and_merge_into_different_targets`
+now pins this down explicitly (it wasn't before — only the single-child case
+had a test). Only gotcha found while writing that test: at zoomed-out views,
+two nearby transition dates' easing windows (`TRANSITION_PX`, 110px) can
+visually overlap — correct, not a bug, but worth knowing before assuming
+something is broken from a screenshot taken zoomed far out.
+
+- **~9,700 lines** of Rust across 11 files in `src/`.
+- **122 tests**, all passing, no compiler warnings.
+- Release binary: `target/release/timeline_explorer.exe`, single file (image
+  encoding added a few hundred KB; still well under 10 MB).
+
+### Export reuses the real canvas painter — it does not re-render anything
+
+`export.rs` + `TimelineApp::start_export`/`tick_export`/`finish_export` (in
+`app.rs`) do **not** re-implement any drawing. The only way to get pixel-perfect
+parity with the live app — same fonts, same curve/label code, no risk of the
+export drifting from what `canvas.rs` actually draws — is to let `canvas.rs`
+draw it and capture that. The flow, across several frames:
+
+1. `start_export` swaps `app.doc` for an already-filtered clone
+   (`export::build_export_document`) and points the view at the chosen range
+   (`export::export_axis`), bypassing `mutate`/`mark_dirty` — this is a
+   transient render, not an edit, and must never enter the undo stack or get
+   autosaved over the real library.
+2. While `app.export_job` is `Some`, `TimelineApp::ui()` **replaces the whole
+   panel layout** with just the canvas — no toolbar, sidebar, inspector, or
+   status bar — and skips `autosave_if_due` and `show_dialogs`/`show_confirm`
+   entirely. The eventual screenshot must contain nothing else.
+3. `ExportStage::Preparing` exists solely to eat one frame of lag: the
+   document swap happens *inside* a button click handler, which runs *after*
+   that frame's canvas draw, so `last_lanes` on that exact frame still
+   reflects the *old* document. Only from the next frame on is `last_lanes`
+   trustworthy for the new one.
+4. `Measuring` reads `last_lanes` (now correct) to get the exact content
+   height, then sends `ViewportCommand::InnerSize` to resize the OS window to
+   fit it precisely — no cropping needed since the canvas already fills the
+   whole (panel-less) window.
+5. `Settling` waits a few frames for the resize to actually land (window
+   managers do not apply `InnerSize` synchronously).
+6. `Capturing` sends `ViewportCommand::Screenshot` and polls
+   `ctx.input(|i| i.events)` for the matching `Event::Screenshot` each frame
+   until it arrives.
+7. `finish_export` encodes the returned `ColorImage` — PNG directly via the
+   `image` crate, PDF by JPEG-encoding it and wrapping that in a **hand-rolled**
+   single-page PDF (`export::wrap_jpeg_as_pdf`) rather than pulling in a
+   PDF-writing crate; a one-image PDF is a small, fixed structure, and
+   `printpdf`'s page/content-stream API was still enough of a moving target
+   across recent versions (checked against its 0.12.5 docs while building
+   this) that hand-writing it was the lower-risk choice. Verified by writing
+   a real gradient test image through both paths and opening the resulting
+   files directly — both render correctly.
+8. Either way, the real document, `y_offset`, `selection`, and window size are
+   restored, whether the capture succeeded or the format was Png/Pdf.
+
+**Not verified end-to-end in this environment**: steps 2–6 (the window-resize
+→ settle → screenshot dance) could not be exercised by actually driving the
+UI — this dev sandbox's input automation is blocked from taking real
+foreground focus (by design; a forced-focus attempt was flagged and blocked
+by antivirus, correctly). Everything **outside** that interactive loop is
+covered by unit tests and by writing real files through both output paths
+and opening them (`export::tests`, all passing) — the document filtering,
+axis math, JPEG encoding, and PDF structure are all confirmed correct. If
+export produces a blank, wrongly-sized, or stale-content image the first time
+someone actually runs it, look at steps 2–6 first, in particular whether
+`Settling`'s frame count (currently 4) is enough on slower machines/drivers —
+it is a guess, not a measurement.
 
 ### The UI is German-only, by request — not a translation *layer*
 

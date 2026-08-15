@@ -10,6 +10,7 @@
 mod app;
 mod canvas;
 mod example;
+mod export;
 mod forms;
 mod layout;
 mod model;

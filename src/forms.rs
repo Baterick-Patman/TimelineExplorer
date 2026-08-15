@@ -16,6 +16,7 @@ pub enum Dialog {
     Biography(BiographyForm),
     Event(EventForm),
     Categories(CategoryEditor),
+    Export(ExportForm),
 }
 
 impl Dialog {
@@ -1393,6 +1394,198 @@ fn category_dialog(app: &mut TimelineApp, ctx: &egui::Context, ed: &mut Category
 }
 
 // ---------------------------------------------------------------------------
+// Export
+// ---------------------------------------------------------------------------
+
+pub struct ExportForm {
+    pub format: crate::export::ExportFormat,
+    pub timelines: BTreeSet<Id>,
+    pub include_biographies: bool,
+    pub from_text: String,
+    pub to_text: String,
+    pub min_importance: u8,
+    pub width_px: f32,
+}
+
+impl ExportForm {
+    /// Starts with every timeline selected and the range framing the whole
+    /// library — the common case is narrowing down from "everything",
+    /// rather than building the selection up from nothing.
+    pub fn new(doc: &Document) -> Self {
+        let (from_text, to_text) = match doc.extent() {
+            Some((lo, hi)) => (axis_year_label(lo), axis_year_label(hi)),
+            None => (String::new(), String::new()),
+        };
+        Self {
+            format: crate::export::ExportFormat::Png,
+            timelines: doc.timelines.iter().map(|t| t.id).collect(),
+            include_biographies: true,
+            from_text,
+            to_text,
+            min_importance: IMPORTANCE_MIN,
+            width_px: 2000.0,
+        }
+    }
+}
+
+/// One level of the timeline-selection tree, then recurse — a group's own
+/// checkbox is a bulk select/deselect over every timeline in its subtree,
+/// same shape as `panels::group_tree` but without the visibility/collapse
+/// controls this dialog has no use for.
+fn export_tree(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    parent: Option<Id>,
+    depth: usize,
+    guard: &mut usize,
+    selected: &mut BTreeSet<Id>,
+) {
+    *guard += 1;
+    if *guard > 512 || depth > 12 {
+        return;
+    }
+    let indent = depth as f32 * 14.0;
+
+    for g in doc.child_groups(parent) {
+        let members = doc.group_timelines(g.id);
+        let mut checked = !members.is_empty() && members.iter().all(|t| selected.contains(t));
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            if ui
+                .checkbox(&mut checked, egui::RichText::new(&g.name).strong())
+                .changed()
+            {
+                if checked {
+                    selected.extend(members.iter().copied());
+                } else {
+                    for t in &members {
+                        selected.remove(t);
+                    }
+                }
+            }
+        });
+        export_tree(ui, doc, Some(g.id), depth + 1, guard, selected);
+    }
+
+    for t in doc.timelines_in(parent) {
+        let mut checked = selected.contains(&t.id);
+        ui.horizontal(|ui| {
+            ui.add_space(indent + 16.0);
+            if ui.checkbox(&mut checked, &t.name).changed() {
+                if checked {
+                    selected.insert(t.id);
+                } else {
+                    selected.remove(&t.id);
+                }
+            }
+        });
+    }
+}
+
+fn export_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut ExportForm) -> bool {
+    let mut keep_open = true;
+
+    egui::Modal::new(egui::Id::new("export_dialog")).show(ctx, |ui| {
+        ui.set_width(460.0);
+        ui.heading("Ausschnitt exportieren");
+        ui.weak("Rendert die gewählten Zeitstrahlen — mit oder ohne ihre Biografien — im gewählten Zeitraum als Bild oder PDF.");
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Format:");
+            ui.selectable_value(&mut form.format, crate::export::ExportFormat::Png, "PNG");
+            ui.selectable_value(&mut form.format, crate::export::ExportFormat::Pdf, "PDF");
+        });
+
+        ui.add_space(6.0);
+        let from = date_field(ui, "Von:", &mut form.from_text, false);
+        let to = date_field(ui, "Bis:", &mut form.to_text, false);
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Mindestbedeutung der Ereignisse").strong());
+        importance_picker(ui, &mut form.min_importance);
+
+        ui.add_space(6.0);
+        ui.checkbox(&mut form.include_biographies, "Zugehörige Biografien einschließen");
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Breite (px):");
+            ui.add(egui::Slider::new(&mut form.width_px, 800.0..=4000.0));
+        });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Zeitstrahlen").strong());
+        egui::ScrollArea::vertical()
+            .max_height(220.0)
+            .show(ui, |ui| {
+                let mut guard = 0usize;
+                export_tree(ui, &app.doc, None, 0, &mut guard, &mut form.timelines);
+            });
+        if form.timelines.is_empty() {
+            ui.colored_label(BAD_RED, "mindestens einen Zeitstrahl auswählen");
+        }
+
+        let mut ordering_ok = true;
+        if let (Ok(Some(f)), Ok(Some(t))) = (&from, &to) {
+            if t.decimal_end() < f.decimal() {
+                ordering_ok = false;
+                ui.colored_label(BAD_RED, "das Bis-Datum liegt vor dem Von-Datum");
+            }
+        }
+        let can_export = from.is_ok() && to.is_ok() && ordering_ok && !form.timelines.is_empty();
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("Abbrechen").clicked() {
+                keep_open = false;
+            }
+            if ui
+                .add_enabled(can_export, egui::Button::new("Exportieren…"))
+                .clicked()
+            {
+                if let (Ok(Some(f)), Ok(Some(t))) = (&from, &to) {
+                    let ext = match form.format {
+                        crate::export::ExportFormat::Png => "png",
+                        crate::export::ExportFormat::Pdf => "pdf",
+                    };
+                    let filter_name = match form.format {
+                        crate::export::ExportFormat::Png => "PNG-Bild",
+                        crate::export::ExportFormat::Pdf => "PDF-Dokument",
+                    };
+                    let dialog = rfd::FileDialog::new()
+                        .add_filter(filter_name, &[ext])
+                        .set_file_name(format!("export.{ext}"));
+                    if let Some(path) = dialog.save_file() {
+                        let export_doc = crate::export::build_export_document(
+                            &app.doc,
+                            &form.timelines,
+                            form.include_biographies,
+                            form.min_importance,
+                        );
+                        app.start_export(
+                            ctx,
+                            export_doc,
+                            f.decimal(),
+                            t.decimal_end(),
+                            form.width_px,
+                            form.format,
+                            path,
+                        );
+                        keep_open = false;
+                    }
+                }
+            }
+        });
+    });
+
+    keep_open
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -1408,6 +1601,7 @@ pub fn show_dialogs(app: &mut TimelineApp, ctx: &egui::Context) {
         Dialog::Timeline(f) => timeline_dialog(app, ctx, f),
         Dialog::Biography(f) => biography_dialog(app, ctx, f),
         Dialog::Categories(f) => category_dialog(app, ctx, f),
+        Dialog::Export(f) => export_dialog(app, ctx, f),
         Dialog::None => false,
     };
     // A dialog opened *by* this dialog (e.g. a delete confirmation) wins.

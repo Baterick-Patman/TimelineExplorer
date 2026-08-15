@@ -1055,6 +1055,97 @@ mod tests {
         assert!((later - 220.0).abs() < 0.01, "should settle on its own lane");
     }
 
+    /// The Diadochi split: several successor kingdoms fanning out from the
+    /// same empire at the same moment, then each merging into a different
+    /// conqueror at its own later date — Seleucid Syria falls to Rome in 63
+    /// BC, decades before Ptolemaic Egypt does in 30 BC. Nothing about
+    /// `origin`/`merge` is exclusive to one child or one merge target: both
+    /// fields live on the child timeline itself, so this "one parent, many
+    /// independent children, each converging on its own schedule" shape
+    /// needs no special-casing anywhere in the geometry.
+    #[test]
+    fn several_timelines_can_split_from_one_parent_and_merge_into_different_targets() {
+        let alexanders_empire = Id(1);
+        let rome = Id(2);
+        let ptolemaic_egypt = Timeline {
+            id: Id(3),
+            name: "Ptolemaic Egypt".into(),
+            color: [0, 0, 0],
+            visible: true,
+            group: None,
+            order: 0,
+            span: Some(Span::range(HDate::year(-305), HDate::year(-30))),
+            origin: Some(Junction {
+                other: alexanders_empire,
+                date: HDate::year(-305),
+                label: "Diadochi".into(),
+            }),
+            merge: Some(Junction {
+                other: rome,
+                date: HDate::year(-30),
+                label: "Antony and Cleopatra".into(),
+            }),
+            notes: String::new(),
+            epochs: Vec::new(),
+        };
+        let seleucid_empire = Timeline {
+            id: Id(4),
+            name: "Seleucid Empire".into(),
+            color: [0, 0, 0],
+            visible: true,
+            group: None,
+            order: 1,
+            span: Some(Span::range(HDate::year(-305), HDate::year(-63))),
+            // Same parent, same split date as Ptolemaic Egypt above.
+            origin: Some(Junction {
+                other: alexanders_empire,
+                date: HDate::year(-305),
+                label: "Diadochi".into(),
+            }),
+            // Same target as Ptolemaic Egypt, but decades earlier.
+            merge: Some(Junction {
+                other: rome,
+                date: HDate::year(-63),
+                label: "Pompey's settlement".into(),
+            }),
+            notes: String::new(),
+            epochs: Vec::new(),
+        };
+
+        let centers = HashMap::from([
+            (alexanders_empire, 50.0f32),
+            (ptolemaic_egypt.id, 150.0f32),
+            (seleucid_empire.id, 250.0f32),
+            (rome, 350.0f32),
+        ]);
+        // Zoomed in enough (110px transition / 20 px-per-year = 5.5-year
+        // window) that the two merges, 33 years apart, don't visually blend
+        // into each other — at 2 px/year the transition windows are wide
+        // enough to overlap, which is correct rendering, just not what this
+        // test wants to isolate.
+        let ppy = 20.0;
+
+        // Both still ride the shared parent's lane right at the split.
+        for child in [&ptolemaic_egypt, &seleucid_empire] {
+            let at_split = band_center_at(child, centers[&child.id], &centers, -305.0, ppy);
+            assert!(
+                (at_split - 50.0).abs() < 0.01,
+                "{} should start on the parent lane, got {at_split}",
+                child.name
+            );
+        }
+
+        // Seleucid Empire has already converged onto Rome...
+        let seleucid_after_63 = band_center_at(&seleucid_empire, 250.0, &centers, -63.0, ppy);
+        assert!((seleucid_after_63 - 350.0).abs() < 0.01);
+        // ...33 years before Ptolemaic Egypt, which at that same date is
+        // still living its own independent life on its own lane.
+        let ptolemaic_at_50 = band_center_at(&ptolemaic_egypt, 150.0, &centers, -50.0, ppy);
+        assert!((ptolemaic_at_50 - 150.0).abs() < 0.01);
+        let ptolemaic_after_30 = band_center_at(&ptolemaic_egypt, 150.0, &centers, -30.0, ppy);
+        assert!((ptolemaic_after_30 - 350.0).abs() < 0.01);
+    }
+
     #[test]
     fn a_junction_pointing_at_a_hidden_timeline_falls_back_to_a_straight_band() {
         let (doc, _) = merging_doc();

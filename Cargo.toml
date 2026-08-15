@@ -1,6 +1,6 @@
 [package]
 name = "timeline_explorer"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Timeline Explorer - multi-timeline comparison tool"
 
@@ -13,6 +13,7 @@ egui = "0.36"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rfd = "0.17"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [profile.release]
 opt-level = 2
