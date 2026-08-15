@@ -17,6 +17,7 @@ pub enum Dialog {
     Event(EventForm),
     Categories(CategoryEditor),
     Export(ExportForm),
+    Import(ImportForm),
 }
 
 impl Dialog {
@@ -1586,6 +1587,334 @@ fn export_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut ExportFo
 }
 
 // ---------------------------------------------------------------------------
+// Import
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ImportTarget {
+    Events,
+    Biographies,
+}
+
+pub struct ImportForm {
+    pub target: ImportTarget,
+    pub timeline: Option<Id>,
+    pub url: String,
+    pub pasted: String,
+    pub importance: u8,
+    pub col_title: Option<usize>,
+    pub col_date: Option<usize>,
+    pub col_end_date: Option<usize>,
+    pub col_description: Option<usize>,
+    pub col_name: Option<usize>,
+    pub col_birth: Option<usize>,
+    pub col_death: Option<usize>,
+    pub col_category: Option<usize>,
+    pub col_culture: Option<usize>,
+    /// Set after a failed "Von URL laden", so the dialog can show it without
+    /// disturbing anything already pasted.
+    pub error: Option<String>,
+}
+
+impl Default for ImportForm {
+    fn default() -> Self {
+        Self {
+            target: ImportTarget::Events,
+            timeline: None,
+            url: String::new(),
+            pasted: String::new(),
+            importance: 3,
+            col_title: None,
+            col_date: None,
+            col_end_date: None,
+            col_description: None,
+            col_name: None,
+            col_birth: None,
+            col_death: None,
+            col_category: None,
+            col_culture: None,
+            error: None,
+        }
+    }
+}
+
+/// A first guess at which detected column feeds which field, so the common
+/// case of an obviously-named header ("Year", "Born", "Name"...) doesn't
+/// need mapping by hand at all — only re-guessed when the *set* of headers
+/// changes, so picking a column by hand is never silently overwritten on
+/// the next keystroke elsewhere in the pasted text.
+fn guess_column(headers: &[String], keywords: &[&str]) -> Option<usize> {
+    headers.iter().position(|h| {
+        let h = h.to_lowercase();
+        keywords.iter().any(|k| h.contains(k))
+    })
+}
+
+fn guess_columns(form: &mut ImportForm, headers: &[String]) {
+    match form.target {
+        ImportTarget::Events => {
+            form.col_title = form.col_title.or_else(|| guess_column(headers, &["titel", "title", "ereignis", "event", "name"]));
+            form.col_date = form.col_date.or_else(|| guess_column(headers, &["jahr", "year", "datum", "date", "beginn", "start"]));
+            form.col_end_date = form.col_end_date.or_else(|| guess_column(headers, &["bis", "end", "ende"]));
+            form.col_description = form.col_description.or_else(|| guess_column(headers, &["beschreibung", "description", "notiz", "note"]));
+        }
+        ImportTarget::Biographies => {
+            form.col_name = form.col_name.or_else(|| guess_column(headers, &["name"]));
+            form.col_birth = form.col_birth.or_else(|| guess_column(headers, &["geburt", "born", "birth"]));
+            form.col_death = form.col_death.or_else(|| guess_column(headers, &["tod", "died", "death", "gest"]));
+            form.col_category = form.col_category.or_else(|| guess_column(headers, &["kategorie", "category", "rolle", "role", "titel", "title"]));
+            form.col_culture = form.col_culture.or_else(|| guess_column(headers, &["kultur", "culture", "reich", "empire", "zeitstrahl"]));
+        }
+    }
+}
+
+fn column_picker(ui: &mut egui::Ui, label: &str, headers: &[String], value: &mut Option<usize>, required: bool) {
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let text = value
+            .and_then(|i| headers.get(i))
+            .cloned()
+            .unwrap_or_else(|| if required { "— wählen —".into() } else { "— keine —".into() });
+        egui::ComboBox::from_id_salt(("import_col", label))
+            .selected_text(text)
+            .show_ui(ui, |ui| {
+                if !required {
+                    ui.selectable_value(value, None, "— keine —");
+                }
+                for (i, h) in headers.iter().enumerate() {
+                    ui.selectable_value(value, Some(i), h);
+                }
+            });
+    });
+}
+
+fn resolve_category(doc: &mut Document, name: &str) -> Id {
+    if let Some(c) = doc.categories.iter().find(|c| c.name.eq_ignore_ascii_case(name)) {
+        return c.id;
+    }
+    let id = doc.new_id();
+    let color = STARTER_CATEGORIES[doc.categories.len() % STARTER_CATEGORIES.len()].1;
+    doc.categories.push(Category { id, name: name.to_string(), color, parent: None });
+    id
+}
+
+fn resolve_culture(doc: &Document, name: &str) -> Option<Id> {
+    doc.timelines.iter().find(|t| t.name.eq_ignore_ascii_case(name)).map(|t| t.id)
+}
+
+fn import_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut ImportForm) -> bool {
+    let mut keep_open = true;
+
+    egui::Modal::new(egui::Id::new("import_dialog")).show(ctx, |ui| {
+        ui.set_width(520.0);
+        ui.heading("Daten importieren");
+        ui.weak("Aus einer eingefügten Tabelle (z. B. direkt aus einer Wikipedia-Seite kopiert) oder von einer URL geladen.");
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Ziel:");
+            ui.selectable_value(&mut form.target, ImportTarget::Events, "Ereignisse auf einem Zeitstrahl");
+            ui.selectable_value(&mut form.target, ImportTarget::Biographies, "Biografien");
+        });
+
+        if form.target == ImportTarget::Events {
+            ui.horizontal(|ui| {
+                let text = form
+                    .timeline
+                    .and_then(|id| app.doc.timeline(id))
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| "— wählen —".into());
+                ui.label("Zeitstrahl:");
+                egui::ComboBox::from_id_salt("import_timeline")
+                    .selected_text(text)
+                    .show_ui(ui, |ui| {
+                        for t in &app.doc.timelines {
+                            ui.selectable_value(&mut form.timeline, Some(t.id), &t.name);
+                        }
+                    });
+            });
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Von URL laden:");
+            ui.add(egui::TextEdit::singleline(&mut form.url).desired_width(280.0).hint_text("https://…"));
+            if ui.button("Laden").on_hover_text("Lädt die Seite und übernimmt ihre erste Tabelle — braucht eine Internetverbindung.").clicked() {
+                form.error = None;
+                match crate::import::fetch_url(&form.url) {
+                    Ok(html) => match crate::import::extract_first_table_as_tsv(&html) {
+                        Ok(tsv) => form.pasted = tsv,
+                        Err(e) => form.error = Some(e),
+                    },
+                    Err(e) => form.error = Some(e),
+                }
+            }
+        });
+        if let Some(err) = &form.error {
+            ui.colored_label(BAD_RED, err);
+        }
+        ui.weak("Oder direkt eine Tabelle einfügen (z. B. mit der Maus aus einer Wikipedia-Seite kopiert):");
+        ui.add(
+            egui::TextEdit::multiline(&mut form.pasted)
+                .desired_rows(6)
+                .desired_width(f32::INFINITY)
+                .hint_text("Spalte1\tSpalte2\t…\nWert\tWert\t…"),
+        );
+
+        let table = crate::import::parse_table_text(&form.pasted);
+        if !table.headers.is_empty() {
+            guess_columns(form, &table.headers);
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(format!("{} Spalten erkannt · {} Zeilen", table.headers.len(), table.rows.len())).strong());
+
+            match form.target {
+                ImportTarget::Events => {
+                    column_picker(ui, "Titel", &table.headers, &mut form.col_title, true);
+                    column_picker(ui, "Datum/Jahr", &table.headers, &mut form.col_date, true);
+                    column_picker(ui, "Bis-Datum (optional)", &table.headers, &mut form.col_end_date, false);
+                    column_picker(ui, "Beschreibung (optional)", &table.headers, &mut form.col_description, false);
+                }
+                ImportTarget::Biographies => {
+                    column_picker(ui, "Name", &table.headers, &mut form.col_name, true);
+                    column_picker(ui, "Geburtsdatum", &table.headers, &mut form.col_birth, true);
+                    column_picker(ui, "Todestag (optional)", &table.headers, &mut form.col_death, false);
+                    column_picker(ui, "Kategorie (optional)", &table.headers, &mut form.col_category, false);
+                    column_picker(ui, "Kultur/Zeitstrahl (optional)", &table.headers, &mut form.col_culture, false);
+                }
+            }
+        }
+
+        ui.add_space(6.0);
+        importance_picker(ui, &mut form.importance);
+        ui.weak("Gilt zunächst für alle importierten Einträge — danach wie gewohnt einzeln änderbar.");
+
+        let ready = !table.headers.is_empty()
+            && !table.rows.is_empty()
+            && match form.target {
+                ImportTarget::Events => form.col_title.is_some() && form.col_date.is_some() && form.timeline.is_some(),
+                ImportTarget::Biographies => form.col_name.is_some() && form.col_birth.is_some(),
+            };
+
+        let mut preview: Option<(usize, usize)> = None;
+        if ready {
+            preview = Some(match form.target {
+                ImportTarget::Events => {
+                    let map = crate::import::EventColumnMap {
+                        title: form.col_title.unwrap(),
+                        date: form.col_date.unwrap(),
+                        end_date: form.col_end_date,
+                        description: form.col_description,
+                    };
+                    let (drafts, skipped) = crate::import::build_event_drafts(&table, &map);
+                    (drafts.len(), skipped.len())
+                }
+                ImportTarget::Biographies => {
+                    let map = crate::import::BiographyColumnMap {
+                        name: form.col_name.unwrap(),
+                        birth: form.col_birth.unwrap(),
+                        death: form.col_death,
+                        category: form.col_category,
+                        culture: form.col_culture,
+                    };
+                    let (drafts, skipped) = crate::import::build_biography_drafts(&table, &map);
+                    (drafts.len(), skipped.len())
+                }
+            });
+        }
+        if let Some((ok, skipped)) = preview {
+            ui.add_space(4.0);
+            if skipped > 0 {
+                ui.weak(format!("{ok} Zeile(n) werden importiert, {skipped} übersprungen (Datum nicht lesbar oder Pflichtfeld leer)."));
+            } else {
+                ui.weak(format!("{ok} Zeile(n) werden importiert."));
+            }
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("Abbrechen").clicked() {
+                keep_open = false;
+            }
+            let can_import = ready && preview.is_some_and(|(ok, _)| ok > 0);
+            if ui.add_enabled(can_import, egui::Button::new("Importieren")).clicked() {
+                match form.target {
+                    ImportTarget::Events => {
+                        let map = crate::import::EventColumnMap {
+                            title: form.col_title.unwrap(),
+                            date: form.col_date.unwrap(),
+                            end_date: form.col_end_date,
+                            description: form.col_description,
+                        };
+                        let (drafts, _) = crate::import::build_event_drafts(&table, &map);
+                        let owner = OwnerRef::Timeline(form.timeline.unwrap());
+                        let importance = form.importance;
+                        let count = drafts.len();
+                        app.mutate(|doc| {
+                            for d in drafts {
+                                let id = doc.new_id();
+                                let span = match d.end {
+                                    Some(end) => Span::range(d.start, end),
+                                    None => Span::point(d.start),
+                                };
+                                doc.events.push(Event {
+                                    id,
+                                    owner,
+                                    title: d.title,
+                                    description: d.description,
+                                    span,
+                                    importance,
+                                    categories: vec![],
+                                    parent: None,
+                                });
+                            }
+                        });
+                        app.info(format!("{count} Ereignis(se) importiert"));
+                    }
+                    ImportTarget::Biographies => {
+                        let map = crate::import::BiographyColumnMap {
+                            name: form.col_name.unwrap(),
+                            birth: form.col_birth.unwrap(),
+                            death: form.col_death,
+                            category: form.col_category,
+                            culture: form.col_culture,
+                        };
+                        let (drafts, _) = crate::import::build_biography_drafts(&table, &map);
+                        let importance = form.importance;
+                        let count = drafts.len();
+                        app.mutate(|doc| {
+                            for d in drafts {
+                                let category = d.category_name.as_deref().map(|n| resolve_category(doc, n));
+                                let timeline = d.culture_name.as_deref().and_then(|n| resolve_culture(doc, n));
+                                let id = doc.new_id();
+                                doc.biographies.push(Biography {
+                                    id,
+                                    name: d.name,
+                                    timeline,
+                                    birth: d.birth,
+                                    death: d.death,
+                                    color: None,
+                                    categories: category.into_iter().collect(),
+                                    importance,
+                                    display: if timeline.is_some() { BioDisplay::Inline } else { BioDisplay::Lane },
+                                    notes: String::new(),
+                                });
+                            }
+                        });
+                        app.info(format!("{count} Biografie(n) importiert"));
+                    }
+                }
+                keep_open = false;
+            }
+        });
+    });
+
+    keep_open
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch
 // ---------------------------------------------------------------------------
 
@@ -1602,6 +1931,7 @@ pub fn show_dialogs(app: &mut TimelineApp, ctx: &egui::Context) {
         Dialog::Biography(f) => biography_dialog(app, ctx, f),
         Dialog::Categories(f) => category_dialog(app, ctx, f),
         Dialog::Export(f) => export_dialog(app, ctx, f),
+        Dialog::Import(f) => import_dialog(app, ctx, f),
         Dialog::None => false,
     };
     // A dialog opened *by* this dialog (e.g. a delete confirmation) wins.

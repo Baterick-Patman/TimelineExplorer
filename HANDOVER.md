@@ -37,10 +37,23 @@ two nearby transition dates' easing windows (`TRANSITION_PX`, 110px) can
 visually overlap — correct, not a bug, but worth knowing before assuming
 something is broken from a screenshot taken zoomed far out.
 
-- **~9,700 lines** of Rust across 11 files in `src/`.
-- **122 tests**, all passing, no compiler warnings.
-- Release binary: `target/release/timeline_explorer.exe`, single file (image
-  encoding added a few hundred KB; still well under 10 MB).
+A further batch on top of that: a real bug fix (a collapsed group used to
+silently drop a member's connection to something outside it — see below),
+group reordering (siblings, same Up/Down shape as timelines already had)
+plus a best-effort "tidy" heuristic that nudges connected groups next to
+each other, search suggestions that jump the canvas straight to the match
+(reveal + pan + zoom, not just filter the current list), a real Google-style
+autocomplete dropdown under all three search fields, and bulk import of
+events or biographies from a pasted table or a URL — the one place in the
+app that now touches the network, and only when the user explicitly asks it
+to.
+
+- **~10,700 lines** of Rust across 13 files in `src/`.
+- **138 tests**, all passing, no compiler warnings.
+- Release binary: `target/release/timeline_explorer.exe`, single file, ~9 MB
+  (image encoding, `ureq`+`rustls` for the optional URL fetch, and
+  `scraper`+`html5ever` for HTML table parsing account for the growth from
+  the ~6.4 MB the first release shipped at — still one file, no installer).
 
 ### Export reuses the real canvas painter — it does not re-render anything
 
@@ -383,12 +396,136 @@ functions run, and writes them back after — that is what lets
 like every other panel function here, instead of needing `&mut TimelineApp`
 just to update two strings and an enum.
 
-Biography clustering (`panels::bio_cluster`) is keyed on `(id_salt, Id)` for
-`CollapsingHeader`'s `id_salt` — egui persists the open/closed state per id
-across frames automatically, no extra bookkeeping needed. Category clusters
-are **not** a partition: a biography with several categories appears in each
-matching cluster, unlike culture clustering where each biography has exactly
-one (or none).
+Biography clustering (`panels::bio_cluster`) is keyed on `(id_salt, Id)`,
+passed to `egui::collapsing_header::CollapsingState::load_with_default_open`
+— egui persists the open/closed state per id across frames automatically, no
+extra bookkeeping needed. It uses `CollapsingState` directly (not the
+higher-level `CollapsingHeader`) specifically so the header row can carry
+the "alle anzeigen"/"alle ausblenden" buttons alongside the label —
+`CollapsingHeader` only exposes that via `.show_header()`, which is actually
+a `CollapsingState` method reached through a type coercion, not something
+`CollapsingHeader` itself has; reaching for `CollapsingState` up front avoids
+that trap. Category clusters are **not** a partition: a biography with
+several categories appears in each matching cluster, unlike culture
+clustering where each biography has exactly one (or none).
+
+### A collapsed group used to silently drop a member's outside connection
+
+If timeline A (inside a collapsed group) had `merge.other` pointing at
+something outside the group, the merge curve simply vanished the moment the
+group collapsed — `paint_group_lane`'s collapsed branch drew one flat summary
+rectangle and nothing else, with no idea any of its members had an
+`origin`/`merge` at all. Fixed by `layout::group_external_junctions`, which
+walks every member and reports each origin/merge whose *other end* is not
+itself inside the group; `canvas::paint_group_lane` then synthesizes a
+throwaway `Timeline` carrying just that one junction and feeds it through the
+same `band_curve` a normal band uses, so the curve eases out of the flat
+summary band exactly the way it would out of the member's own lane if the
+group were expanded. No new curve maths — same easing function, same
+`TRANSITION_PX` window, just fed a stand-in `Timeline` instead of a real one.
+
+### Group ordering is manual by default, with a best-effort "tidy" on top
+
+`panels::reorder_group` mirrors the timeline `reorder` that already existed
+(Up/Down among same-parent siblings, dense renumbering) — this was a real
+gap, not a design choice; groups had an `order` field since the original
+implementation but nothing in the UI ever changed it.
+
+`layout::suggest_group_order` is a separate, opt-in "Verbundene Gruppen
+zusammenrücken" action (a button, not automatic background behaviour) that
+greedily chains top-level groups so ones connected by an origin/merge end up
+adjacent — cuts down on a merge curve visually crossing through unrelated
+bands. **This is deliberately not a general crossing-minimisation solver**
+(that's a hard graph-layout problem) — just a greedy nearest-neighbour chain,
+and it only reorders siblings at one level (called on the top level from the
+UI; it takes a `parent` argument, so recursing into subgroups is a small
+follow-up if it's ever wanted, not a redesign). Groups with no cross-group
+connection at all keep their existing relative order rather than being
+shuffled for no reason — see the two tests next to it in `layout.rs` for the
+exact guarantee.
+
+### Search suggestions jump the canvas, they don't just filter
+
+`app::JumpTarget` (Event/Biography/Timeline/Group) is deliberately a
+separate type from `Selection`, even though the variants line up one to
+one — a jump target is "what to reveal and frame," a selection is "what the
+inspector shows right now," and keeping them apart leaves room for a jump
+target later that isn't a valid `Selection` (an epoch, say) without having
+to touch `Selection` itself.
+
+`TimelineApp::jump_to` does two genuinely separate things and is careful to
+route them through the app's two different "this changed" channels
+correctly: revealing whatever stands between the target and being visible
+(un-hiding the timeline, expanding every ancestor group, restoring a
+`Hidden` biography to `Inline`/`Lane`) goes through `mutate` — a real,
+undoable document edit, the same as any other visibility toggle in this
+app — while the resulting pan/zoom goes through `mark_dirty` only, same as
+`fit_to_content`, since view state was already established as "persists,
+but doesn't clutter undo." Getting this split wrong in either direction
+would be a real regression: routing the reveal through `mark_dirty` only
+would make an unwanted "oh, and it un-collapsed three groups" impossible to
+undo; routing the pan/zoom through `mutate` would spam the undo stack with
+one entry per search.
+
+`reveal_jump_target` is pure (`&mut Document`, no `TimelineApp`) and has its
+own tests in `app.rs` — cheaper to verify this way than by driving the real
+UI, and it already caught the one subtlety worth knowing: revealing a
+biography must only touch its `display` if it was `Hidden`. An
+already-visible one (shown as `Lane` despite having a culture, say) must not
+be silently switched to `Inline` just because jumping to it noticed it has
+one.
+
+### The suggestion dropdown is a real `egui::Popup`, not an inline list
+
+`panels::suggestions` anchors a floating popup below the search field via
+`egui::Popup::from_response(resp).align(RectAlign::BOTTOM_START)`, forcing
+`.open(true)` explicitly rather than relying on the popup's own
+click-tracked memory (which is what `from_response` alone would leave it to,
+and does not match "open exactly when this field has focus and the query
+has matches"). It reuses one generic helper across all three search fields
+(top canvas search, sidebar timeline/group search, sidebar biography search)
+by being generic over the payload type — the top search's candidates are a
+`JumpTarget` (heterogeneous: events, biographies, timelines, groups all in
+one list), the sidebar ones are also `JumpTarget` now so that picking a
+sidebar suggestion jumps the canvas too, for consistency, even though the
+sidebar's own live-filtered tree already narrows things down on its own.
+Pressing Enter while the field has focus picks the top match without
+needing to click it — checked via `resp.ctx.input(|i| i.key_pressed(...))`
+inside the helper itself, so every call site gets it for free.
+
+### Import: network access is opt-in, and lives in exactly one function
+
+`import::fetch_url` is the *only* function in the entire codebase that
+touches the network, and it only ever runs when the user clicks "Von URL
+laden" inside the import dialog — nothing calls it on startup, on a timer,
+or as a side effect of anything else. If you are auditing this app for
+"does it phone home", that one function (and its one call site in
+`forms.rs`'s `import_dialog`) is the whole answer.
+
+Deliberately **not** a full table-layout engine:
+`import::extract_first_table_as_tsv` does not reconstruct `rowspan`/
+`colspan` — a cell spanning several rows only ends up attributed to the
+first of them. Wikipedia's simple "list of monarchs" style tables are
+usually spanless and import cleanly; a table that does use spans needs a
+touch-up pass after import rather than a perfect parse. This was a
+deliberate scope cut, not an oversight — reconstructing spans correctly
+(propagating a spanning cell down/across the grid it visually covers) is
+real complexity for a feature whose fallback (fix it by hand afterwards) is
+already available and cheap.
+
+The column-mapping guess (`import::guess_column`, matching header text
+against a keyword list per field) only fills in a field that is still
+`None` — `guess_columns` is called every frame once headers exist, but
+`.or_else(...)` means a column the user already picked by hand is never
+silently overwritten by a re-guess triggered by, say, pasting the same table
+again with one row appended.
+
+Row parsing is lenient by design: a row with an unparseable date or an empty
+required field is skipped, not treated as a reason to abort the whole
+import — `import::build_event_drafts`/`build_biography_drafts` return
+`(Vec<Draft>, Vec<(row_number, reason)>)` so the dialog can report exactly
+how many rows landed and why any others didn't, rather than an all-or-nothing
+"table wasn't quite right, so nothing happened."
 
 ### The egui hover-reflow workaround
 

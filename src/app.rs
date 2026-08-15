@@ -3,7 +3,9 @@
 use crate::canvas;
 use crate::example;
 use crate::export::{self, ExportFormat, ExportJob, ExportStage};
-use crate::forms::{BiographyForm, CategoryEditor, Dialog, EventForm, ExportForm, GroupForm, TimelineForm};
+use crate::forms::{
+    BiographyForm, CategoryEditor, Dialog, EventForm, ExportForm, GroupForm, ImportForm, TimelineForm,
+};
 use crate::layout::{self, Lane, TimeAxis};
 use crate::model::*;
 use crate::panels;
@@ -24,6 +26,97 @@ pub enum Selection {
     Timeline(Id),
     Biography(Id),
     Event(Id),
+}
+
+/// Something a search suggestion can point at and jump the canvas to.
+/// Distinct from `Selection`, even though the variants line up one to one:
+/// a `Selection` is "what the inspector currently shows", a `JumpTarget` is
+/// "what to reveal and frame" — keeping them separate leaves room for a
+/// jump target that isn't selectable (an epoch, say) without disturbing
+/// `Selection` itself.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JumpTarget {
+    Group(Id),
+    Timeline(Id),
+    Biography(Id),
+    Event(Id),
+}
+
+impl From<JumpTarget> for Selection {
+    fn from(t: JumpTarget) -> Self {
+        match t {
+            JumpTarget::Group(id) => Selection::Group(id),
+            JumpTarget::Timeline(id) => Selection::Timeline(id),
+            JumpTarget::Biography(id) => Selection::Biography(id),
+            JumpTarget::Event(id) => Selection::Event(id),
+        }
+    }
+}
+
+/// Un-hide and expand whatever stands between `target` and actually being
+/// visible: the timeline itself, every ancestor group (expanded, not just
+/// visible), and — for an event — its owner, recursing once more for an
+/// event that belongs to a biography that belongs to a culture.
+fn reveal_jump_target(doc: &mut Document, target: JumpTarget) {
+    fn reveal_group_chain(doc: &mut Document, group: Option<Id>) {
+        let mut cursor = group;
+        let mut guard = 0;
+        while let Some(id) = cursor {
+            guard += 1;
+            if guard > 64 {
+                break; // A hand-edited file could contain a parent cycle.
+            }
+            let parent = doc.group(id).and_then(|g| g.parent);
+            if let Some(g) = doc.group_mut(id) {
+                g.collapsed = false;
+                g.visible = true;
+            }
+            cursor = parent;
+        }
+    }
+    fn reveal_timeline(doc: &mut Document, id: Id) {
+        let group = doc.timeline(id).and_then(|t| t.group);
+        if let Some(t) = doc.timeline_mut(id) {
+            t.visible = true;
+        }
+        reveal_group_chain(doc, group);
+    }
+    fn reveal_biography(doc: &mut Document, id: Id) {
+        let timeline = doc.biography(id).and_then(|b| b.timeline);
+        if let Some(b) = doc.biography_mut(id) {
+            if b.display == BioDisplay::Hidden {
+                b.display = if b.timeline.is_some() {
+                    BioDisplay::Inline
+                } else {
+                    BioDisplay::Lane
+                };
+            }
+        }
+        if let Some(t) = timeline {
+            reveal_timeline(doc, t);
+        }
+    }
+
+    match target {
+        JumpTarget::Group(id) => {
+            reveal_group_chain(doc, Some(id));
+            for tid in doc.group_timelines(id) {
+                if let Some(t) = doc.timeline_mut(tid) {
+                    t.visible = true;
+                }
+            }
+        }
+        JumpTarget::Timeline(id) => reveal_timeline(doc, id),
+        JumpTarget::Biography(id) => reveal_biography(doc, id),
+        JumpTarget::Event(id) => {
+            if let Some(owner) = doc.event(id).map(|e| e.owner) {
+                match owner {
+                    OwnerRef::Timeline(t) => reveal_timeline(doc, t),
+                    OwnerRef::Biography(b) => reveal_biography(doc, b),
+                }
+            }
+        }
+    }
 }
 
 /// How the sidebar clusters biographies for collapsing — by their culture
@@ -309,6 +402,58 @@ impl TimelineApp {
         self.doc.view.left_year = lo - pad;
         self.y_offset = 0.0;
         self.mark_dirty();
+    }
+
+    // --- Jump-to-search-result --------------------------------------------
+
+    /// Pan/zoom to `target`, revealing it first if it is currently hidden or
+    /// tucked inside a collapsed group — jumping to something the user just
+    /// searched for and landing on an unchanged, empty-looking view would
+    /// defeat the point.
+    pub fn jump_to(&mut self, target: JumpTarget, width: f32) {
+        let Some((date, importance)) = self.jump_anchor(target) else {
+            return;
+        };
+
+        self.mutate(|doc| reveal_jump_target(doc, target));
+
+        // Zoomed in enough to read individual events/lifespans comfortably,
+        // without being so close that "jump to a whole timeline" only shows
+        // a sliver of it.
+        let ppy: f64 = 8.0;
+        let base = layout::importance_threshold(ppy, 0);
+        let needed_bias = (base as i32 - importance as i32).max(0);
+        self.doc.view.pixels_per_year = ppy;
+        self.doc.view.left_year = date - (width as f64 / ppy) * 0.4;
+        self.doc.view.filters.detail_bias = self.doc.view.filters.detail_bias.max(needed_bias);
+        self.y_offset = 0.0;
+        self.selection = Some(target.into());
+        self.mark_dirty();
+    }
+
+    /// Where a jump target sits on the axis, and how important it is (so the
+    /// zoom-dependent threshold can be pushed aside if it would otherwise
+    /// hide the very thing just jumped to).
+    fn jump_anchor(&self, target: JumpTarget) -> Option<(f64, u8)> {
+        match target {
+            JumpTarget::Event(id) => self.doc.event(id).map(|e| (e.span.t0(), e.importance)),
+            JumpTarget::Biography(id) => self.doc.biography(id).map(|b| (b.birth.decimal(), b.importance)),
+            JumpTarget::Timeline(id) => self
+                .doc
+                .timeline(id)
+                .and_then(|t| layout::timeline_band_range(&self.doc, t))
+                .map(|(lo, _)| (lo, IMPORTANCE_MAX)),
+            JumpTarget::Group(id) => self
+                .doc
+                .group_timelines(id)
+                .iter()
+                .filter_map(|&tid| {
+                    self.doc.timeline(tid).and_then(|t| layout::timeline_band_range(&self.doc, t))
+                })
+                .map(|(lo, _)| lo)
+                .fold(None, |acc: Option<f64>, lo| Some(acc.map_or(lo, |a: f64| a.min(lo))))
+                .map(|lo| (lo, IMPORTANCE_MAX)),
+        }
     }
 
     // --- Export -------------------------------------------------------
@@ -697,6 +842,10 @@ impl TimelineApp {
                     self.dialog = Dialog::Export(ExportForm::new(&self.doc));
                     ui.close();
                 }
+                if ui.button("Daten importieren…").clicked() {
+                    self.dialog = Dialog::Import(ImportForm::default());
+                    ui.close();
+                }
                 ui.separator();
                 if ui.button("Datenordner anzeigen").clicked() {
                     store::reveal_in_explorer(&self.path);
@@ -782,6 +931,26 @@ impl TimelineApp {
                 self.doc.view.filters.search = search;
                 self.mark_dirty();
             }
+
+            // Suggestions jump straight to the match — searching for an
+            // event or person and landing on an unchanged view would defeat
+            // the point of searching at all.
+            let candidates = self
+                .doc
+                .events
+                .iter()
+                .map(|e| (e.title.clone(), JumpTarget::Event(e.id)))
+                .chain(self.doc.biographies.iter().map(|b| (b.name.clone(), JumpTarget::Biography(b.id))))
+                .chain(self.doc.timelines.iter().map(|t| (t.name.clone(), JumpTarget::Timeline(t.id))))
+                .chain(self.doc.groups.iter().map(|g| (g.name.clone(), JumpTarget::Group(g.id))));
+            let picked =
+                panels::suggestions(&resp, "top_search_suggest", &self.doc.view.filters.search, candidates, 8);
+            if let Some(target) = picked {
+                let width = self.last_width.unwrap_or(1200.0);
+                self.doc.view.filters.search.clear();
+                self.jump_to(target, width);
+            }
+
             if !self.doc.view.filters.search.is_empty() && ui.button("Leeren").clicked() {
                 self.doc.view.filters.search.clear();
                 self.mark_dirty();
@@ -1001,5 +1170,126 @@ impl TimelineApp {
                 });
             });
         self.show_help = open;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revealing_an_event_unhides_its_timeline_and_expands_every_ancestor_group() {
+        let mut doc = Document::default();
+        let outer = doc.new_id();
+        doc.groups.push(Group {
+            id: outer,
+            name: "Antiquity".into(),
+            color: [0, 0, 0],
+            parent: None,
+            order: 0,
+            collapsed: true,
+            visible: true,
+            notes: String::new(),
+        });
+        let inner = doc.new_id();
+        doc.groups.push(Group {
+            id: inner,
+            name: "Greek antiquity".into(),
+            color: [0, 0, 0],
+            parent: Some(outer),
+            order: 0,
+            collapsed: true,
+            visible: true,
+            notes: String::new(),
+        });
+        let tl = doc.new_id();
+        doc.timelines.push(Timeline {
+            id: tl,
+            name: "Athens".into(),
+            color: [0, 0, 0],
+            visible: false,
+            group: Some(inner),
+            order: 0,
+            span: None,
+            origin: None,
+            merge: None,
+            notes: String::new(),
+            epochs: Vec::new(),
+        });
+        let ev = doc.new_id();
+        doc.events.push(Event {
+            id: ev,
+            owner: OwnerRef::Timeline(tl),
+            title: "Battle of Marathon".into(),
+            description: String::new(),
+            span: Span::circa_point(-490),
+            importance: 3,
+            categories: vec![],
+            parent: None,
+        });
+
+        reveal_jump_target(&mut doc, JumpTarget::Event(ev));
+
+        assert!(doc.timeline(tl).unwrap().visible);
+        assert!(!doc.group(inner).unwrap().collapsed);
+        assert!(!doc.group(outer).unwrap().collapsed);
+    }
+
+    #[test]
+    fn revealing_a_hidden_biography_restores_inline_when_it_has_a_culture() {
+        let mut doc = Document::default();
+        let tl = doc.new_id();
+        doc.timelines.push(Timeline {
+            id: tl,
+            name: "Rome".into(),
+            color: [0, 0, 0],
+            visible: true,
+            group: None,
+            order: 0,
+            span: None,
+            origin: None,
+            merge: None,
+            notes: String::new(),
+            epochs: Vec::new(),
+        });
+        let bio = doc.new_id();
+        doc.biographies.push(Biography {
+            id: bio,
+            name: "Cicero".into(),
+            timeline: Some(tl),
+            birth: HDate::year(-106),
+            death: Some(HDate::year(-43)),
+            color: None,
+            categories: vec![],
+            importance: 4,
+            display: BioDisplay::Hidden,
+            notes: String::new(),
+        });
+
+        reveal_jump_target(&mut doc, JumpTarget::Biography(bio));
+
+        assert_eq!(doc.biography(bio).unwrap().display, BioDisplay::Inline);
+    }
+
+    #[test]
+    fn revealing_an_unhidden_biography_leaves_its_display_alone() {
+        // Already showing as its own lane — a jump must not silently switch
+        // it to Inline just because it happens to have a culture.
+        let mut doc = Document::default();
+        let bio = doc.new_id();
+        doc.biographies.push(Biography {
+            id: bio,
+            name: "Anon".into(),
+            timeline: None,
+            birth: HDate::year(-100),
+            death: None,
+            color: None,
+            categories: vec![],
+            importance: 3,
+            display: BioDisplay::Lane,
+            notes: String::new(),
+        });
+        reveal_jump_target(&mut doc, JumpTarget::Biography(bio));
+        assert_eq!(doc.biography(bio).unwrap().display, BioDisplay::Lane);
     }
 }

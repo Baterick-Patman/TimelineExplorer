@@ -2,6 +2,7 @@
 
 use crate::app::{BioGroupBy, Confirm, Selection, TimelineApp};
 use crate::forms::{CategoryEditor, Dialog, EventForm, GroupForm};
+use crate::layout;
 use crate::model::*;
 use crate::theme::to_color;
 use std::collections::BTreeSet;
@@ -15,6 +16,8 @@ enum Action {
     ToggleGroupVisible(Id),
     ToggleCollapsed(Id),
     Move(Id, i32),
+    MoveGroup(Id, i32),
+    TidyTopLevelGroups,
     SetDisplay(Id, BioDisplay),
     AddEventTo(OwnerRef),
     AddNestedEventTo(OwnerRef, Id),
@@ -25,6 +28,7 @@ enum Action {
     /// toggle, only a three-way `display`.
     ShowCluster(Vec<Id>),
     HideCluster(Vec<Id>),
+    Jump(crate::app::JumpTarget),
 }
 
 pub fn sidebar(app: &mut TimelineApp, ui: &mut egui::Ui) {
@@ -72,6 +76,15 @@ fn apply(app: &mut TimelineApp, a: Action) {
             }
         }),
         Action::Move(id, delta) => app.mutate(|doc| reorder(doc, id, delta)),
+        Action::MoveGroup(id, delta) => app.mutate(|doc| reorder_group(doc, id, delta)),
+        Action::TidyTopLevelGroups => app.mutate(|doc| {
+            let order = layout::suggest_group_order(doc, None);
+            for (i, id) in order.iter().enumerate() {
+                if let Some(g) = doc.group_mut(*id) {
+                    g.order = i as u32;
+                }
+            }
+        }),
         Action::SetDisplay(id, d) => app.mutate(|doc| {
             if let Some(b) = doc.biography_mut(id) {
                 b.display = d;
@@ -120,6 +133,10 @@ fn apply(app: &mut TimelineApp, a: Action) {
                 }
             }
         }),
+        Action::Jump(target) => {
+            let width = app.last_width.unwrap_or(1200.0);
+            app.jump_to(target, width);
+        }
     }
 }
 
@@ -146,11 +163,79 @@ fn reorder(doc: &mut Document, id: Id, delta: i32) {
     }
 }
 
+/// Move a group up or down among its siblings (same parent group, or the
+/// top level), renumbering so order stays dense. Mirrors `reorder` for
+/// timelines.
+fn reorder_group(doc: &mut Document, id: Id, delta: i32) {
+    let Some(parent) = doc.group(id).map(|g| g.parent) else {
+        return;
+    };
+    let mut siblings: Vec<Id> = doc.child_groups(parent).iter().map(|g| g.id).collect();
+    let Some(pos) = siblings.iter().position(|s| *s == id) else {
+        return;
+    };
+    let target = pos as i32 + delta;
+    if target < 0 || target >= siblings.len() as i32 {
+        return;
+    }
+    siblings.swap(pos, target as usize);
+    for (i, sid) in siblings.iter().enumerate() {
+        if let Some(g) = doc.group_mut(*sid) {
+            g.order = i as u32;
+        }
+    }
+}
+
 fn section_header(ui: &mut egui::Ui, title: &str, count: usize) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(title).strong());
         ui.weak(format!("({count})"));
     });
+}
+
+/// A small "Google-style" suggestion dropdown anchored below `resp` (a
+/// search field's response): up to `limit` candidates whose name contains
+/// the current query, case-insensitively, each a clickable row. Returns the
+/// candidate clicked, or the top match if Enter was pressed while the field
+/// had focus. Stays closed while the field itself isn't focused or the
+/// query is empty — an always-open empty box would just be visual noise
+/// between keystrokes.
+pub fn suggestions<T: Copy>(
+    resp: &egui::Response,
+    id_salt: &str,
+    query: &str,
+    candidates: impl Iterator<Item = (String, T)>,
+    limit: usize,
+) -> Option<T> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() || !resp.has_focus() {
+        return None;
+    }
+    let matches: Vec<(String, T)> = candidates
+        .filter(|(name, _)| name.to_lowercase().contains(&needle))
+        .take(limit)
+        .collect();
+    if matches.is_empty() {
+        return None;
+    }
+    if resp.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+        return Some(matches[0].1);
+    }
+
+    let mut picked = None;
+    egui::Popup::from_response(resp)
+        .id(egui::Id::new(id_salt))
+        .align(egui::RectAlign::BOTTOM_START)
+        .open(true)
+        .close_behavior(egui::PopupCloseBehavior::IgnoreClicks)
+        .show(|ui| {
+            for (name, value) in matches {
+                if ui.selectable_label(false, name).clicked() {
+                    picked = Some(value);
+                }
+            }
+        });
+    picked
 }
 
 fn color_chip(ui: &mut egui::Ui, color: Rgb) {
@@ -235,11 +320,26 @@ fn timelines_section(
     });
     ui.weak("Gruppen klappen zu einem einzigen Band zusammen, damit sich ganze Kulturen vergleichen lassen.");
     ui.add_space(2.0);
-    ui.add(
+    let search_resp = ui.add(
         egui::TextEdit::singleline(search)
             .hint_text("Zeitstrahlen und Gruppen suchen…")
             .desired_width(f32::INFINITY),
     );
+
+    let candidates = app
+        .doc
+        .groups
+        .iter()
+        .map(|g| (g.name.clone(), crate::app::JumpTarget::Group(g.id)))
+        .chain(
+            app.doc
+                .timelines
+                .iter()
+                .map(|t| (t.name.clone(), crate::app::JumpTarget::Timeline(t.id))),
+        );
+    if let Some(target) = suggestions(&search_resp, "timeline_search_suggest", search, candidates, 8) {
+        actions.push(Action::Jump(target));
+    }
     ui.add_space(2.0);
 
     let needle = search.trim().to_lowercase();
@@ -255,9 +355,23 @@ fn timelines_section(
         }
     }
     ui.add_space(2.0);
-    if ui.small_button("+ Gruppe auf oberster Ebene").clicked() {
-        actions.push(Action::NewGroupUnder(None));
-    }
+    ui.horizontal(|ui| {
+        if ui.small_button("+ Gruppe auf oberster Ebene").clicked() {
+            actions.push(Action::NewGroupUnder(None));
+        }
+        if app.doc.groups.iter().any(|g| g.parent.is_none())
+            && ui
+                .small_button("Verbundene Gruppen zusammenrücken")
+                .on_hover_text(
+                    "Gruppen mit \"Spaltet sich ab von\"/\"Geht auf in\"-Verbindungen zueinander \
+                     nebeneinander anordnen (oberste Ebene) — bestmöglich, kein Garant gegen jede \
+                     Überschneidung.",
+                )
+                .clicked()
+        {
+            actions.push(Action::TidyTopLevelGroups);
+        }
+    });
 }
 
 /// Render one level of the group tree, then recurse.
@@ -324,6 +438,12 @@ fn group_tree(
                 }
                 if ui.small_button("+ Untergruppe").clicked() {
                     actions.push(Action::NewGroupUnder(Some(g.id)));
+                }
+                if ui.small_button("Hoch").on_hover_text("Nach oben verschieben").clicked() {
+                    actions.push(Action::MoveGroup(g.id, -1));
+                }
+                if ui.small_button("Runter").on_hover_text("Nach unten verschieben").clicked() {
+                    actions.push(Action::MoveGroup(g.id, 1));
                 }
                 if ui.small_button("Entfernen").clicked() {
                     actions.push(Action::Delete(Selection::Group(g.id)));
@@ -412,11 +532,19 @@ fn biographies_section(
 ) {
     section_header(ui, "Biografien", app.doc.biographies.len());
     ui.weak("Eingebettet verschachtelt sich unter einer Kultur; Eigene Spur läuft parallel dazu.");
-    ui.add(
+    let search_resp = ui.add(
         egui::TextEdit::singleline(search)
             .hint_text("Biografien suchen…")
             .desired_width(f32::INFINITY),
     );
+    let candidates = app
+        .doc
+        .biographies
+        .iter()
+        .map(|b| (b.name.clone(), crate::app::JumpTarget::Biography(b.id)));
+    if let Some(target) = suggestions(&search_resp, "bio_search_suggest", search, candidates, 8) {
+        actions.push(Action::Jump(target));
+    }
     ui.horizontal(|ui| {
         ui.weak("Gruppieren nach:");
         if ui.selectable_label(*group_by == BioGroupBy::Culture, "Kultur").clicked() {
@@ -1035,6 +1163,34 @@ mod tests {
         let mut doc = doc_with(&["A", "B"]);
         reorder(&mut doc, Id(999), 1);
         assert_eq!(order_of(&doc), vec!["A", "B"]);
+    }
+
+    fn group_order_of(doc: &Document, parent: Option<Id>) -> Vec<String> {
+        doc.child_groups(parent).iter().map(|g| g.name.clone()).collect()
+    }
+
+    #[test]
+    fn moving_a_group_up_swaps_it_with_its_sibling() {
+        let mut doc = Document::default();
+        let _a = group(&mut doc, "A", None);
+        let b = group(&mut doc, "B", None);
+        let _c = group(&mut doc, "C", None);
+        reorder_group(&mut doc, b, -1);
+        assert_eq!(group_order_of(&doc, None), vec!["B", "A", "C"]);
+    }
+
+    #[test]
+    fn moving_a_group_is_scoped_to_its_own_parent() {
+        let mut doc = Document::default();
+        let outer = group(&mut doc, "Outer", None);
+        let a = group(&mut doc, "A", Some(outer));
+        let _b = group(&mut doc, "B", Some(outer));
+        let _top = group(&mut doc, "Top", None);
+        // A moving up must not jump out of its parent, even though "Top" is
+        // its immediate predecessor in the raw document order.
+        reorder_group(&mut doc, a, -1);
+        assert_eq!(group_order_of(&doc, Some(outer)), vec!["A", "B"]);
+        assert_eq!(group_order_of(&doc, None), vec!["Outer", "Top"]);
     }
 
     // --- Sidebar search -------------------------------------------------------

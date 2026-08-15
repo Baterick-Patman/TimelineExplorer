@@ -82,7 +82,9 @@ pub fn draw(app: &mut TimelineApp, ui: &mut egui::Ui) {
                 }
             }
             LaneKind::Group(id) => {
-                paint_group_lane(&clip, &app.doc, id, lane, &axis, content_rect, &theme);
+                paint_group_lane(
+                    &clip, &app.doc, id, lane, &centers, &axis, view_from, view_to, content_rect, &theme,
+                );
             }
         }
     }
@@ -1022,12 +1024,16 @@ fn paint_range(
 /// A group row. Expanded it is just a heading with a bracket; collapsed it
 /// becomes a single band spanning everything beneath it, so whole
 /// civilisations can be compared without unfolding them.
+#[allow(clippy::too_many_arguments)]
 fn paint_group_lane(
     p: &egui::Painter,
     doc: &Document,
     id: Id,
     lane: &Lane,
+    centers: &std::collections::HashMap<Id, f32>,
     axis: &TimeAxis,
+    view_from: f64,
+    view_to: f64,
     content_rect: Rect,
     theme: &Theme,
 ) {
@@ -1071,6 +1077,45 @@ fn paint_group_lane(
         );
         x += 9.0;
     }
+
+    // A collapsed group would otherwise silently drop any member's
+    // connection to something outside it — draw it from the flat summary
+    // band itself by borrowing the same easing `band_curve` already gives a
+    // single timeline, via a throwaway `Timeline` carrying just that one
+    // junction.
+    let (from, to) = (lo.max(view_from), hi.min(view_to));
+    if to > from {
+        for (junction, is_merge) in group_external_junctions(doc, id) {
+            if !centers.contains_key(&junction.other) {
+                continue; // Falls back to a straight band, same as any hidden target.
+            }
+            let mut stand_in = Timeline {
+                id,
+                name: String::new(),
+                color: lane.color,
+                visible: true,
+                order: 0,
+                group: None,
+                span: None,
+                origin: None,
+                merge: None,
+                notes: String::new(),
+                epochs: Vec::new(),
+            };
+            if is_merge {
+                stand_in.merge = Some(junction);
+            } else {
+                stand_in.origin = Some(junction);
+            }
+            let pts = band_curve(&stand_in, lane.center, centers, axis, from, to);
+            if pts.len() < 2 {
+                continue;
+            }
+            let points: Vec<Pos2> = pts.iter().map(|(x, y)| Pos2::new(*x, *y)).collect();
+            p.add(egui::Shape::line(points, Stroke::new(lane.thickness, with_alpha(color, 235))));
+        }
+    }
+
     let _ = theme;
 }
 

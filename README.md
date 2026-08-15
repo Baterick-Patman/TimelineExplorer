@@ -3,8 +3,10 @@
 A local, offline Windows tool for building and comparing parallel historical
 timelines. Built from `timeline_app_planning.md`.
 
-Ships as **one self-contained `.exe`**: no installer, no runtime to install, no
-network access at any point.
+Ships as **one self-contained `.exe`**: no installer, no runtime to install,
+and no network access unless you explicitly ask for it via the "Von URL
+laden" button in the import dialog (used to pull a table straight off a
+page, e.g. Wikipedia). Nothing else in the app ever goes online.
 
 ## Download
 
@@ -17,7 +19,7 @@ every tagged version.
 cargo build --release
 ```
 
-The result is `target/release/timeline_explorer.exe` (~6 MB). Copy it anywhere
+The result is `target/release/timeline_explorer.exe` (~9 MB). Copy it anywhere
 and run it — nothing else is needed.
 
 ```bash
@@ -35,8 +37,10 @@ The single-executable constraint drove the choice.
   redistributable is required. Verified against the PE import table: the only
   DLLs it imports are ones that ship with Windows (`kernel32`, `user32`,
   `gdi32`, `opengl32`, `shell32`, …). No .NET, no WebView2, no VC++ redist.
-- **Fully offline.** No network code exists in the binary. Fonts are compiled
-  in; rendering goes straight to OpenGL.
+- **Offline by default.** The only network code in the binary is
+  `import::fetch_url`, used solely by the import dialog's opt-in "Von URL
+  laden" button — nothing else ever makes a request. Fonts are compiled in;
+  rendering goes straight to OpenGL.
 - **Rendering.** The app is essentially one large custom canvas — converging
   bands, importance-scaled type, free zoom and pan. egui is an immediate-mode
   painter, so that geometry is drawn directly rather than fought against a

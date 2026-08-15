@@ -5,7 +5,7 @@
 //! reasoned about and tested without a window on screen.
 
 use crate::model::*;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 // --- Tunables ---------------------------------------------------------------
 
@@ -507,6 +507,65 @@ pub fn timeline_centers(lanes: &[Lane]) -> HashMap<Id, f32> {
         .collect()
 }
 
+/// A best-effort reordering of the groups that share `parent` (siblings —
+/// this does not reach into subgroups), greedily placing each one next to
+/// whichever other sibling its timelines have the most origin/merge
+/// connections with. Cuts down on a merge curve crossing through unrelated
+/// bands the way "Griechische Antike" sitting far from "Griechische
+/// Bronzezeit" would, even though nothing between them is actually related.
+///
+/// This is **not** a general crossing-minimisation solver — that is a hard
+/// graph-layout problem in general, and the docstring on the caller should
+/// say so — but a simple greedy chain already helps the common case of a
+/// handful of connected cultures. Siblings with no cross-group connection at
+/// all keep their existing relative order, so this never scrambles an
+/// otherwise-unrelated group list for no reason.
+pub fn suggest_group_order(doc: &Document, parent: Option<Id>) -> Vec<Id> {
+    let siblings: Vec<Id> = doc.child_groups(parent).iter().map(|g| g.id).collect();
+    if siblings.len() < 2 {
+        return siblings;
+    }
+
+    let subtrees: Vec<(Id, BTreeSet<Id>)> = siblings
+        .iter()
+        .map(|&g| (g, doc.group_timelines(g).into_iter().collect()))
+        .collect();
+    let group_of_timeline = |t: Id| -> Option<Id> {
+        subtrees.iter().find(|(_, members)| members.contains(&t)).map(|(g, _)| *g)
+    };
+
+    let mut weight: HashMap<(Id, Id), u32> = HashMap::new();
+    let key = |a: Id, b: Id| if a.0 < b.0 { (a, b) } else { (b, a) };
+    for (g, members) in &subtrees {
+        for &tid in members {
+            let Some(tl) = doc.timeline(tid) else { continue };
+            for j in [&tl.origin, &tl.merge].into_iter().flatten() {
+                if let Some(other_g) = group_of_timeline(j.other) {
+                    if other_g != *g {
+                        *weight.entry(key(*g, other_g)).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut placed: Vec<Id> = Vec::with_capacity(siblings.len());
+    let mut remaining = siblings.clone();
+    while !remaining.is_empty() {
+        let next_connected = placed.last().and_then(|&last| {
+            remaining
+                .iter()
+                .copied()
+                .filter(|&cand| weight.get(&key(last, cand)).copied().unwrap_or(0) > 0)
+                .max_by_key(|&cand| weight[&key(last, cand)])
+        });
+        let pick = next_connected.unwrap_or(remaining[0]);
+        remaining.retain(|&id| id != pick);
+        placed.push(pick);
+    }
+    placed
+}
+
 // --- Band geometry ----------------------------------------------------------
 
 /// The span a timeline's band actually covers, honouring junctions and falling
@@ -720,6 +779,32 @@ pub fn band_color_segments(tl: &Timeline, from: f64, to: f64) -> Vec<(f64, f64, 
         segments.push((cursor, to, tl.color, None));
     }
     segments
+}
+
+/// A group member's `origin`/`merge` junction, when the *other* end of it is
+/// outside the group — the ones a collapsed group's single summary band
+/// needs to draw a curve for itself, or the connection to something outside
+/// the group silently disappears the moment it is collapsed. `is_merge`
+/// tells the caller which of the two curve directions to synthesize
+/// (`false` = origin, easing in from the target; `true` = merge, easing out
+/// to it).
+pub fn group_external_junctions(doc: &Document, group: Id) -> Vec<(Junction, bool)> {
+    let members: std::collections::BTreeSet<Id> = doc.group_timelines(group).into_iter().collect();
+    let mut out = Vec::new();
+    for tid in &members {
+        let Some(tl) = doc.timeline(*tid) else { continue };
+        if let Some(j) = &tl.origin {
+            if !members.contains(&j.other) {
+                out.push((j.clone(), false));
+            }
+        }
+        if let Some(j) = &tl.merge {
+            if !members.contains(&j.other) {
+                out.push((j.clone(), true));
+            }
+        }
+    }
+    out
 }
 
 // --- Label placement --------------------------------------------------------
@@ -1553,6 +1638,117 @@ mod tests {
 
     fn names(lanes: &[Lane]) -> Vec<&str> {
         lanes.iter().map(|l| l.name.as_str()).collect()
+    }
+
+    #[test]
+    fn group_external_junctions_skips_connections_within_the_group() {
+        let mut doc = grouped_doc();
+        let greek = doc.groups[0].id;
+        let sparta = doc.timelines[0].id;
+        let athens = doc.timelines[1].id;
+        let rome = doc.timelines[2].id;
+
+        // Athens merges out to Rome — outside the group, must be reported.
+        doc.timeline_mut(athens).unwrap().merge = Some(Junction {
+            other: rome,
+            date: HDate::year(-146),
+            label: "Corinth".into(),
+        });
+        // Sparta "splits from" Athens — its own group sibling, so collapsing
+        // the group hides nothing that isn't already inside the one summary
+        // band, and this must not be reported.
+        doc.timeline_mut(sparta).unwrap().origin = Some(Junction {
+            other: athens,
+            date: HDate::year(-800),
+            label: String::new(),
+        });
+
+        let external = group_external_junctions(&doc, greek);
+        assert_eq!(external.len(), 1);
+        assert_eq!(external[0].0.other, rome);
+        assert!(external[0].1, "Athens' connection to Rome is a merge");
+    }
+
+    #[test]
+    fn suggest_group_order_chains_connected_groups_together() {
+        // A, B, C, D at the top level; only B and D are actually related
+        // (B's timeline merges into D's) — the suggestion should pull them
+        // next to each other without disturbing A and C's relative order.
+        let mut doc = Document::default();
+        let group_a = doc.new_id();
+        let group_b = doc.new_id();
+        let group_c = doc.new_id();
+        let group_d = doc.new_id();
+        for (id, name) in [(group_a, "A"), (group_b, "B"), (group_c, "C"), (group_d, "D")] {
+            doc.groups.push(Group {
+                id,
+                name: name.into(),
+                color: [0, 0, 0],
+                parent: None,
+                order: doc.groups.len() as u32,
+                collapsed: false,
+                visible: true,
+                notes: String::new(),
+            });
+        }
+        let in_b = doc.new_id();
+        let in_d = doc.new_id();
+        doc.timelines.push(Timeline {
+            id: in_d,
+            name: "D's timeline".into(),
+            color: [0, 0, 0],
+            visible: true,
+            group: Some(group_d),
+            order: 0,
+            span: None,
+            origin: None,
+            merge: None,
+            notes: String::new(),
+            epochs: Vec::new(),
+        });
+        doc.timelines.push(Timeline {
+            id: in_b,
+            name: "B's timeline".into(),
+            color: [0, 0, 0],
+            visible: true,
+            group: Some(group_b),
+            order: 0,
+            span: None,
+            origin: None,
+            merge: Some(Junction { other: in_d, date: HDate::year(1), label: String::new() }),
+            notes: String::new(),
+            epochs: Vec::new(),
+        });
+
+        let order = suggest_group_order(&doc, None);
+        let pos = |id: Id| order.iter().position(|&x| x == id).unwrap();
+        assert!(
+            (pos(group_b) as i32 - pos(group_d) as i32).abs() == 1,
+            "B and D should end up adjacent, got order {order:?}"
+        );
+    }
+
+    #[test]
+    fn suggest_group_order_leaves_unconnected_siblings_in_their_original_order() {
+        let mut doc = Document::default();
+        let ids: Vec<Id> = ["A", "B", "C"]
+            .into_iter()
+            .map(|name| {
+                let id = doc.new_id();
+                doc.groups.push(Group {
+                    id,
+                    name: name.into(),
+                    color: [0, 0, 0],
+                    parent: None,
+                    order: doc.groups.len() as u32,
+                    collapsed: false,
+                    visible: true,
+                    notes: String::new(),
+                });
+                id
+            })
+            .collect();
+        assert_eq!(suggest_group_order(&doc, None), ids);
     }
 
     #[test]
