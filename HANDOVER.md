@@ -13,13 +13,47 @@ multiple parallel timelines, biographies (inline and own-lane), fuzzy dates,
 categories with include/exclude filtering, zoom-dependent importance, and
 converging/diverging timelines. Several later requests are also in: nestable
 super-categories ("groups"), single-year-resolution work on biographies,
-colour-coded epochs (now with their name painted directly on the band, not
-just the colour), nestable events, and nestable categories (ticking a parent
-category in the filter cascades onto its subcategories).
+colour-coded epochs (with their name painted directly on the band, not just
+the colour), nestable events, nestable categories (ticking a parent category
+in the filter cascades onto its subcategories), European `14.07.1789`-style
+date entry alongside ISO, biography bands with a category-driven fill and a
+culture-driven border, a sidebar Timelines/Biographies search with
+biographies collapsible by culture or by category, and a full German UI.
 
-- **~9,000 lines** of Rust across 10 files in `src/`.
-- **110 tests**, all passing, no compiler warnings.
+- **~9,300 lines** of Rust across 10 files in `src/`.
+- **114 tests**, all passing, no compiler warnings.
 - Release binary: `target/release/timeline_explorer.exe`, ~6.4 MB, single file.
+
+### The UI is German-only, by request — not a translation *layer*
+
+Every user-facing string (menus, dialogs, toasts, tooltips, the ruler's
+`v. Chr.`/`n. Chr.`-style year labels, `STARTER_CATEGORIES`) was translated
+in place. This was a deliberate choice over building an i18n system: the app
+has exactly one intended UI language, so a string catalogue plus a language
+switch would have been pure overhead. If English (or a togglable second
+language) is ever wanted back, that is a real feature to design, not a
+revert — search each file for the German strings and reintroduce a catalogue
+rather than trying to mechanically undo this.
+
+**Scope drawn deliberately:** code identifiers, comments, doc comments, and
+test fixture data (event/timeline names like `"Second Punic War"` in
+`example.rs` and in unit tests) were left in English — only what a user
+actually sees was translated. `STARTER_CATEGORIES` is the one exception
+worth knowing about: those names are also looked up by exact string in
+`example::build()` (`cat(&doc, "Politik")` etc.), so renaming a starter
+category requires updating both places together, or `example::build()`
+silently fails to tag anything.
+
+**If you touch date formatting**, `year_label`/`axis_year_label` produce
+`"{n} v. Chr."` for BC/BCE years now, not `"{n} BC"` — the corresponding
+assertions in `model.rs`'s tests were updated to match. `HDate::parse` still
+accepts English input (`44 BC`, `1789-07-14`) unchanged; only *display*
+moved to German. Curly quotes (`"`/`"`) are reused everywhere a quoted name
+appears in German text, deliberately **not** the German-typographic `„`/`"`
+pair — `"`/`"` were already verified safe in egui's bundled font (see the
+font caveat below); `„` was never tested and there was no way to verify it
+renders without a live screenshot loop, so it was avoided rather than risking
+tofu boxes in every confirmation dialog.
 
 **Not implemented:** export to image/PDF (open question 5 in the planning
 document, deliberately left for a decision rather than guessed at), and
@@ -261,6 +295,26 @@ on the segment and skipped if the segment is narrower than the label —
 deliberately placed *on* the band (its own pill, `theme.canvas_bg` behind it)
 rather than in the label rows above, so it reads as structural (like a lane
 name) rather than as an event title.
+
+### Sidebar search strings live on `TimelineApp`, not `Document`
+
+`timeline_search` / `bio_search` / `bio_group_by` are deliberately session-only
+UI state on `TimelineApp`, not part of `Document` — they narrow a long
+sidebar list while you work, not something worth remembering between
+launches (unlike the canvas's own `view.filters.search`, which *is*
+persisted). `panels::sidebar()` takes them out of `app` with `mem::take`
+(or a plain copy, for the `Copy` `bio_group_by`) before the section
+functions run, and writes them back after — that is what lets
+`timelines_section` / `biographies_section` keep taking `app: &TimelineApp`
+like every other panel function here, instead of needing `&mut TimelineApp`
+just to update two strings and an enum.
+
+Biography clustering (`panels::bio_cluster`) is keyed on `(id_salt, Id)` for
+`CollapsingHeader`'s `id_salt` — egui persists the open/closed state per id
+across frames automatically, no extra bookkeeping needed. Category clusters
+are **not** a partition: a biography with several categories appears in each
+matching cluster, unlike culture clustering where each biography has exactly
+one (or none).
 
 ### The egui hover-reflow workaround
 

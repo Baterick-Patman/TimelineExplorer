@@ -76,7 +76,7 @@ pub fn load(path: &Path) -> Result<Option<Document>, String> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = fs::read_to_string(path).map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+    let text = fs::read_to_string(path).map_err(|e| format!("{} konnte nicht gelesen werden: {e}", path.display()))?;
     // Notepad and PowerShell write a UTF-8 BOM. The library is meant to be
     // user-inspectable, so a byte-order mark must not make it unreadable.
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
@@ -84,7 +84,7 @@ pub fn load(path: &Path) -> Result<Option<Document>, String> {
         return Ok(None);
     }
     let doc: Document = serde_json::from_str(text)
-        .map_err(|e| format!("{} is not a valid library file: {e}", path.display()))?;
+        .map_err(|e| format!("{} ist keine gültige Bibliotheksdatei: {e}", path.display()))?;
     Ok(Some(doc))
 }
 
@@ -94,21 +94,21 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
-                .map_err(|e| format!("Could not create {}: {e}", parent.display()))?;
+                .map_err(|e| format!("{} konnte nicht angelegt werden: {e}", parent.display()))?;
         }
     }
 
-    let json = serde_json::to_string_pretty(doc).map_err(|e| format!("Could not encode library: {e}"))?;
+    let json = serde_json::to_string_pretty(doc).map_err(|e| format!("Bibliothek konnte nicht kodiert werden: {e}"))?;
 
     let tmp = path.with_extension("json.tmp");
     {
         let mut f = fs::File::create(&tmp)
-            .map_err(|e| format!("Could not write {}: {e}", tmp.display()))?;
+            .map_err(|e| format!("{} konnte nicht geschrieben werden: {e}", tmp.display()))?;
         f.write_all(json.as_bytes())
-            .map_err(|e| format!("Could not write {}: {e}", tmp.display()))?;
+            .map_err(|e| format!("{} konnte nicht geschrieben werden: {e}", tmp.display()))?;
         // Force the bytes out before anything replaces the live file.
         f.sync_all()
-            .map_err(|e| format!("Could not flush {}: {e}", tmp.display()))?;
+            .map_err(|e| format!("{} konnte nicht synchronisiert werden: {e}", tmp.display()))?;
     }
 
     if path.exists() {
@@ -118,7 +118,7 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), String> {
     // `fs::rename` replaces the destination atomically on Windows as well as
     // Unix. Deleting first would leave a window in which the library does not
     // exist on disk at all — a crash there would cost the whole document.
-    fs::rename(&tmp, path).map_err(|e| format!("Could not finalise {}: {e}", path.display()))?;
+    fs::rename(&tmp, path).map_err(|e| format!("{} konnte nicht fertiggestellt werden: {e}", path.display()))?;
     Ok(())
 }
 
@@ -183,8 +183,8 @@ pub fn backups(path: &Path) -> Vec<(PathBuf, String)> {
         let p = dir.join(format!("{stem}.bak{n}.json"));
         if p.is_file() {
             let label = match fs::metadata(&p).and_then(|m| m.modified()) {
-                Ok(t) => format!("Backup {n} — {}", format_age(t)),
-                Err(_) => format!("Backup {n}"),
+                Ok(t) => format!("Sicherung {n} — {}", format_age(t)),
+                Err(_) => format!("Sicherung {n}"),
             };
             out.push((p, label));
         }
@@ -196,17 +196,17 @@ pub fn backups(path: &Path) -> Vec<(PathBuf, String)> {
 /// date-formatting dependency.
 fn format_age(t: std::time::SystemTime) -> String {
     let Ok(elapsed) = t.elapsed() else {
-        return "just now".into();
+        return "gerade eben".into();
     };
     let secs = elapsed.as_secs();
     if secs < 90 {
-        "just now".into()
+        "gerade eben".into()
     } else if secs < 3600 {
-        format!("{} min ago", secs / 60)
+        format!("vor {} Min.", secs / 60)
     } else if secs < 86_400 {
-        format!("{} h ago", secs / 3600)
+        format!("vor {} Std.", secs / 3600)
     } else {
-        format!("{} days ago", secs / 86_400)
+        format!("vor {} Tagen", secs / 86_400)
     }
 }
 

@@ -1,6 +1,6 @@
 //! Left sidebar (timelines, biographies, filters) and right inspector.
 
-use crate::app::{Confirm, Selection, TimelineApp};
+use crate::app::{BioGroupBy, Confirm, Selection, TimelineApp};
 use crate::forms::{CategoryEditor, Dialog, EventForm, GroupForm};
 use crate::model::*;
 use crate::theme::to_color;
@@ -23,14 +23,25 @@ enum Action {
 
 pub fn sidebar(app: &mut TimelineApp, ui: &mut egui::Ui) {
     let mut actions: Vec<Action> = Vec::new();
+    // Taken out for the duration of the frame so `timelines_section` and
+    // `biographies_section` can keep taking `app: &TimelineApp` like every
+    // other panel function here, rather than needing `&mut TimelineApp` just
+    // to update two search strings.
+    let mut timeline_search = std::mem::take(&mut app.timeline_search);
+    let mut bio_search = std::mem::take(&mut app.bio_search);
+    let mut bio_group_by = app.bio_group_by;
 
     egui::ScrollArea::vertical().show(ui, |ui| {
-        timelines_section(app, ui, &mut actions);
+        timelines_section(app, ui, &mut actions, &mut timeline_search);
         ui.add_space(10.0);
-        biographies_section(app, ui, &mut actions);
+        biographies_section(app, ui, &mut actions, &mut bio_search, &mut bio_group_by);
         ui.add_space(10.0);
         filters_section(app, ui);
     });
+
+    app.timeline_search = timeline_search;
+    app.bio_search = bio_search;
+    app.bio_group_by = bio_group_by;
 
     for a in actions {
         apply(app, a);
@@ -119,25 +130,103 @@ fn color_chip(ui: &mut egui::Ui, color: Rgb) {
         .rect_filled(rect, egui::CornerRadius::same(2), to_color(color));
 }
 
-fn timelines_section(app: &TimelineApp, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+/// A colour chip with an optional outline — a biography's fill (its category,
+/// typically) and border (its culture) shown at a glance, the same two
+/// colours its band is painted with. Falls back to a plain chip when there is
+/// no culture to draw a border for.
+fn color_chip_bordered(ui: &mut egui::Ui, fill: Rgb, border: Option<Rgb>) {
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(10.0, 14.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, egui::CornerRadius::same(2), to_color(fill));
+    if let Some(border) = border {
+        p.rect_stroke(
+            rect,
+            egui::CornerRadius::same(2),
+            egui::Stroke::new(1.5, to_color(border)),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+/// Which groups and timelines a sidebar search leaves standing.
+///
+/// A timeline matches on its own name; a group matches either on its own name
+/// (which pulls in its whole subtree, so a matched folder shows everything
+/// inside it) or by containing a matching timeline somewhere below it (which
+/// pulls in just the path down to that timeline, plus the timeline itself) —
+/// otherwise a matching timeline three groups deep would have no visible way
+/// to reach it once its ancestors were filtered out.
+struct TreeMatch {
+    timelines: BTreeSet<Id>,
+    groups: BTreeSet<Id>,
+}
+
+fn ancestor_groups(doc: &Document, mut group: Option<Id>, into: &mut BTreeSet<Id>) {
+    while let Some(id) = group {
+        if !into.insert(id) {
+            break; // Already walked this far up on an earlier match.
+        }
+        group = doc.group(id).and_then(|g| g.parent);
+    }
+}
+
+fn compute_timeline_matches(doc: &Document, needle: &str) -> TreeMatch {
+    let mut timelines = BTreeSet::new();
+    let mut groups = BTreeSet::new();
+
+    for t in &doc.timelines {
+        if t.name.to_lowercase().contains(needle) {
+            timelines.insert(t.id);
+            ancestor_groups(doc, t.group, &mut groups);
+        }
+    }
+    for g in &doc.groups {
+        if g.name.to_lowercase().contains(needle) {
+            groups.insert(g.id);
+            timelines.extend(doc.group_timelines(g.id));
+            ancestor_groups(doc, g.parent, &mut groups);
+        }
+    }
+    TreeMatch { timelines, groups }
+}
+
+fn timelines_section(
+    app: &TimelineApp,
+    ui: &mut egui::Ui,
+    actions: &mut Vec<Action>,
+    search: &mut String,
+) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Timelines").strong());
+        ui.label(egui::RichText::new("Zeitstrahlen").strong());
         ui.weak(format!(
-            "({} in {} group(s))",
+            "({} in {} Gruppe(n))",
             app.doc.timelines.len(),
             app.doc.groups.len()
         ));
     });
-    ui.weak("Groups collapse into a single band so you can compare whole civilisations.");
+    ui.weak("Gruppen klappen zu einem einzigen Band zusammen, damit sich ganze Kulturen vergleichen lassen.");
+    ui.add_space(2.0);
+    ui.add(
+        egui::TextEdit::singleline(search)
+            .hint_text("Zeitstrahlen und Gruppen suchen…")
+            .desired_width(f32::INFINITY),
+    );
     ui.add_space(2.0);
 
-    group_tree(app, ui, None, 0, actions, &mut 0);
+    let needle = search.trim().to_lowercase();
+    let filter = (!needle.is_empty()).then(|| compute_timeline_matches(&app.doc, &needle));
+
+    group_tree(app, ui, None, 0, actions, &mut 0, filter.as_ref());
 
     if app.doc.timelines.is_empty() && app.doc.groups.is_empty() {
-        ui.weak("None yet - add one with + Timeline above.");
+        ui.weak("Noch keine — mit + Zeitstrahl oben einen anlegen.");
+    } else if let Some(f) = &filter {
+        if f.timelines.is_empty() && f.groups.is_empty() {
+            ui.weak("Keine Treffer.");
+        }
     }
     ui.add_space(2.0);
-    if ui.small_button("+ group at top level").clicked() {
+    if ui.small_button("+ Gruppe auf oberster Ebene").clicked() {
         actions.push(Action::NewGroupUnder(None));
     }
 }
@@ -145,7 +234,8 @@ fn timelines_section(app: &TimelineApp, ui: &mut egui::Ui, actions: &mut Vec<Act
 /// Render one level of the group tree, then recurse.
 ///
 /// `guard` bounds the walk: a hand-edited file could contain a parent cycle,
-/// and the sidebar must not hang because of it.
+/// and the sidebar must not hang because of it. `filter`, when set, hides any
+/// group or timeline the current sidebar search does not match.
 fn group_tree(
     app: &TimelineApp,
     ui: &mut egui::Ui,
@@ -153,6 +243,7 @@ fn group_tree(
     depth: usize,
     actions: &mut Vec<Action>,
     guard: &mut usize,
+    filter: Option<&TreeMatch>,
 ) {
     *guard += 1;
     if *guard > 512 || depth > 12 {
@@ -161,13 +252,16 @@ fn group_tree(
     let indent = depth as f32 * 12.0;
 
     for g in app.doc.child_groups(parent) {
+        if filter.is_some_and(|f| !f.groups.contains(&g.id)) {
+            continue;
+        }
         let selected = app.selection == Some(Selection::Group(g.id));
         ui.horizontal(|ui| {
             ui.add_space(indent);
             let mut vis = g.visible;
             if ui
                 .checkbox(&mut vis, "")
-                .on_hover_text("Show this group")
+                .on_hover_text("Diese Gruppe anzeigen")
                 .changed()
             {
                 actions.push(Action::ToggleGroupVisible(g.id));
@@ -175,9 +269,9 @@ fn group_tree(
             if ui
                 .small_button(if g.collapsed { "+" } else { "-" })
                 .on_hover_text(if g.collapsed {
-                    "Expand: show the timelines inside"
+                    "Ausklappen: die enthaltenen Zeitstrahlen anzeigen"
                 } else {
-                    "Collapse: show one band for the whole group"
+                    "Einklappen: ein Band für die ganze Gruppe anzeigen"
                 })
                 .clicked()
             {
@@ -187,7 +281,7 @@ fn group_tree(
             let count = app.doc.group_timelines(g.id).len();
             if ui
                 .selectable_label(selected, egui::RichText::new(&g.name).strong())
-                .on_hover_text(format!("{count} timeline(s) inside"))
+                .on_hover_text(format!("{count} Zeitstrahl(en) darin"))
                 .clicked()
             {
                 actions.push(Action::Select(Selection::Group(g.id)));
@@ -196,23 +290,26 @@ fn group_tree(
         if selected {
             ui.horizontal(|ui| {
                 ui.add_space(indent + 20.0);
-                if ui.small_button("edit").clicked() {
+                if ui.small_button("bearbeiten").clicked() {
                     actions.push(Action::Edit(Selection::Group(g.id)));
                 }
-                if ui.small_button("+ subgroup").clicked() {
+                if ui.small_button("+ Untergruppe").clicked() {
                     actions.push(Action::NewGroupUnder(Some(g.id)));
                 }
-                if ui.small_button("Remove").clicked() {
+                if ui.small_button("Entfernen").clicked() {
                     actions.push(Action::Delete(Selection::Group(g.id)));
                 }
             });
         }
         if !g.collapsed {
-            group_tree(app, ui, Some(g.id), depth + 1, actions, guard);
+            group_tree(app, ui, Some(g.id), depth + 1, actions, guard, filter);
         }
     }
 
     for t in app.doc.timelines_in(parent) {
+        if filter.is_some_and(|f| !f.timelines.contains(&t.id)) {
+            continue;
+        }
         timeline_row(app, ui, t, indent, actions);
     }
 }
@@ -230,7 +327,7 @@ fn timeline_row(
         let mut vis = t.visible;
         if ui
             .checkbox(&mut vis, "")
-            .on_hover_text("Show this timeline")
+            .on_hover_text("Diesen Zeitstrahl anzeigen")
             .changed()
         {
             actions.push(Action::ToggleVisible(t.id));
@@ -239,7 +336,7 @@ fn timeline_row(
         let count = app.doc.events_of(OwnerRef::Timeline(t.id)).count();
         if ui
             .selectable_label(selected, &t.name)
-            .on_hover_text(format!("{count} event(s)"))
+            .on_hover_text(format!("{count} Ereignis(se)"))
             .clicked()
         {
             actions.push(Action::Select(Selection::Timeline(t.id)));
@@ -248,80 +345,194 @@ fn timeline_row(
     if selected {
         ui.horizontal(|ui| {
             ui.add_space(indent + 20.0);
-            if ui.small_button("+ event").clicked() {
+            if ui.small_button("+ Ereignis").clicked() {
                 actions.push(Action::AddEventTo(OwnerRef::Timeline(t.id)));
             }
-            if ui.small_button("edit").clicked() {
+            if ui.small_button("bearbeiten").clicked() {
                 actions.push(Action::Edit(Selection::Timeline(t.id)));
             }
-            if ui.small_button("Up").on_hover_text("Move up").clicked() {
+            if ui.small_button("Hoch").on_hover_text("Nach oben verschieben").clicked() {
                 actions.push(Action::Move(t.id, -1));
             }
-            if ui.small_button("Down").on_hover_text("Move down").clicked() {
+            if ui.small_button("Runter").on_hover_text("Nach unten verschieben").clicked() {
                 actions.push(Action::Move(t.id, 1));
             }
-            if ui.small_button("Delete").clicked() {
+            if ui.small_button("Löschen").clicked() {
                 actions.push(Action::Delete(Selection::Timeline(t.id)));
             }
         });
     }
 }
 
-fn biographies_section(app: &TimelineApp, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-    section_header(ui, "Biographies", app.doc.biographies.len());
-    ui.weak("Inline nests under a culture; Own lane runs alongside them.");
-
-    let mut sorted: Vec<&Biography> = app.doc.biographies.iter().collect();
-    sorted.sort_by(|a, b| {
-        a.birth
-            .decimal()
-            .partial_cmp(&b.birth.decimal())
-            .unwrap_or(std::cmp::Ordering::Equal)
+/// Biographies clustered so each cluster can be collapsed away with one
+/// click — the same declutter this sidebar already gives timelines via
+/// groups. Without it, a library with hundreds of biographies was one long
+/// flat scroll with no way to collapse away what you are not looking at.
+///
+/// Clustered by culture (their linked timeline) or by category, whichever
+/// the "Group by" toggle is set to. Culture is a strict partition — one
+/// culture per biography — while a category cluster ("all Philosophers")
+/// can and does overlap another, since a biography may carry several
+/// categories at once.
+fn biographies_section(
+    app: &TimelineApp,
+    ui: &mut egui::Ui,
+    actions: &mut Vec<Action>,
+    search: &mut String,
+    group_by: &mut BioGroupBy,
+) {
+    section_header(ui, "Biografien", app.doc.biographies.len());
+    ui.weak("Eingebettet verschachtelt sich unter einer Kultur; Eigene Spur läuft parallel dazu.");
+    ui.add(
+        egui::TextEdit::singleline(search)
+            .hint_text("Biografien suchen…")
+            .desired_width(f32::INFINITY),
+    );
+    ui.horizontal(|ui| {
+        ui.weak("Gruppieren nach:");
+        if ui.selectable_label(*group_by == BioGroupBy::Culture, "Kultur").clicked() {
+            *group_by = BioGroupBy::Culture;
+        }
+        if ui.selectable_label(*group_by == BioGroupBy::Category, "Kategorie").clicked() {
+            *group_by = BioGroupBy::Category;
+        }
     });
+    ui.add_space(2.0);
 
-    for b in sorted {
-        let selected = app.selection == Some(Selection::Biography(b.id));
-        ui.horizontal(|ui| {
-            color_chip(ui, app.doc.bio_color(b));
-            if ui
-                .selectable_label(selected, &b.name)
-                .on_hover_text(b.life_label())
-                .clicked()
-            {
-                actions.push(Action::Select(Selection::Biography(b.id)));
+    let needle = search.trim().to_lowercase();
+    let matches = |name: &str| needle.is_empty() || name.to_lowercase().contains(&needle);
+    let mut any_cluster = false;
+
+    match group_by {
+        BioGroupBy::Culture => {
+            let mut ordered_timelines: Vec<&Timeline> = app.doc.timelines.iter().collect();
+            ordered_timelines.sort_by_key(|t| (t.order, t.id.0));
+
+            for t in ordered_timelines {
+                let bios: Vec<&Biography> = app
+                    .doc
+                    .biographies
+                    .iter()
+                    .filter(|b| b.timeline == Some(t.id) && matches(&b.name))
+                    .collect();
+                if bios.is_empty() {
+                    continue;
+                }
+                any_cluster = true;
+                bio_cluster(ui, app, "bio_cluster_culture", t.id, &t.name, bios, actions);
             }
-        });
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            for d in [BioDisplay::Hidden, BioDisplay::Inline, BioDisplay::Lane] {
-                let enabled = d != BioDisplay::Inline || b.timeline.is_some();
-                let resp = ui.add_enabled(
-                    enabled,
-                    egui::Button::selectable(b.display == d, d.name()),
+
+            let unculture: Vec<&Biography> = app
+                .doc
+                .biographies
+                .iter()
+                .filter(|b| b.timeline.is_none() && matches(&b.name))
+                .collect();
+            if !unculture.is_empty() {
+                any_cluster = true;
+                bio_cluster(ui, app, "bio_cluster_culture_none", (), "Keine Kultur", unculture, actions);
+            }
+        }
+        BioGroupBy::Category => {
+            for c in &app.doc.categories {
+                let bios: Vec<&Biography> = app
+                    .doc
+                    .biographies
+                    .iter()
+                    .filter(|b| b.categories.contains(&c.id) && matches(&b.name))
+                    .collect();
+                if bios.is_empty() {
+                    continue;
+                }
+                any_cluster = true;
+                bio_cluster(ui, app, "bio_cluster_category", c.id, &c.name, bios, actions);
+            }
+
+            let uncategorised: Vec<&Biography> = app
+                .doc
+                .biographies
+                .iter()
+                .filter(|b| b.categories.is_empty() && matches(&b.name))
+                .collect();
+            if !uncategorised.is_empty() {
+                any_cluster = true;
+                bio_cluster(
+                    ui,
+                    app,
+                    "bio_cluster_category_none",
+                    (),
+                    "Ohne Kategorie",
+                    uncategorised,
+                    actions,
                 );
-                if resp.clicked() {
-                    actions.push(Action::SetDisplay(b.id, d));
-                }
             }
-        });
-        if selected {
-            ui.horizontal(|ui| {
-                ui.add_space(20.0);
-                if ui.small_button("+ event").clicked() {
-                    actions.push(Action::AddEventTo(OwnerRef::Biography(b.id)));
-                }
-                if ui.small_button("edit").clicked() {
-                    actions.push(Action::Edit(Selection::Biography(b.id)));
-                }
-                if ui.small_button("Delete").clicked() {
-                    actions.push(Action::Delete(Selection::Biography(b.id)));
-                }
-            });
         }
     }
 
     if app.doc.biographies.is_empty() {
-        ui.weak("None yet — add one with + Biography above.");
+        ui.weak("Noch keine — mit + Biografie oben eine anlegen.");
+    } else if !any_cluster {
+        ui.weak("Keine Treffer.");
+    }
+}
+
+/// One collapsible cluster of biographies, sorted by birth year.
+fn bio_cluster(
+    ui: &mut egui::Ui,
+    app: &TimelineApp,
+    id_salt: &str,
+    cluster_key: impl std::hash::Hash + std::fmt::Debug,
+    label: &str,
+    mut bios: Vec<&Biography>,
+    actions: &mut Vec<Action>,
+) {
+    bios.sort_by(|a, b| a.birth.decimal().partial_cmp(&b.birth.decimal()).unwrap_or(std::cmp::Ordering::Equal));
+    egui::CollapsingHeader::new(format!("{label} ({})", bios.len()))
+        .id_salt((id_salt, cluster_key))
+        .default_open(true)
+        .show(ui, |ui| {
+            for b in bios {
+                biography_row(app, ui, b, actions);
+            }
+        });
+}
+
+fn biography_row(app: &TimelineApp, ui: &mut egui::Ui, b: &Biography, actions: &mut Vec<Action>) {
+    let selected = app.selection == Some(Selection::Biography(b.id));
+    ui.horizontal(|ui| {
+        let (fill, border) = app.doc.bio_colors(b);
+        color_chip_bordered(ui, fill, border);
+        if ui
+            .selectable_label(selected, &b.name)
+            .on_hover_text(b.life_label())
+            .clicked()
+        {
+            actions.push(Action::Select(Selection::Biography(b.id)));
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(20.0);
+        for d in [BioDisplay::Hidden, BioDisplay::Inline, BioDisplay::Lane] {
+            let enabled = d != BioDisplay::Inline || b.timeline.is_some();
+            let resp = ui.add_enabled(enabled, egui::Button::selectable(b.display == d, d.name()));
+            if resp.clicked() {
+                actions.push(Action::SetDisplay(b.id, d));
+            }
+        }
+    });
+    if selected {
+        ui.horizontal(|ui| {
+            ui.add_space(20.0);
+            if ui.small_button("+ Ereignis").clicked() {
+                actions.push(Action::AddEventTo(OwnerRef::Biography(b.id)));
+            }
+            if ui.small_button("bearbeiten").clicked() {
+                actions.push(Action::Edit(Selection::Biography(b.id)));
+            }
+            if ui.small_button("Löschen").clicked() {
+                actions.push(Action::Delete(Selection::Biography(b.id)));
+            }
+        });
     }
 }
 
@@ -366,7 +577,7 @@ fn category_filter_tree(
 }
 
 fn filters_section(app: &mut TimelineApp, ui: &mut egui::Ui) {
-    section_header(ui, "Categories & filter", app.doc.categories.len());
+    section_header(ui, "Kategorien & Filter", app.doc.categories.len());
 
     let mut changed = false;
     let mut mode = app.doc.view.filters.mode;
@@ -379,9 +590,9 @@ fn filters_section(app: &mut TimelineApp, ui: &mut egui::Ui) {
         }
     });
     match mode {
-        FilterMode::Off => ui.weak("Everything is shown."),
-        FilterMode::Include => ui.weak("Only ticked categories are shown."),
-        FilterMode::Exclude => ui.weak("Ticked categories are hidden."),
+        FilterMode::Off => ui.weak("Alles wird angezeigt."),
+        FilterMode::Include => ui.weak("Nur angehakte Kategorien werden angezeigt."),
+        FilterMode::Exclude => ui.weak("Angehakte Kategorien werden ausgeblendet."),
     };
 
     let mut selected = app.doc.view.filters.selected.clone();
@@ -389,7 +600,7 @@ fn filters_section(app: &mut TimelineApp, ui: &mut egui::Ui) {
 
     ui.add_space(4.0);
     if app.doc.categories.is_empty() {
-        ui.weak("No categories yet.");
+        ui.weak("Noch keine Kategorien.");
     } else {
         let mut guard = 0usize;
         category_filter_tree(ui, &app.doc, None, 0, &mut guard, &mut selected, &mut changed);
@@ -397,19 +608,19 @@ fn filters_section(app: &mut TimelineApp, ui: &mut egui::Ui) {
 
     ui.add_space(4.0);
     if ui
-        .checkbox(&mut keep_uncat, "Always keep uncategorised entries")
+        .checkbox(&mut keep_uncat, "Einträge ohne Kategorie immer anzeigen")
         .changed()
     {
         changed = true;
     }
 
     ui.horizontal(|ui| {
-        if ui.small_button("Clear filter").clicked() {
+        if ui.small_button("Filter zurücksetzen").clicked() {
             selected.clear();
             mode = FilterMode::Off;
             changed = true;
         }
-        if ui.small_button("Edit categories…").clicked() {
+        if ui.small_button("Kategorien bearbeiten…").clicked() {
             app.dialog = Dialog::Categories(CategoryEditor::default());
         }
     });
@@ -444,10 +655,10 @@ pub fn inspector(app: &mut TimelineApp, ui: &mut egui::Ui) {
 
 fn header_row(ui: &mut egui::Ui, sel: Selection, actions: &mut Vec<Action>) {
     ui.horizontal(|ui| {
-        if ui.button("Edit").clicked() {
+        if ui.button("Bearbeiten").clicked() {
             actions.push(Action::Edit(sel));
         }
-        if ui.button("Delete").clicked() {
+        if ui.button("Löschen").clicked() {
             actions.push(Action::Delete(sel));
         }
     });
@@ -475,15 +686,15 @@ fn group_inspector(app: &TimelineApp, ui: &mut egui::Ui, id: Id, actions: &mut V
     ui.separator();
 
     if let Some(p) = g.parent.and_then(|p| app.doc.group(p)) {
-        field(ui, "Inside", p.name.clone());
+        field(ui, "In", p.name.clone());
     }
     field(
         ui,
-        "State",
+        "Status",
         if g.collapsed {
-            "collapsed - drawn as one band"
+            "eingeklappt – als ein Band gezeichnet"
         } else {
-            "expanded"
+            "ausgeklappt"
         },
     );
     let timelines = app.doc.group_timelines(id);
@@ -500,14 +711,14 @@ fn group_inspector(app: &TimelineApp, ui: &mut egui::Ui, id: Id, actions: &mut V
                 .is_some_and(|t| timelines.contains(&t)),
         })
         .count();
-    field(ui, "Contains", format!("{} timeline(s), {events} event(s)", timelines.len()));
+    field(ui, "Enthält", format!("{} Zeitstrahl(en), {events} Ereignis(se)", timelines.len()));
     if !g.notes.trim().is_empty() {
         ui.add_space(4.0);
         ui.label(&g.notes);
     }
 
     ui.add_space(8.0);
-    section_header(ui, "Timelines", timelines.len());
+    section_header(ui, "Zeitstrahlen", timelines.len());
     for tid in timelines {
         if let Some(t) = app.doc.timeline(tid) {
             if ui
@@ -530,23 +741,23 @@ fn event_inspector(app: &TimelineApp, ui: &mut egui::Ui, id: Id, actions: &mut V
     // navigable, rather than a fact only visible by hunting through dates.
     if let Some(parent) = ev.parent.and_then(|p| app.doc.event(p)) {
         ui.horizontal(|ui| {
-            ui.weak("Nested inside:");
+            ui.weak("Verschachtelt in:");
             if ui.link(&parent.title).clicked() {
                 actions.push(Action::Select(Selection::Event(parent.id)));
             }
         });
     }
     if ev.span.is_range() {
-        if ui.button("+ Add nested event").clicked() {
+        if ui.button("+ Verschachteltes Ereignis hinzufügen").clicked() {
             actions.push(Action::AddNestedEventTo(ev.owner, id));
         }
     }
     ui.separator();
 
-    field(ui, "Date", ev.span.label());
-    field(ui, "On", app.doc.owner_name(ev.owner));
-    field(ui, "Importance", importance_name(ev.importance));
-    field(ui, "Categories", app.doc.category_names(&ev.categories));
+    field(ui, "Datum", ev.span.label());
+    field(ui, "Gehört zu", app.doc.owner_name(ev.owner));
+    field(ui, "Bedeutung", importance_name(ev.importance));
+    field(ui, "Kategorien", app.doc.category_names(&ev.categories));
     if !ev.description.trim().is_empty() {
         ui.add_space(6.0);
         ui.separator();
@@ -557,7 +768,7 @@ fn event_inspector(app: &TimelineApp, ui: &mut egui::Ui, id: Id, actions: &mut V
     if !children.is_empty() {
         ui.add_space(6.0);
         ui.separator();
-        ui.weak(format!("Contains {} nested event(s):", children.len()));
+        ui.weak(format!("Enthält {} verschachtelte Ereignisse:", children.len()));
         for child in children {
             if ui.link(&child.title).clicked() {
                 actions.push(Action::Select(Selection::Event(child.id)));
@@ -574,26 +785,26 @@ fn timeline_inspector(app: &TimelineApp, ui: &mut egui::Ui, id: Id, actions: &mu
     });
     ui.add_space(4.0);
     header_row(ui, Selection::Timeline(id), actions);
-    if ui.button("+ Add event here").clicked() {
+    if ui.button("+ Ereignis hier hinzufügen").clicked() {
         actions.push(Action::AddEventTo(OwnerRef::Timeline(id)));
     }
     ui.separator();
 
     if let Some(s) = tl.span {
-        field(ui, "Span", s.label());
+        field(ui, "Zeitraum", s.label());
     } else {
-        field(ui, "Span", "inferred from its events");
+        field(ui, "Zeitraum", "aus den Ereignissen abgeleitet");
     }
     if let Some(j) = &tl.origin {
         field(
             ui,
-            "Splits from",
+            "Spaltet sich ab von",
             format!(
-                "{} at {}{}",
+                "{} am {}{}",
                 app.doc
                     .timeline(j.other)
                     .map(|t| t.name.clone())
-                    .unwrap_or_else(|| "(missing)".into()),
+                    .unwrap_or_else(|| "(fehlt)".into()),
                 j.date.label(),
                 if j.label.is_empty() {
                     String::new()
@@ -606,13 +817,13 @@ fn timeline_inspector(app: &TimelineApp, ui: &mut egui::Ui, id: Id, actions: &mu
     if let Some(j) = &tl.merge {
         field(
             ui,
-            "Merges into",
+            "Geht auf in",
             format!(
-                "{} at {}{}",
+                "{} am {}{}",
                 app.doc
                     .timeline(j.other)
                     .map(|t| t.name.clone())
-                    .unwrap_or_else(|| "(missing)".into()),
+                    .unwrap_or_else(|| "(fehlt)".into()),
                 j.date.label(),
                 if j.label.is_empty() {
                     String::new()
@@ -639,18 +850,18 @@ fn biography_inspector(app: &TimelineApp, ui: &mut egui::Ui, id: Id, actions: &m
     });
     ui.add_space(4.0);
     header_row(ui, Selection::Biography(id), actions);
-    if ui.button("+ Add life event").clicked() {
+    if ui.button("+ Lebensereignis hinzufügen").clicked() {
         actions.push(Action::AddEventTo(OwnerRef::Biography(id)));
     }
     ui.separator();
 
-    field(ui, "Lived", bio.life_label());
+    field(ui, "Lebte", bio.life_label());
     if let Some(t) = bio.timeline.and_then(|t| app.doc.timeline(t)) {
-        field(ui, "Culture", t.name.clone());
+        field(ui, "Kultur", t.name.clone());
     }
-    field(ui, "Shown as", bio.display.name());
-    field(ui, "Importance", importance_name(bio.importance));
-    field(ui, "Categories", app.doc.category_names(&bio.categories));
+    field(ui, "Angezeigt als", bio.display.name());
+    field(ui, "Bedeutung", importance_name(bio.importance));
+    field(ui, "Kategorien", app.doc.category_names(&bio.categories));
     if !bio.notes.trim().is_empty() {
         ui.add_space(4.0);
         ui.label(&bio.notes);
@@ -671,9 +882,9 @@ fn event_list(app: &TimelineApp, ui: &mut egui::Ui, owner: OwnerRef, actions: &m
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    section_header(ui, "Events", events.len());
+    section_header(ui, "Ereignisse", events.len());
     if events.is_empty() {
-        ui.weak("Nothing here yet.");
+        ui.weak("Hier ist noch nichts.");
         return;
     }
     for ev in events {
@@ -771,5 +982,72 @@ mod tests {
         let mut doc = doc_with(&["A", "B"]);
         reorder(&mut doc, Id(999), 1);
         assert_eq!(order_of(&doc), vec!["A", "B"]);
+    }
+
+    // --- Sidebar search -------------------------------------------------------
+
+    fn group(doc: &mut Document, name: &str, parent: Option<Id>) -> Id {
+        let id = doc.new_id();
+        doc.groups.push(Group {
+            id,
+            name: name.into(),
+            color: [0, 0, 0],
+            parent,
+            order: 0,
+            collapsed: false,
+            visible: true,
+            notes: String::new(),
+        });
+        id
+    }
+
+    fn timeline_in(doc: &mut Document, name: &str, group: Option<Id>) -> Id {
+        let id = doc.new_id();
+        doc.timelines.push(Timeline {
+            id,
+            name: name.into(),
+            color: [0, 0, 0],
+            visible: true,
+            group,
+            order: 0,
+            span: None,
+            origin: None,
+            merge: None,
+            notes: String::new(),
+            epochs: Vec::new(),
+        });
+        id
+    }
+
+    #[test]
+    fn a_timeline_match_pulls_in_its_ancestor_groups_but_not_its_siblings() {
+        let mut doc = Document::default();
+        let antiquity = group(&mut doc, "Antiquity", None);
+        let greek = group(&mut doc, "Greek antiquity", Some(antiquity));
+        let athens = timeline_in(&mut doc, "Athens", Some(greek));
+        let sparta = timeline_in(&mut doc, "Sparta", Some(greek));
+
+        let m = compute_timeline_matches(&doc, "athens");
+        assert!(m.timelines.contains(&athens));
+        assert!(!m.timelines.contains(&sparta));
+        // Both ancestor groups must be included, or Athens would have no
+        // visible path down to it in the tree.
+        assert!(m.groups.contains(&greek));
+        assert!(m.groups.contains(&antiquity));
+    }
+
+    #[test]
+    fn a_group_name_match_pulls_in_its_whole_subtree() {
+        let mut doc = Document::default();
+        let greek = group(&mut doc, "Greek antiquity", None);
+        let athens = timeline_in(&mut doc, "Athens", Some(greek));
+        let sparta = timeline_in(&mut doc, "Sparta", Some(greek));
+        let rome = timeline_in(&mut doc, "Rome", None);
+
+        let m = compute_timeline_matches(&doc, "greek");
+        assert!(m.groups.contains(&greek));
+        assert!(m.timelines.contains(&athens));
+        assert!(m.timelines.contains(&sparta));
+        assert!(!m.timelines.contains(&rome));
     }
 }

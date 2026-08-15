@@ -45,29 +45,29 @@ fn date_field(
         ui.add(
             egui::TextEdit::singleline(buf)
                 .desired_width(180.0)
-                .hint_text("e.g. 44 BC, c. 250 BC, 1789-07-14"),
+                .hint_text("z. B. 44 v. Chr., um 250 v. Chr., 14.07.1789, 1789-07-14"),
         );
     });
 
     let trimmed = buf.trim();
     if trimmed.is_empty() {
         if allow_empty {
-            ui.indent("d", |ui| ui.weak("— none —"));
+            ui.indent("d", |ui| ui.weak("— keine —"));
             return Ok(None);
         }
-        ui.indent("d", |ui| ui.colored_label(BAD_RED, "a date is required"));
+        ui.indent("d", |ui| ui.colored_label(BAD_RED, "ein Datum wird benötigt"));
         return Err(());
     }
     match HDate::parse(trimmed) {
         Some(d) => {
             ui.indent("d", |ui| {
-                ui.colored_label(OK_GREEN, format!("reads as {}", d.label()));
+                ui.colored_label(OK_GREEN, format!("gelesen als {}", d.label()));
             });
             Ok(Some(d))
         }
         None => {
             ui.indent("d", |ui| {
-                ui.colored_label(BAD_RED, "not understood — try 44 BC, -44, or 1789-07-14");
+                ui.colored_label(BAD_RED, "nicht verstanden — versuche 44 v. Chr., -44 oder 1789-07-14");
             });
             Err(())
         }
@@ -76,13 +76,13 @@ fn date_field(
 
 fn importance_picker(ui: &mut egui::Ui, value: &mut u8) {
     ui.horizontal(|ui| {
-        ui.label("Importance:");
+        ui.label("Bedeutung:");
         for level in (IMPORTANCE_MIN..=IMPORTANCE_MAX).rev() {
             if ui
                 .selectable_label(*value == level, importance_name(level))
                 .on_hover_text(format!(
-                    "Level {level} — shown from {} zoom onwards",
-                    if level >= 4 { "any" } else { "closer" }
+                    "Stufe {level} — sichtbar ab {} Zoom",
+                    if level >= 4 { "jedem" } else { "näherem" }
                 ))
                 .clicked()
             {
@@ -93,9 +93,9 @@ fn importance_picker(ui: &mut egui::Ui, value: &mut u8) {
 }
 
 fn category_picker(ui: &mut egui::Ui, doc: &Document, selected: &mut BTreeSet<Id>) {
-    ui.label("Categories:");
+    ui.label("Kategorien:");
     if doc.categories.is_empty() {
-        ui.weak("No categories defined yet — add some under Edit > Categories.");
+        ui.weak("Noch keine Kategorien definiert — welche unter Bearbeiten > Kategorien anlegen.");
         return;
     }
     egui::ScrollArea::vertical()
@@ -149,7 +149,7 @@ fn category_picker_rows(
 }
 
 fn owner_picker(ui: &mut egui::Ui, doc: &Document, owner: &mut OwnerRef) {
-    egui::ComboBox::from_label("Belongs to")
+    egui::ComboBox::from_label("Gehört zu")
         .selected_text(doc.owner_name(*owner))
         .width(240.0)
         .show_ui(ui, |ui| {
@@ -176,7 +176,7 @@ fn dialog_buttons(ui: &mut egui::Ui, can_save: bool, save_label: &str) -> Option
     ui.separator();
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        if ui.button("Cancel").clicked() {
+        if ui.button("Abbrechen").clicked() {
             result = Some(false);
         }
         if ui
@@ -186,7 +186,7 @@ fn dialog_buttons(ui: &mut egui::Ui, can_save: bool, save_label: &str) -> Option
             result = Some(true);
         }
         if !can_save {
-            ui.weak("fix the highlighted fields first");
+            ui.weak("zuerst die markierten Felder korrigieren");
         }
     });
     result
@@ -273,14 +273,14 @@ fn event_parent_combo(
     let text = value
         .and_then(|id| doc.event(id))
         .map(|e| e.title.clone())
-        .unwrap_or_else(|| "— none (top level) —".into());
+        .unwrap_or_else(|| "— keine (oberste Ebene) —".into());
     ui.horizontal(|ui| {
-        ui.label("Nested inside:");
+        ui.label("Verschachtelt in:");
         egui::ComboBox::from_id_salt("event_parent")
             .selected_text(text)
             .width(220.0)
             .show_ui(ui, |ui| {
-                ui.selectable_value(value, None, "— none (top level) —");
+                ui.selectable_value(value, None, "— keine (oberste Ebene) —");
                 for e in doc.events_of(owner) {
                     if !e.span.is_range() {
                         continue;
@@ -299,9 +299,9 @@ fn event_parent_combo(
 fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm) -> bool {
     let mut keep_open = true;
     let title = if form.editing.is_some() {
-        "Edit event"
+        "Ereignis bearbeiten"
     } else {
-        "New event"
+        "Neues Ereignis"
     };
 
     egui::Modal::new(egui::Id::new("event_dialog")).show(ctx, |ui| {
@@ -310,11 +310,11 @@ fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            ui.label("Title:");
+            ui.label("Titel:");
             ui.add(
                 egui::TextEdit::singleline(&mut form.title)
                     .desired_width(320.0)
-                    .hint_text("e.g. Battle of Pydna"),
+                    .hint_text("z. B. Schlacht bei Pydna"),
             );
         });
         owner_picker(ui, &app.doc, &mut form.owner);
@@ -328,10 +328,10 @@ fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm
         event_parent_combo(ui, &app.doc, form.owner, form.editing, &mut form.parent);
         ui.add_space(6.0);
 
-        let start = date_field(ui, "Date:  ", &mut form.start_text, false);
-        ui.checkbox(&mut form.is_range, "This spans a period");
+        let start = date_field(ui, "Datum:", &mut form.start_text, false);
+        ui.checkbox(&mut form.is_range, "Erstreckt sich über einen Zeitraum");
         let end = if form.is_range {
-            date_field(ui, "Until:", &mut form.end_text, false)
+            date_field(ui, "Bis:  ", &mut form.end_text, false)
         } else {
             Ok(None)
         };
@@ -342,7 +342,7 @@ fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm
         category_picker(ui, &app.doc, &mut form.categories);
 
         ui.add_space(6.0);
-        ui.label("Notes:");
+        ui.label("Notizen:");
         ui.add(
             egui::TextEdit::multiline(&mut form.description)
                 .desired_rows(3)
@@ -355,12 +355,12 @@ fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm
         if let (Ok(Some(s)), Ok(Some(e))) = (&start, &end) {
             if e.decimal_end() < s.decimal() {
                 ordering_ok = false;
-                ui.colored_label(BAD_RED, "the end date is before the start date");
+                ui.colored_label(BAD_RED, "das Enddatum liegt vor dem Startdatum");
             }
         }
         let can_save = start_ok && end_ok && ordering_ok && !form.title.trim().is_empty();
 
-        match dialog_buttons(ui, can_save, "Save") {
+        match dialog_buttons(ui, can_save, "Speichern") {
             Some(true) => {
                 let Ok(Some(s)) = start else { return };
                 let span = match (form.is_range, end) {
@@ -392,7 +392,7 @@ fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm
                                 ev.parent = parent;
                             }
                         });
-                        app.info("Event updated");
+                        app.info("Ereignis aktualisiert");
                     }
                     None => {
                         let parent = form.parent;
@@ -412,7 +412,7 @@ fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm
                             });
                         });
                         app.selection = new_id.map(Selection::Event);
-                        app.info("Event added");
+                        app.info("Ereignis hinzugefügt");
                     }
                 }
                 keep_open = false;
@@ -470,12 +470,12 @@ fn group_combo(
     let text = value
         .and_then(|id| doc.group(id))
         .map(|g| g.name.clone())
-        .unwrap_or_else(|| "— none (top level) —".into());
+        .unwrap_or_else(|| "— keine (oberste Ebene) —".into());
     egui::ComboBox::from_id_salt(id_salt)
         .selected_text(text)
         .width(240.0)
         .show_ui(ui, |ui| {
-            ui.selectable_value(value, None, "— none (top level) —");
+            ui.selectable_value(value, None, "— keine (oberste Ebene) —");
             for g in &doc.groups {
                 // Never offer a move that would make a group its own ancestor.
                 if let Some(m) = moving {
@@ -491,15 +491,15 @@ fn group_combo(
 fn group_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut GroupForm) -> bool {
     let mut keep_open = true;
     let heading = if form.editing.is_some() {
-        "Edit group"
+        "Gruppe bearbeiten"
     } else {
-        "New group"
+        "Neue Gruppe"
     };
 
     egui::Modal::new(egui::Id::new("group_dialog")).show(ctx, |ui| {
         ui.set_width(440.0);
         ui.heading(heading);
-        ui.weak("A super-category, e.g. \"European history\" or \"Greek antiquity\". Collapse it to compare whole civilisations; expand it to see the timelines inside.");
+        ui.weak("Eine Oberkategorie, z. B. \"Europäische Geschichte\" oder \"Griechische Antike\". Einklappen, um ganze Kulturen zu vergleichen; ausklappen, um die enthaltenen Zeitstrahlen zu sehen.");
         ui.add_space(10.0);
 
         ui.horizontal(|ui| {
@@ -507,19 +507,19 @@ fn group_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut GroupForm
             ui.add(
                 egui::TextEdit::singleline(&mut form.name)
                     .desired_width(280.0)
-                    .hint_text("e.g. Greek antiquity"),
+                    .hint_text("z. B. Griechische Antike"),
             );
             ui.color_edit_button_srgb(&mut form.color);
         });
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label("Inside:");
+            ui.label("In:");
             group_combo(ui, &app.doc, "group_parent", &mut form.parent, form.editing);
         });
 
         ui.add_space(6.0);
-        ui.label("Notes:");
+        ui.label("Notizen:");
         ui.add(
             egui::TextEdit::multiline(&mut form.notes)
                 .desired_rows(2)
@@ -527,7 +527,7 @@ fn group_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut GroupForm
         );
 
         let can_save = !form.name.trim().is_empty();
-        match dialog_buttons(ui, can_save, "Save") {
+        match dialog_buttons(ui, can_save, "Speichern") {
             Some(true) => {
                 let name = form.name.trim().to_string();
                 let color = form.color;
@@ -550,7 +550,7 @@ fn group_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut GroupForm
                                 g.notes = notes;
                             }
                         });
-                        app.info("Group updated");
+                        app.info("Gruppe aktualisiert");
                     }
                     None => {
                         let mut new_id = None;
@@ -570,7 +570,7 @@ fn group_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut GroupForm
                             });
                         });
                         app.selection = new_id.map(Selection::Group);
-                        app.info("Group added — put timelines in it from their editor.");
+                        app.info("Gruppe hinzugefügt — Zeitstrahlen über deren Editor hineinlegen.");
                     }
                 }
                 keep_open = false;
@@ -716,7 +716,7 @@ fn timeline_combo(
     let text = value
         .and_then(|id| doc.timeline(id))
         .map(|t| t.name.clone())
-        .unwrap_or_else(|| "— choose —".into());
+        .unwrap_or_else(|| "— wählen —".into());
     egui::ComboBox::from_id_salt(id_salt)
         .selected_text(text)
         .width(200.0)
@@ -734,9 +734,9 @@ fn timeline_combo(
 fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut TimelineForm) -> bool {
     let mut keep_open = true;
     let heading = if form.editing.is_some() {
-        "Edit timeline"
+        "Zeitstrahl bearbeiten"
     } else {
-        "New timeline"
+        "Neuer Zeitstrahl"
     };
 
     egui::Modal::new(egui::Id::new("timeline_dialog")).show(ctx, |ui| {
@@ -749,26 +749,26 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
             ui.add(
                 egui::TextEdit::singleline(&mut form.name)
                     .desired_width(280.0)
-                    .hint_text("e.g. Roman Republic"),
+                    .hint_text("z. B. Römische Republik"),
             );
             ui.color_edit_button_srgb(&mut form.color);
         });
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label("Inside group:");
+            ui.label("In Gruppe:");
             group_combo(ui, &app.doc, "tl_group", &mut form.group, None);
         });
 
         ui.add_space(6.0);
         ui.checkbox(
             &mut form.use_span,
-            "Set an explicit lifespan (otherwise inferred from its events)",
+            "Expliziten Zeitraum festlegen (sonst aus den Ereignissen abgeleitet)",
         );
         let (start, end) = if form.use_span {
             (
-                date_field(ui, "From: ", &mut form.start_text, false),
-                date_field(ui, "To:   ", &mut form.end_text, true),
+                date_field(ui, "Von: ", &mut form.start_text, false),
+                date_field(ui, "Bis: ", &mut form.end_text, true),
             )
         } else {
             (Ok(None), Ok(None))
@@ -777,31 +777,31 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
         ui.add_space(10.0);
         ui.separator();
         ui.label(
-            egui::RichText::new("Relationships to other timelines")
+            egui::RichText::new("Beziehungen zu anderen Zeitstrahlen")
                 .strong(),
         );
-        ui.weak("Bands curve into one another at these points instead of just running side by side.");
+        ui.weak("Bänder biegen an diesen Punkten ineinander, statt nur nebeneinander zu verlaufen.");
         ui.add_space(6.0);
 
-        ui.checkbox(&mut form.origin_on, "Splits from another timeline");
+        ui.checkbox(&mut form.origin_on, "Spaltet sich ab von einem anderen Zeitstrahl");
         let origin_date = if form.origin_on {
             ui.horizontal(|ui| {
                 timeline_combo(
                     ui,
                     &app.doc,
                     "origin_combo",
-                    "is the parent",
+                    "ist der Ursprung",
                     &mut form.origin_other,
                     form.editing,
                 );
             });
-            let d = date_field(ui, "at:   ", &mut form.origin_date, false);
+            let d = date_field(ui, "am:  ", &mut form.origin_date, false);
             ui.horizontal(|ui| {
-                ui.label("Label:");
+                ui.label("Beschriftung:");
                 ui.add(
                     egui::TextEdit::singleline(&mut form.origin_label)
                         .desired_width(240.0)
-                        .hint_text("optional, e.g. Wars of the Diadochi"),
+                        .hint_text("optional, z. B. Diadochenkriege"),
                 );
             });
             d
@@ -810,25 +810,25 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
         };
 
         ui.add_space(6.0);
-        ui.checkbox(&mut form.merge_on, "Merges into another timeline");
+        ui.checkbox(&mut form.merge_on, "Geht auf in einem anderen Zeitstrahl");
         let merge_date = if form.merge_on {
             ui.horizontal(|ui| {
                 timeline_combo(
                     ui,
                     &app.doc,
                     "merge_combo",
-                    "absorbs it",
+                    "nimmt ihn auf",
                     &mut form.merge_other,
                     form.editing,
                 );
             });
-            let d = date_field(ui, "at:   ", &mut form.merge_date, false);
+            let d = date_field(ui, "am:  ", &mut form.merge_date, false);
             ui.horizontal(|ui| {
-                ui.label("Label:");
+                ui.label("Beschriftung:");
                 ui.add(
                     egui::TextEdit::singleline(&mut form.merge_label)
                         .desired_width(240.0)
-                        .hint_text("optional, e.g. Battle of Pydna"),
+                        .hint_text("optional, z. B. Schlacht bei Pydna"),
                 );
             });
             d
@@ -838,8 +838,8 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
 
         ui.add_space(10.0);
         ui.separator();
-        ui.label(egui::RichText::new("Epochs").strong());
-        ui.weak("Colour-code eras along this band — \"Archaic\", \"Classical\" — without splitting it into separate timelines.");
+        ui.label(egui::RichText::new("Epochen").strong());
+        ui.weak("Epochen entlang dieses Bands farblich kennzeichnen — \"Archaisch\", \"Klassisch\" — ohne es in separate Zeitstrahlen aufzuteilen.");
         ui.add_space(4.0);
 
         let mut remove_epoch = None;
@@ -850,20 +850,20 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
                 ui.add(
                     egui::TextEdit::singleline(&mut row.name)
                         .desired_width(110.0)
-                        .hint_text("e.g. Archaic"),
+                        .hint_text("z. B. Archaisch"),
                 );
                 ui.add(
                     egui::TextEdit::singleline(&mut row.start_text)
                         .desired_width(85.0)
-                        .hint_text("start"),
+                        .hint_text("Beginn"),
                 );
                 ui.label("–");
                 ui.add(
                     egui::TextEdit::singleline(&mut row.end_text)
                         .desired_width(85.0)
-                        .hint_text("end"),
+                        .hint_text("Ende"),
                 );
-                if ui.small_button("Delete").clicked() {
+                if ui.small_button("Löschen").clicked() {
                     remove_epoch = Some(i);
                 }
             });
@@ -872,14 +872,14 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
             if !name_ok || !dates_ok {
                 epochs_ready = false;
                 ui.indent("epoch_err", |ui| {
-                    ui.colored_label(BAD_RED, "needs a name and two valid dates");
+                    ui.colored_label(BAD_RED, "braucht einen Namen und zwei gültige Daten");
                 });
             }
         }
         if let Some(i) = remove_epoch {
             form.epochs.remove(i);
         }
-        if ui.small_button("+ Epoch").clicked() {
+        if ui.small_button("+ Epoche").clicked() {
             let color = form
                 .epochs
                 .last()
@@ -889,7 +889,7 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
         }
 
         ui.add_space(8.0);
-        ui.label("Notes:");
+        ui.label("Notizen:");
         ui.add(
             egui::TextEdit::multiline(&mut form.notes)
                 .desired_rows(2)
@@ -899,10 +899,10 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
         let origin_ready = !form.origin_on || (form.origin_other.is_some() && origin_date.is_ok());
         let merge_ready = !form.merge_on || (form.merge_other.is_some() && merge_date.is_ok());
         if form.origin_on && form.origin_other.is_none() {
-            ui.colored_label(BAD_RED, "choose the timeline it splits from");
+            ui.colored_label(BAD_RED, "den Zeitstrahl wählen, von dem es sich abspaltet");
         }
         if form.merge_on && form.merge_other.is_none() {
-            ui.colored_label(BAD_RED, "choose the timeline it merges into");
+            ui.colored_label(BAD_RED, "den Zeitstrahl wählen, in den es aufgeht");
         }
         let can_save = !form.name.trim().is_empty()
             && start.is_ok()
@@ -911,7 +911,7 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
             && merge_ready
             && epochs_ready;
 
-        match dialog_buttons(ui, can_save, "Save") {
+        match dialog_buttons(ui, can_save, "Speichern") {
             Some(true) => {
                 let span = match (form.use_span, &start, &end) {
                     (true, Ok(Some(s)), Ok(e)) => Some(Span { start: *s, end: *e }),
@@ -954,7 +954,7 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
                                 t.epochs = epochs;
                             }
                         });
-                        app.info("Timeline updated");
+                        app.info("Zeitstrahl aktualisiert");
                     }
                     None => {
                         let mut new_id = None;
@@ -978,7 +978,7 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
                             });
                         });
                         app.selection = new_id.map(Selection::Timeline);
-                        app.info("Timeline added");
+                        app.info("Zeitstrahl hinzugefügt");
                     }
                 }
                 keep_open = false;
@@ -1046,9 +1046,9 @@ impl BiographyForm {
 fn biography_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut BiographyForm) -> bool {
     let mut keep_open = true;
     let heading = if form.editing.is_some() {
-        "Edit biography"
+        "Biografie bearbeiten"
     } else {
-        "New biography"
+        "Neue Biografie"
     };
 
     egui::Modal::new(egui::Id::new("bio_dialog")).show(ctx, |ui| {
@@ -1061,7 +1061,7 @@ fn biography_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Biogr
             ui.add(
                 egui::TextEdit::singleline(&mut form.name)
                     .desired_width(300.0)
-                    .hint_text("e.g. Marcus Tullius Cicero"),
+                    .hint_text("z. B. Marcus Tullius Cicero"),
             );
         });
 
@@ -1070,26 +1070,26 @@ fn biography_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Biogr
                 .timeline
                 .and_then(|id| app.doc.timeline(id))
                 .map(|t| t.name.clone())
-                .unwrap_or_else(|| "— none —".into());
+                .unwrap_or_else(|| "— keine —".into());
             egui::ComboBox::from_id_salt("bio_tl")
                 .selected_text(text)
                 .width(220.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut form.timeline, None, "— none —");
+                    ui.selectable_value(&mut form.timeline, None, "— keine —");
                     for t in &app.doc.timelines {
                         ui.selectable_value(&mut form.timeline, Some(t.id), &t.name);
                     }
                 });
-            ui.label("culture / timeline");
+            ui.label("Kultur / Zeitstrahl");
         });
 
         ui.add_space(6.0);
-        let birth = date_field(ui, "Born: ", &mut form.birth_text, false);
-        let death = date_field(ui, "Died: ", &mut form.death_text, true);
+        let birth = date_field(ui, "Geboren:", &mut form.birth_text, false);
+        let death = date_field(ui, "Gestorben:", &mut form.death_text, true);
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.label("Show as:");
+            ui.label("Anzeigen als:");
             for d in [BioDisplay::Hidden, BioDisplay::Inline, BioDisplay::Lane] {
                 let enabled = d != BioDisplay::Inline || form.timeline.is_some();
                 let resp = ui.add_enabled(
@@ -1100,7 +1100,7 @@ fn biography_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Biogr
                     form.display = d;
                 }
                 if !enabled {
-                    resp.on_hover_text("Inline needs a parent culture");
+                    resp.on_hover_text("Eingebettet braucht eine übergeordnete Kultur");
                 }
             }
         });
@@ -1111,11 +1111,11 @@ fn biography_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Biogr
 
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.checkbox(&mut form.own_color, "Own colour");
+            ui.checkbox(&mut form.own_color, "Eigene Farbe");
             if form.own_color {
                 ui.color_edit_button_srgb(&mut form.color);
             } else {
-                ui.weak("inherits the culture's colour");
+                ui.weak("übernimmt die Farbe der Kultur");
             }
         });
 
@@ -1125,7 +1125,7 @@ fn biography_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Biogr
         category_picker(ui, &app.doc, &mut form.categories);
 
         ui.add_space(6.0);
-        ui.label("Notes:");
+        ui.label("Notizen:");
         ui.add(
             egui::TextEdit::multiline(&mut form.notes)
                 .desired_rows(2)
@@ -1136,13 +1136,13 @@ fn biography_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Biogr
         if let (Ok(Some(b)), Ok(Some(d))) = (&birth, &death) {
             if d.decimal_end() < b.decimal() {
                 ordering_ok = false;
-                ui.colored_label(BAD_RED, "the death date is before the birth date");
+                ui.colored_label(BAD_RED, "das Sterbedatum liegt vor dem Geburtsdatum");
             }
         }
         let can_save =
             !form.name.trim().is_empty() && birth.is_ok() && death.is_ok() && ordering_ok;
 
-        match dialog_buttons(ui, can_save, "Save") {
+        match dialog_buttons(ui, can_save, "Speichern") {
             Some(true) => {
                 let Ok(Some(birth)) = birth else { return };
                 let death = death.unwrap_or(None);
@@ -1169,7 +1169,7 @@ fn biography_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Biogr
                                 b.notes = notes;
                             }
                         });
-                        app.info("Biography updated");
+                        app.info("Biografie aktualisiert");
                     }
                     None => {
                         let mut new_id = None;
@@ -1190,7 +1190,7 @@ fn biography_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Biogr
                             });
                         });
                         app.selection = new_id.map(Selection::Biography);
-                        app.info("Biography added");
+                        app.info("Biografie hinzugefügt");
                     }
                 }
                 keep_open = false;
@@ -1226,12 +1226,12 @@ fn category_combo(
     let text = value
         .and_then(|id| doc.category(id))
         .map(|c| c.name.clone())
-        .unwrap_or_else(|| "— none (top level) —".into());
+        .unwrap_or_else(|| "— keine (oberste Ebene) —".into());
     egui::ComboBox::from_id_salt(id_salt)
         .selected_text(text)
         .width(170.0)
         .show_ui(ui, |ui| {
-            ui.selectable_value(value, None, "— none (top level) —");
+            ui.selectable_value(value, None, "— keine (oberste Ebene) —");
             for c in &doc.categories {
                 // Never offer a move that would make a category its own ancestor.
                 if let Some(m) = moving {
@@ -1286,7 +1286,7 @@ fn category_editor_tree(
             let uses = doc.events.iter().filter(|e| e.categories.contains(&c.id)).count()
                 + doc.biographies.iter().filter(|b| b.categories.contains(&c.id)).count();
             ui.weak(format!("{uses}"));
-            if ui.button("Delete").on_hover_text("Delete category").clicked() {
+            if ui.button("Löschen").on_hover_text("Kategorie löschen").clicked() {
                 actions.push(CatAction::Remove(c.id));
             }
         });
@@ -1312,9 +1312,9 @@ fn category_dialog(app: &mut TimelineApp, ctx: &egui::Context, ed: &mut Category
 
     egui::Modal::new(egui::Id::new("cat_dialog")).show(ctx, |ui| {
         ui.set_width(460.0);
-        ui.heading("Categories");
-        ui.weak("Rename, recolour, nest, add or remove freely — nothing depends on a fixed list.");
-        ui.weak("\"Inside:\" nests one category under another; ticking a parent in the sidebar filter also covers its subcategories.");
+        ui.heading("Kategorien");
+        ui.weak("Beliebig umbenennen, umfärben, verschachteln, hinzufügen oder entfernen — nichts hängt an einer festen Liste.");
+        ui.weak("\"in:\" verschachtelt eine Kategorie unter einer anderen; eine Elternkategorie im Seitenleisten-Filter anzuhaken deckt auch ihre Unterkategorien ab.");
         ui.add_space(8.0);
 
         let mut actions: Vec<CatAction> = Vec::new();
@@ -1364,12 +1364,12 @@ fn category_dialog(app: &mut TimelineApp, ctx: &egui::Context, ed: &mut Category
             ui.add(
                 egui::TextEdit::singleline(&mut ed.new_name)
                     .desired_width(170.0)
-                    .hint_text("new category name"),
+                    .hint_text("neuer Kategoriename"),
             );
             ui.weak("in:");
             category_combo(ui, &app.doc, "cat_new_parent", &mut ed.new_parent, None);
             let ok = !ed.new_name.trim().is_empty();
-            if ui.add_enabled(ok, egui::Button::new("Add")).clicked() {
+            if ui.add_enabled(ok, egui::Button::new("Hinzufügen")).clicked() {
                 let name = ed.new_name.trim().to_string();
                 let color = *col;
                 let parent = ed.new_parent;
@@ -1384,7 +1384,7 @@ fn category_dialog(app: &mut TimelineApp, ctx: &egui::Context, ed: &mut Category
         });
 
         ui.add_space(10.0);
-        if ui.button("Close").clicked() {
+        if ui.button("Schließen").clicked() {
             keep_open = false;
         }
     });

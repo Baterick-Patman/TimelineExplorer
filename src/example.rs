@@ -197,19 +197,19 @@ pub fn build() -> Document {
         });
     };
 
-    let military = cat(&doc, "Military");
-    let politics = cat(&doc, "Politics");
-    let mil_pol = cats(&doc, &["Military", "Politics"]);
-    let literature = cat(&doc, "Literature");
-    let philosophy = cat(&doc, "Philosophy");
-    let science = cat(&doc, "Science");
-    let personal = cat(&doc, "Personal");
-    let law = cat(&doc, "Law");
-    let art = cat(&doc, "Art");
-    let mil_rel = cats(&doc, &["Military", "Religion"]);
-    let sci_lit = cats(&doc, &["Science", "Literature"]);
-    let lit_law = cats(&doc, &["Literature", "Law"]);
-    let lit_phil = cats(&doc, &["Literature", "Philosophy"]);
+    let military = cat(&doc, "Militär");
+    let politics = cat(&doc, "Politik");
+    let mil_pol = cats(&doc, &["Militär", "Politik"]);
+    let literature = cat(&doc, "Literatur");
+    let philosophy = cat(&doc, "Philosophie");
+    let science = cat(&doc, "Wissenschaft");
+    let personal = cat(&doc, "Privat");
+    let law = cat(&doc, "Recht");
+    let art = cat(&doc, "Kunst");
+    let mil_rel = cats(&doc, &["Militär", "Religion"]);
+    let sci_lit = cats(&doc, &["Wissenschaft", "Literatur"]);
+    let lit_law = cats(&doc, &["Literatur", "Recht"]);
+    let lit_phil = cats(&doc, &["Literatur", "Philosophie"]);
 
     let r = OwnerRef::Timeline(rome);
     add(&mut doc, r, "Founding of the Republic", Span::point(HDate::year(-509)), 5, politics.clone());
@@ -256,7 +256,7 @@ pub fn build() -> Document {
         birth: HDate::year(-106),
         death: Some(HDate::year(-43)),
         color: Some([232, 178, 96]),
-        categories: cats(&doc, &["Literature", "Philosophy", "Politics"]),
+        categories: cats(&doc, &["Literatur", "Philosophie", "Politik"]),
         importance: 4,
         display: BioDisplay::Inline,
         notes: "Orator, consul, and prolific correspondent.".into(),
@@ -274,7 +274,7 @@ pub fn build() -> Document {
             ..HDate::year(-44)
         }),
         color: Some([236, 130, 110]),
-        categories: cats(&doc, &["Politics", "Military", "Literature"]),
+        categories: cats(&doc, &["Politik", "Militär", "Literatur"]),
         importance: 5,
         display: BioDisplay::Lane,
         notes: String::new(),

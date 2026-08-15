@@ -25,6 +25,17 @@ pub enum Selection {
     Event(Id),
 }
 
+/// How the sidebar clusters biographies for collapsing — by their culture
+/// (single-valued: exactly one cluster each) or by category (a biography can
+/// carry several, so it can appear in more than one cluster). Session-only,
+/// like the search strings it sits next to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BioGroupBy {
+    #[default]
+    Culture,
+    Category,
+}
+
 pub struct Toast {
     pub text: String,
     pub error: bool,
@@ -63,6 +74,14 @@ pub struct TimelineApp {
     pub show_help: bool,
     pub focus_search: bool,
 
+    /// Sidebar list filters — narrow a long Timelines/Biographies list down
+    /// while typing. Deliberately not part of `Document`: it is a navigation
+    /// aid for the current session, not something worth remembering between
+    /// launches the way the canvas search (`view.filters.search`) is.
+    pub timeline_search: String,
+    pub bio_search: String,
+    pub bio_group_by: BioGroupBy,
+
     undo: Vec<Document>,
     redo: Vec<Document>,
 }
@@ -78,7 +97,7 @@ impl TimelineApp {
                 // in-memory document and tell the user loudly.
                 Document::with_starter_categories(),
                 Some(Toast {
-                    text: format!("{e} — your file was left untouched. Use File > Open to try another."),
+                    text: format!("{e} — deine Datei wurde nicht verändert. Über Datei > Öffnen eine andere versuchen."),
                     error: true,
                     at: Instant::now(),
                 }),
@@ -101,6 +120,9 @@ impl TimelineApp {
             toast,
             show_help: false,
             focus_search: false,
+            timeline_search: String::new(),
+            bio_search: String::new(),
+            bio_group_by: BioGroupBy::default(),
             undo: Vec::new(),
             redo: Vec::new(),
         }
@@ -139,7 +161,7 @@ impl TimelineApp {
             self.redo.push(std::mem::replace(&mut self.doc, prev));
             self.validate_selection();
             self.mark_dirty();
-            self.info("Undone");
+            self.info("Rückgängig gemacht");
         }
     }
 
@@ -148,7 +170,7 @@ impl TimelineApp {
             self.undo.push(std::mem::replace(&mut self.doc, next));
             self.validate_selection();
             self.mark_dirty();
-            self.info("Redone");
+            self.info("Wiederholt");
         }
     }
 
@@ -211,14 +233,14 @@ impl TimelineApp {
 
     pub fn save_as(&mut self) {
         let dialog = rfd::FileDialog::new()
-            .add_filter("Timeline library", &[store::FILE_EXTENSION])
+            .add_filter("Zeitstrahl-Bibliothek", &[store::FILE_EXTENSION])
             .set_file_name(store::DEFAULT_FILE_NAME)
             .set_directory(self.path.parent().unwrap_or(std::path::Path::new(".")));
         if let Some(p) = dialog.save_file() {
             self.path = p;
             self.save();
             if !self.dirty {
-                self.info(format!("Saved to {}", self.path.display()));
+                self.info(format!("Gespeichert unter {}", self.path.display()));
             }
         }
     }
@@ -229,7 +251,7 @@ impl TimelineApp {
             self.save();
         }
         let dialog = rfd::FileDialog::new()
-            .add_filter("Timeline library", &[store::FILE_EXTENSION])
+            .add_filter("Zeitstrahl-Bibliothek", &[store::FILE_EXTENSION])
             .set_directory(self.path.parent().unwrap_or(std::path::Path::new(".")));
         if let Some(p) = dialog.pick_file() {
             match store::load(&p) {
@@ -240,9 +262,9 @@ impl TimelineApp {
                     self.redo.clear();
                     self.selection = None;
                     self.dirty = false;
-                    self.info("Library opened");
+                    self.info("Bibliothek geöffnet");
                 }
-                Ok(None) => self.error("That file is empty."),
+                Ok(None) => self.error("Diese Datei ist leer."),
                 Err(e) => self.error(e),
             }
         }
@@ -251,7 +273,7 @@ impl TimelineApp {
     pub fn load_example(&mut self) {
         self.mutate(|doc| *doc = example::build());
         self.selection = None;
-        self.info("Example library loaded — edit or delete anything you like.");
+        self.info("Beispielbibliothek geladen — bearbeite oder lösche alles nach Belieben.");
     }
 
     pub fn restore_backup(&mut self, path: &std::path::Path) {
@@ -259,9 +281,9 @@ impl TimelineApp {
             Ok(Some(doc)) => {
                 self.mutate(|d| *d = doc);
                 self.selection = None;
-                self.info("Backup restored. Undo if this was not what you wanted.");
+                self.info("Sicherung wiederhergestellt. Mit Rückgängig lässt sich das zurücknehmen.");
             }
-            Ok(None) => self.error("That backup is empty."),
+            Ok(None) => self.error("Diese Sicherung ist leer."),
             Err(e) => self.error(e),
         }
     }
@@ -352,7 +374,7 @@ impl TimelineApp {
     pub fn new_event_dialog(&mut self) {
         match self.default_owner() {
             Some(owner) => self.dialog = Dialog::Event(EventForm::new(owner)),
-            None => self.error("Create a timeline first — events have to belong to something."),
+            None => self.error("Zuerst einen Zeitstrahl anlegen — Ereignisse brauchen einen Träger."),
         }
     }
 
@@ -363,31 +385,31 @@ impl TimelineApp {
             Confirm::DeleteGroup(id) => {
                 self.mutate(|d| d.delete_group(id));
                 self.validate_selection();
-                self.info("Group removed; its contents moved up a level - Ctrl+Z to undo.");
+                self.info("Gruppe entfernt; ihr Inhalt ist eine Ebene nach oben gerückt — Strg+Z macht das rückgängig.");
             }
             Confirm::DeleteTimeline(id) => {
                 self.mutate(|d| d.delete_timeline(id));
                 self.validate_selection();
-                self.info("Timeline deleted — Ctrl+Z to undo.");
+                self.info("Zeitstrahl gelöscht — Strg+Z macht das rückgängig.");
             }
             Confirm::DeleteBiography(id) => {
                 self.mutate(|d| d.delete_biography(id));
                 self.validate_selection();
-                self.info("Biography deleted — Ctrl+Z to undo.");
+                self.info("Biografie gelöscht — Strg+Z macht das rückgängig.");
             }
             Confirm::DeleteEvent(id) => {
                 self.mutate(|d| d.delete_event(id));
                 self.validate_selection();
-                self.info("Event deleted; nested events moved up a level — Ctrl+Z to undo.");
+                self.info("Ereignis gelöscht; verschachtelte Ereignisse sind eine Ebene nach oben gerückt — Strg+Z macht das rückgängig.");
             }
             Confirm::DeleteCategory(id) => {
                 self.mutate(|d| d.delete_category(id));
-                self.info("Category deleted; any subcategories moved up a level — Ctrl+Z to undo.");
+                self.info("Kategorie gelöscht; Unterkategorien sind eine Ebene nach oben gerückt — Strg+Z macht das rückgängig.");
             }
             Confirm::NewLibrary => {
                 self.mutate(|d| *d = Document::with_starter_categories());
                 self.selection = None;
-                self.info("Started an empty library — Ctrl+Z to undo.");
+                self.info("Leere Bibliothek gestartet — Strg+Z macht das rückgängig.");
             }
             Confirm::Restore(path, _) => self.restore_backup(&path),
         }
@@ -474,7 +496,7 @@ impl TimelineApp {
         });
         if ctrl && s {
             self.save();
-            self.info("Saved");
+            self.info("Gespeichert");
         }
         if ctrl && z {
             self.undo();
@@ -509,33 +531,33 @@ impl TimelineApp {
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.button("New library…").clicked() {
+            ui.menu_button("Datei", |ui| {
+                if ui.button("Neue Bibliothek…").clicked() {
                     self.confirm = Some(Confirm::NewLibrary);
                     ui.close();
                 }
-                if ui.button("Open…").clicked() {
+                if ui.button("Öffnen…").clicked() {
                     self.open();
                     ui.close();
                 }
-                if ui.button("Save   (Ctrl+S)").clicked() {
+                if ui.button("Speichern   (Strg+S)").clicked() {
                     self.save();
-                    self.info("Saved");
+                    self.info("Gespeichert");
                     ui.close();
                 }
-                if ui.button("Save as…").clicked() {
+                if ui.button("Speichern unter…").clicked() {
                     self.save_as();
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("Load example library").clicked() {
+                if ui.button("Beispielbibliothek laden").clicked() {
                     self.load_example();
                     ui.close();
                 }
-                ui.menu_button("Restore backup", |ui| {
+                ui.menu_button("Sicherung wiederherstellen", |ui| {
                     let list = store::backups(&self.path);
                     if list.is_empty() {
-                        ui.label("No backups yet");
+                        ui.label("Noch keine Sicherungen");
                     }
                     for (p, label) in list {
                         if ui.button(label.clone()).clicked() {
@@ -545,81 +567,81 @@ impl TimelineApp {
                     }
                 });
                 ui.separator();
-                if ui.button("Show data folder").clicked() {
+                if ui.button("Datenordner anzeigen").clicked() {
                     store::reveal_in_explorer(&self.path);
                     ui.close();
                 }
             });
 
-            ui.menu_button("Edit", |ui| {
+            ui.menu_button("Bearbeiten", |ui| {
                 if ui
-                    .add_enabled(self.can_undo(), egui::Button::new("Undo   (Ctrl+Z)"))
+                    .add_enabled(self.can_undo(), egui::Button::new("Rückgängig   (Strg+Z)"))
                     .clicked()
                 {
                     self.undo();
                     ui.close();
                 }
                 if ui
-                    .add_enabled(self.can_redo(), egui::Button::new("Redo   (Ctrl+Y)"))
+                    .add_enabled(self.can_redo(), egui::Button::new("Wiederholen   (Strg+Y)"))
                     .clicked()
                 {
                     self.redo();
                     ui.close();
                 }
                 ui.separator();
-                if ui.button("Categories…").clicked() {
+                if ui.button("Kategorien…").clicked() {
                     self.dialog = Dialog::Categories(CategoryEditor::default());
                     ui.close();
                 }
             });
 
-            ui.menu_button("View", |ui| {
+            ui.menu_button("Ansicht", |ui| {
                 let mut dark = self.doc.view.dark_mode;
-                if ui.checkbox(&mut dark, "Dark theme").changed() {
+                if ui.checkbox(&mut dark, "Dunkles Design").changed() {
                     self.doc.view.dark_mode = dark;
                     self.mark_dirty();
                 }
                 let mut labels = self.doc.view.show_labels;
-                if ui.checkbox(&mut labels, "Show event labels").changed() {
+                if ui.checkbox(&mut labels, "Ereignis-Beschriftungen anzeigen").changed() {
                     self.doc.view.show_labels = labels;
                     self.mark_dirty();
                 }
                 ui.separator();
-                if ui.button("Fit everything   (Home)").clicked() {
+                if ui.button("Alles einpassen   (Pos1)").clicked() {
                     let w = ui.ctx().content_rect().width() - 600.0;
                     self.fit_to_content(w.max(400.0));
                     ui.close();
                 }
             });
 
-            if ui.button("Help").clicked() {
+            if ui.button("Hilfe").clicked() {
                 self.show_help = true;
             }
 
             ui.separator();
 
-            if ui.button("+ Event").on_hover_text("Ctrl+N").clicked() {
+            if ui.button("+ Ereignis").on_hover_text("Strg+N").clicked() {
                 self.new_event_dialog();
             }
-            if ui.button("+ Group").clicked() {
+            if ui.button("+ Gruppe").clicked() {
                 self.dialog = Dialog::Group(GroupForm::new(self.doc.next_palette_color()));
             }
-            if ui.button("+ Timeline").clicked() {
+            if ui.button("+ Zeitstrahl").clicked() {
                 self.dialog = Dialog::Timeline(TimelineForm::new(self.doc.next_palette_color()));
             }
-            if ui.button("+ Biography").clicked() {
+            if ui.button("+ Biografie").clicked() {
                 let default_tl = self.doc.timelines.first().map(|t| t.id);
                 self.dialog = Dialog::Biography(BiographyForm::new(default_tl));
             }
         });
 
         ui.horizontal(|ui| {
-            ui.label("Search:");
+            ui.label("Suche:");
             let mut search = self.doc.view.filters.search.clone();
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut search)
                     .desired_width(180.0)
-                    .hint_text("title or description"),
+                    .hint_text("Titel oder Beschreibung"),
             );
             if self.focus_search {
                 resp.request_focus();
@@ -629,15 +651,15 @@ impl TimelineApp {
                 self.doc.view.filters.search = search;
                 self.mark_dirty();
             }
-            if !self.doc.view.filters.search.is_empty() && ui.button("Clear").clicked() {
+            if !self.doc.view.filters.search.is_empty() && ui.button("Leeren").clicked() {
                 self.doc.view.filters.search.clear();
                 self.mark_dirty();
             }
 
             ui.separator();
 
-            ui.label("Detail:")
-                .on_hover_text("Shifts how much the current zoom reveals");
+            ui.label("Detailgrad:")
+                .on_hover_text("Verschiebt, wie viel der aktuelle Zoom zeigt");
             let mut bias = self.doc.view.filters.detail_bias;
             if ui
                 .add(egui::Slider::new(&mut bias, -2..=3).show_value(false))
@@ -652,17 +674,17 @@ impl TimelineApp {
 
             ui.separator();
 
-            if ui.button("-").on_hover_text("Zoom out").clicked() {
+            if ui.button("-").on_hover_text("Verkleinern").clicked() {
                 self.doc.view.pixels_per_year =
                     (self.doc.view.pixels_per_year * 0.7).clamp(layout::MIN_PPY, layout::MAX_PPY);
                 self.mark_dirty();
             }
-            if ui.button("+").on_hover_text("Zoom in").clicked() {
+            if ui.button("+").on_hover_text("Vergrößern").clicked() {
                 self.doc.view.pixels_per_year =
                     (self.doc.view.pixels_per_year * 1.4).clamp(layout::MIN_PPY, layout::MAX_PPY);
                 self.mark_dirty();
             }
-            if ui.button("Fit").clicked() {
+            if ui.button("Einpassen").clicked() {
                 let w = ui.ctx().content_rect().width() - 600.0;
                 self.fit_to_content(w.max(400.0));
             }
@@ -683,12 +705,12 @@ impl TimelineApp {
                     self.toast = None;
                 }
             } else {
-                let saved = if self.dirty { "saving…" } else { "saved" };
+                let saved = if self.dirty { "speichert…" } else { "gespeichert" };
                 let range = match (self.last_axis, self.last_width) {
                     (Some(a), Some(w)) => {
                         let (from, to) = a.visible_range(w);
                         format!(
-                            " · showing {} – {} ({:.2} px/yr)",
+                            " · zeigt {} – {} ({:.2} px/Jahr)",
                             axis_year_label(from),
                             axis_year_label(to),
                             a.ppy
@@ -702,7 +724,7 @@ impl TimelineApp {
                     .map(|f| f.to_string_lossy().to_string())
                     .unwrap_or_else(|| self.path.display().to_string());
                 ui.weak(format!(
-                    "{} · {} timelines · {} biographies · {} events{} · {}",
+                    "{} · {} Zeitstrahlen · {} Biografien · {} Ereignisse{} · {}",
                     saved,
                     self.doc.timelines.len(),
                     self.doc.biographies.len(),
@@ -713,8 +735,8 @@ impl TimelineApp {
                 .on_hover_text(self.path.display().to_string());
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak("wheel = zoom · drag = move · double-click = add · Help for more")
-                    .on_hover_text("wheel = zoom, shift+wheel = pan, alt+wheel = scroll lanes, drag = move, double-click empty space = add an event");
+                ui.weak("Rad = Zoom · Ziehen = Verschieben · Doppelklick = Hinzufügen · Hilfe für mehr")
+                    .on_hover_text("Rad = Zoom, Umschalt+Rad = Verschieben, Alt+Rad = Spuren scrollen, Ziehen = Verschieben, Doppelklick auf leeren Bereich = Ereignis hinzufügen");
             });
         });
     }
@@ -723,51 +745,51 @@ impl TimelineApp {
         let Some(c) = &self.confirm else { return };
         let (title, body) = match c {
             Confirm::DeleteGroup(id) => (
-                "Remove group?",
+                "Gruppe entfernen?",
                 format!(
-                    "{}{}{} will be removed. The timelines and groups inside it are kept and move up a level.",
+                    "{}{}{} wird entfernt. Die enthaltenen Zeitstrahlen und Gruppen bleiben erhalten und rücken eine Ebene nach oben.",
                     "“",
                     self.doc.group(*id).map(|g| g.name.clone()).unwrap_or_default(),
                     "”"
                 ),
             ),
             Confirm::DeleteTimeline(id) => (
-                "Delete timeline?",
+                "Zeitstrahl löschen?",
                 format!(
-                    "“{}” and its {} event(s) will be removed.",
+                    "“{}” und die zugehörigen {} Ereignisse werden entfernt.",
                     self.doc.timeline(*id).map(|t| t.name.clone()).unwrap_or_default(),
                     self.doc.events_of(OwnerRef::Timeline(*id)).count()
                 ),
             ),
             Confirm::DeleteBiography(id) => (
-                "Delete biography?",
+                "Biografie löschen?",
                 format!(
-                    "“{}” and its {} event(s) will be removed.",
+                    "“{}” und die zugehörigen {} Ereignisse werden entfernt.",
                     self.doc.biography(*id).map(|b| b.name.clone()).unwrap_or_default(),
                     self.doc.events_of(OwnerRef::Biography(*id)).count()
                 ),
             ),
             Confirm::DeleteEvent(id) => (
-                "Delete event?",
+                "Ereignis löschen?",
                 format!(
-                    "“{}” will be removed.",
+                    "“{}” wird entfernt.",
                     self.doc.event(*id).map(|e| e.title.clone()).unwrap_or_default()
                 ),
             ),
             Confirm::DeleteCategory(id) => (
-                "Delete category?",
+                "Kategorie löschen?",
                 format!(
-                    "“{}” will be removed from every entry that uses it. Any subcategories are kept and move up a level.",
+                    "“{}” wird von allen Einträgen entfernt, die sie verwenden. Unterkategorien bleiben erhalten und rücken eine Ebene nach oben.",
                     self.doc.category(*id).map(|c| c.name.clone()).unwrap_or_default()
                 ),
             ),
             Confirm::NewLibrary => (
-                "Start an empty library?",
-                "Everything currently loaded will be cleared from this window.".to_string(),
+                "Leere Bibliothek starten?",
+                "Alles aktuell Geladene wird aus diesem Fenster entfernt.".to_string(),
             ),
             Confirm::Restore(_, label) => (
-                "Restore backup?",
-                format!("{label} will replace what is currently loaded."),
+                "Sicherung wiederherstellen?",
+                format!("{label} ersetzt das aktuell Geladene."),
             ),
         };
 
@@ -778,13 +800,13 @@ impl TimelineApp {
             ui.add_space(6.0);
             ui.label(body);
             ui.add_space(4.0);
-            ui.weak("This can be undone with Ctrl+Z.");
+            ui.weak("Das lässt sich mit Strg+Z rückgängig machen.");
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                if ui.button("Cancel").clicked() {
+                if ui.button("Abbrechen").clicked() {
                     decision = Some(false);
                 }
-                if ui.button("Yes, continue").clicked() {
+                if ui.button("Ja, fortfahren").clicked() {
                     decision = Some(true);
                 }
             });
@@ -806,45 +828,45 @@ impl TimelineApp {
             return;
         }
         let mut open = true;
-        egui::Window::new("How to use Timeline Explorer")
+        egui::Window::new("So funktioniert Timeline Explorer")
             .open(&mut open)
             .collapsible(false)
             .default_width(520.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.heading("Moving around");
-                    ui.label("• Mouse wheel zooms in and out around the pointer.");
-                    ui.label("• Shift + wheel, or dragging, pans along the time axis.");
-                    ui.label("• Alt + wheel scrolls through the lanes when you have many.");
-                    ui.label("• Home, or the Fit button, frames your whole dataset.");
+                    ui.heading("Navigation");
+                    ui.label("• Mausrad zoomt um den Zeiger herum.");
+                    ui.label("• Umschalt + Rad, oder Ziehen, verschiebt entlang der Zeitachse.");
+                    ui.label("• Alt + Rad scrollt durch die Spuren, wenn es viele gibt.");
+                    ui.label("• Pos1, oder der Einpassen-Knopf, zeigt den gesamten Datenbestand.");
                     ui.add_space(8.0);
 
-                    ui.heading("Adding data");
-                    ui.label("• Double-click an empty spot on a lane to add an event at that date.");
-                    ui.label("• Ctrl+N adds an event; the + buttons add timelines and biographies.");
-                    ui.label("• Select something and press E to edit it, Delete to remove it.");
+                    ui.heading("Daten hinzufügen");
+                    ui.label("• Doppelklick auf eine leere Stelle einer Spur fügt dort ein Ereignis hinzu.");
+                    ui.label("• Strg+N fügt ein Ereignis hinzu; die +-Knöpfe fügen Zeitstrahlen und Biografien hinzu.");
+                    ui.label("• Etwas auswählen und E zum Bearbeiten drücken, Entf zum Entfernen.");
                     ui.add_space(8.0);
 
-                    ui.heading("Dates");
-                    ui.label("Type dates however you like: 44 BC, -44, c. 250 BC, 1789, 14 Jul 1789, 1789-07-14. Add ±20 for uncertainty. The form shows how it read your entry.");
+                    ui.heading("Datumsangaben");
+                    ui.label("Datum nach Belieben eingeben: 44 v. Chr., -44, um 250 v. Chr., 1789, 14.07.1789, 1789-07-14. Für Unsicherheit ±20 anhängen. Das Formular zeigt, wie die Eingabe verstanden wurde.");
                     ui.add_space(8.0);
 
-                    ui.heading("Zoom and importance");
-                    ui.label("Each entry has an importance from Detail to Epochal. Zoomed out you only see the big things; zooming in reveals the rest. The Detail slider shifts that balance either way.");
+                    ui.heading("Zoom und Bedeutung");
+                    ui.label("Jeder Eintrag hat eine Bedeutung von Detail bis Epochal. Herausgezoomt sieht man nur die großen Linien; Hineinzoomen zeigt den Rest. Der Detailgrad-Regler verschiebt diese Balance in beide Richtungen.");
                     ui.add_space(8.0);
 
-                    ui.heading("Groups");
-                    ui.label("Use + Group for a super-category such as \"European history\" or \"Greek antiquity\", then put timelines inside it from their editor. Groups nest, so \"Greek antiquity > Classical poleis > Athens\" works.");
-                    ui.label("Collapse a group in the sidebar and it becomes a single band standing for everything inside it — useful for comparing whole civilisations. Expand it again to work with Sparta and Athens separately.");
+                    ui.heading("Gruppen");
+                    ui.label("Mit + Gruppe eine Oberkategorie wie \"Europäische Geschichte\" oder \"Griechische Antike\" anlegen, dann Zeitstrahlen über deren Editor hineinlegen. Gruppen lassen sich verschachteln, \"Griechische Antike > Klassische Polis > Athen\" funktioniert also.");
+                    ui.label("Eine Gruppe in der Seitenleiste einklappen lässt sie zu einem einzigen Band werden, das für alles darin steht — nützlich, um ganze Kulturen zu vergleichen. Wieder ausklappen, um Sparta und Athen wieder einzeln zu bearbeiten.");
                     ui.add_space(8.0);
 
-                    ui.heading("Converging timelines");
-                    ui.label("In a timeline's editor set “Merges into” to another timeline and give the date — its band will curve into that timeline's lane and end there. “Splits from” does the reverse for successor states.");
+                    ui.heading("Zusammenlaufende Zeitstrahlen");
+                    ui.label("Im Editor eines Zeitstrahls “Geht auf in einem anderen Zeitstrahl” aktivieren und das Datum angeben — das Band biegt dann in dessen Spur ein und endet dort. “Spaltet sich ab von einem anderen Zeitstrahl” macht das Gegenteil für Nachfolgestaaten.");
                     ui.add_space(8.0);
 
-                    ui.heading("Your data");
-                    ui.label(format!("Everything is stored as readable JSON at {}", self.path.display()));
-                    ui.label("It saves itself about a second after each change, keeps ten rotating backups, and never needs an internet connection.");
+                    ui.heading("Deine Daten");
+                    ui.label(format!("Alles wird als lesbares JSON gespeichert unter {}", self.path.display()));
+                    ui.label("Sie speichert sich automatisch etwa eine Sekunde nach jeder Änderung, hält zehn rotierende Sicherungen vor und braucht nie eine Internetverbindung.");
                 });
             });
         self.show_help = open;

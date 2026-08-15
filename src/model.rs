@@ -43,9 +43,9 @@ impl DateQualifier {
     pub fn prefix(self) -> &'static str {
         match self {
             Self::Exact => "",
-            Self::Circa => "c. ",
-            Self::Before => "before ",
-            Self::After => "after ",
+            Self::Circa => "um ",
+            Self::Before => "vor ",
+            Self::After => "nach ",
         }
     }
 
@@ -142,7 +142,10 @@ impl HDate {
     /// Parse the free-text date entry used by the quick-add forms.
     ///
     /// Accepts `-44`, `44 BC`, `44 v. Chr.`, `c. 250 BC`, `1789`, `1789-07-14`,
-    /// `Jul 1789`, `14 Jul 1789`, any of them with a trailing `±20`.
+    /// `14.07.1789`, `07.1789`, `Jul 1789`, `14 Jul 1789`, any of them with a
+    /// trailing `±20`. `14.07.1789` and `1789-07-14` are the same date read in
+    /// European (day.month.year) vs. ISO (year-month-day) order — both stay
+    /// unambiguous because they use different separators.
     pub fn parse(input: &str) -> Option<Self> {
         let mut s = input.trim().to_lowercase();
         if s.is_empty() {
@@ -262,7 +265,7 @@ fn normalise_year(year: i32) -> i32 {
 
 pub fn year_label(year: i32) -> String {
     if year < 0 {
-        format!("{} BC", -year)
+        format!("{} v. Chr.", -year)
     } else {
         format!("{year}")
     }
@@ -274,12 +277,12 @@ pub fn axis_year_label(decimal: f64) -> String {
     if f >= 0.0 {
         format!("{}", f as i64 + 1)
     } else {
-        format!("{} BC", -(f as i64))
+        format!("{} v. Chr.", -(f as i64))
     }
 }
 
 const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    "Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez",
 ];
 
 pub fn month_name(m: u8) -> &'static str {
@@ -336,6 +339,24 @@ fn parse_ymd(s: &str) -> Option<(i32, Option<u8>, Option<u8>)> {
             let month: u8 = parts[1].parse().ok()?;
             let day = parts.get(2).and_then(|p| p.parse::<u8>().ok());
             return Some((year, Some(month.clamp(1, 12)), day.map(|d| d.clamp(1, 31))));
+        }
+    }
+
+    // European day.month.year: 14.07.1789 / 07.1789 (day/month omitted from
+    // the right, same "trim from the end" rule as the ISO form above).
+    if body.contains('.') {
+        let parts: Vec<&str> = body.split('.').filter(|p| !p.is_empty()).collect();
+        if parts.len() >= 2 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())) {
+            let last = parts.len() - 1;
+            let year: i32 = parts[last].parse().ok()?;
+            let year = if negative { -year } else { year };
+            if parts.len() == 2 {
+                let month: u8 = parts[0].parse().ok()?;
+                return Some((year, Some(month.clamp(1, 12)), None));
+            }
+            let day: u8 = parts[0].parse().ok()?;
+            let month: u8 = parts[1].parse().ok()?;
+            return Some((year, Some(month.clamp(1, 12)), Some(day.clamp(1, 31))));
         }
     }
 
@@ -443,9 +464,9 @@ pub const IMPORTANCE_MAX: u8 = 5;
 pub fn importance_name(level: u8) -> &'static str {
     match level.clamp(IMPORTANCE_MIN, IMPORTANCE_MAX) {
         5 => "Epochal",
-        4 => "Major",
-        3 => "Notable",
-        2 => "Minor",
+        4 => "Bedeutend",
+        3 => "Nennenswert",
+        2 => "Gering",
         _ => "Detail",
     }
 }
@@ -591,9 +612,9 @@ pub enum BioDisplay {
 impl BioDisplay {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Hidden => "Hidden",
-            Self::Inline => "Inline",
-            Self::Lane => "Own lane",
+            Self::Hidden => "Ausgeblendet",
+            Self::Inline => "Eingebettet",
+            Self::Lane => "Eigene Spur",
         }
     }
 }
@@ -637,7 +658,7 @@ impl Biography {
     pub fn life_label(&self) -> String {
         match self.death {
             Some(d) => format!("{} – {}", self.birth.label(), d.label()),
-            None => format!("b. {}", self.birth.label()),
+            None => format!("geb. {}", self.birth.label()),
         }
     }
 }
@@ -691,9 +712,9 @@ impl FilterMode {
 
     pub fn name(self) -> &'static str {
         match self {
-            Self::Off => "Off",
-            Self::Include => "Show only",
-            Self::Exclude => "Hide",
+            Self::Off => "Aus",
+            Self::Include => "Nur anzeigen",
+            Self::Exclude => "Ausblenden",
         }
     }
 }
@@ -788,16 +809,16 @@ impl Default for Document {
 /// Starting categories. The user can rename, recolour, delete and add to these
 /// freely; nothing in the code depends on a particular set existing.
 pub const STARTER_CATEGORIES: [(&str, Rgb); 10] = [
-    ("Military", [201, 88, 79]),
-    ("Politics", [92, 138, 201]),
+    ("Militär", [201, 88, 79]),
+    ("Politik", [92, 138, 201]),
     ("Religion", [163, 122, 196]),
-    ("Philosophy", [90, 170, 160]),
-    ("Literature", [214, 158, 74]),
-    ("Science", [98, 178, 108]),
-    ("Art", [212, 122, 168]),
-    ("Economy", [150, 150, 110]),
-    ("Law", [120, 140, 175]),
-    ("Personal", [160, 160, 170]),
+    ("Philosophie", [90, 170, 160]),
+    ("Literatur", [214, 158, 74]),
+    ("Wissenschaft", [98, 178, 108]),
+    ("Kunst", [212, 122, 168]),
+    ("Wirtschaft", [150, 150, 110]),
+    ("Recht", [120, 140, 175]),
+    ("Privat", [160, 160, 170]),
 ];
 
 /// Distinct band colours, cycled when the user adds timelines.
@@ -1033,11 +1054,25 @@ impl Document {
         names.join(", ")
     }
 
-    /// Colour a biography is drawn in: its own, else its culture's, else grey.
+    /// Fill and border colour for a biography's own band.
+    ///
+    /// Fill: an explicit per-biography colour override if set, else its
+    /// first assigned category's colour, else its culture's colour, else
+    /// grey. Border: its culture's colour, if it has one — so a fill driven
+    /// by category still keeps the culture visible, e.g. "Literature" filled
+    /// yellow with a blue Greek-antiquity border, rather than one identity
+    /// hiding the other.
+    pub fn bio_colors(&self, bio: &Biography) -> (Rgb, Option<Rgb>) {
+        let culture = bio.timeline.and_then(|t| self.timeline(t)).map(|t| t.color);
+        let category = bio.categories.first().and_then(|c| self.category(*c)).map(|c| c.color);
+        let fill = bio.color.or(category).or(culture).unwrap_or([170, 170, 180]);
+        (fill, culture)
+    }
+
+    /// Colour a biography is drawn in, ignoring the border — see
+    /// [`Self::bio_colors`].
     pub fn bio_color(&self, bio: &Biography) -> Rgb {
-        bio.color
-            .or_else(|| bio.timeline.and_then(|t| self.timeline(t)).map(|t| t.color))
-            .unwrap_or([170, 170, 180])
+        self.bio_colors(bio).0
     }
 
     pub fn owner_name(&self, owner: OwnerRef) -> String {
@@ -1045,11 +1080,11 @@ impl Document {
             OwnerRef::Timeline(id) => self
                 .timeline(id)
                 .map(|t| t.name.clone())
-                .unwrap_or_else(|| "(deleted timeline)".into()),
+                .unwrap_or_else(|| "(gelöschter Zeitstrahl)".into()),
             OwnerRef::Biography(id) => self
                 .biography(id)
                 .map(|b| b.name.clone())
-                .unwrap_or_else(|| "(deleted biography)".into()),
+                .unwrap_or_else(|| "(gelöschte Biografie)".into()),
         }
     }
 
@@ -1211,10 +1246,10 @@ mod tests {
 
     #[test]
     fn axis_labels_round_trip_through_the_boundary() {
-        assert_eq!(axis_year_label(HDate::year(-44).decimal()), "44 BC");
+        assert_eq!(axis_year_label(HDate::year(-44).decimal()), "44 v. Chr.");
         assert_eq!(axis_year_label(HDate::year(1).decimal()), "1");
         assert_eq!(axis_year_label(HDate::year(1789).decimal()), "1789");
-        assert_eq!(axis_year_label(HDate::year(-1).decimal()), "1 BC");
+        assert_eq!(axis_year_label(HDate::year(-1).decimal()), "1 v. Chr.");
     }
 
     #[test]
@@ -1259,6 +1294,33 @@ mod tests {
         assert_eq!(d.year, -1200);
         assert_eq!(d.plus_minus, 50);
         assert_eq!(d.qualifier, DateQualifier::Circa);
+    }
+
+    #[test]
+    fn parses_european_day_month_year_dates() {
+        // "14.07.1789" and "1789-07-14" are the same date, day.month.year vs.
+        // year-month-day — both must parse to the same result.
+        assert_eq!(HDate::parse("14.07.1789"), HDate::parse("1789-07-14"));
+        // Month and year only, no day — the European equivalent of "1789-07".
+        assert_eq!(
+            HDate::parse("07.1789"),
+            Some(HDate {
+                month: Some(7),
+                day: None,
+                ..HDate::year(1789)
+            })
+        );
+        // A single-digit day/month must not require zero-padding.
+        assert_eq!(
+            HDate::parse("3.7.1789"),
+            Some(HDate {
+                month: Some(7),
+                day: Some(3),
+                ..HDate::year(1789)
+            })
+        );
+        // Year only (no dot at all) is unaffected by any of this.
+        assert_eq!(HDate::parse("1789"), Some(HDate::year(1789)));
     }
 
     #[test]
@@ -1520,6 +1582,67 @@ mod tests {
         // for "Domestic politics" must not appear ticked just because its
         // parent's is.
         assert!(!doc.view.filters.selected.contains(&domestic));
+    }
+
+    // --- Biography colours ----------------------------------------------------
+
+    fn make_bio(timeline: Option<Id>, color: Option<Rgb>, categories: Vec<Id>) -> Biography {
+        Biography {
+            id: Id(999),
+            name: "Test".into(),
+            timeline,
+            birth: HDate::year(-400),
+            death: None,
+            color,
+            categories,
+            importance: 3,
+            display: BioDisplay::Lane,
+            notes: String::new(),
+        }
+    }
+
+    #[test]
+    fn bio_fill_falls_back_from_own_colour_to_category_to_culture_to_grey() {
+        let mut doc = Document::default();
+        let culture = doc.new_id();
+        doc.timelines.push(Timeline {
+            id: culture,
+            name: "Greek antiquity".into(),
+            color: [50, 100, 200],
+            visible: true,
+            group: None,
+            order: 0,
+            span: None,
+            origin: None,
+            merge: None,
+            notes: String::new(),
+            epochs: Vec::new(),
+        });
+        let literature = doc.new_id();
+        doc.categories.push(Category {
+            id: literature,
+            name: "Literature".into(),
+            color: [220, 200, 50],
+            parent: None,
+        });
+
+        // Nothing set at all: grey, no border.
+        let bare = make_bio(None, None, vec![]);
+        assert_eq!(doc.bio_colors(&bare), ([170, 170, 180], None));
+
+        // Culture only: fill and border both the culture's colour.
+        let cultured = make_bio(Some(culture), None, vec![]);
+        assert_eq!(doc.bio_colors(&cultured), ([50, 100, 200], Some([50, 100, 200])));
+
+        // Category and culture: fill is the category's colour, border stays
+        // the culture's — this is the "Literature filled yellow with a blue
+        // Greek-antiquity border" case.
+        let both = make_bio(Some(culture), None, vec![literature]);
+        assert_eq!(doc.bio_colors(&both), ([220, 200, 50], Some([50, 100, 200])));
+
+        // An explicit override always wins over category and culture alike.
+        let overridden = make_bio(Some(culture), Some([9, 9, 9]), vec![literature]);
+        assert_eq!(doc.bio_colors(&overridden), ([9, 9, 9], Some([50, 100, 200])));
     }
 
     #[test]

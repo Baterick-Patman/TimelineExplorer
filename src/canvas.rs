@@ -78,7 +78,7 @@ pub fn draw(app: &mut TimelineApp, ui: &mut egui::Ui) {
             }
             LaneKind::Biography(id) => {
                 if let Some(bio) = app.doc.biography(id) {
-                    paint_biography_band(&clip, bio, lane, &axis, &theme, app.selection);
+                    paint_biography_band(&clip, &app.doc, bio, lane, &axis, &theme, app.selection);
                 }
             }
             LaneKind::Group(id) => {
@@ -303,9 +303,9 @@ fn paint_lane_stripes(p: &egui::Painter, lanes: &[Lane], rect: Rect, theme: &The
 
 fn paint_empty_state(p: &egui::Painter, rect: Rect, theme: &Theme, doc_empty: bool) {
     let msg = if doc_empty {
-        "No timelines yet.\nUse “Add timeline” in the sidebar, or load the example library."
+        "Noch keine Zeitstrahlen.\nMit “+ Zeitstrahl” eine anlegen, oder die Beispielbibliothek laden."
     } else {
-        "Nothing visible.\nEverything is either hidden or filtered out."
+        "Nichts sichtbar.\nAlles ist entweder ausgeblendet oder herausgefiltert."
     };
     p.text(
         rect.center(),
@@ -530,6 +530,7 @@ fn epoch_segment_label(
 
 fn paint_biography_band(
     p: &egui::Painter,
+    doc: &Document,
     bio: &Biography,
     lane: &Lane,
     axis: &TimeAxis,
@@ -539,7 +540,8 @@ fn paint_biography_band(
     let span = bio.span();
     let x0 = axis.x(span.t0());
     let x1 = axis.x(span.t1());
-    let color = to_color(lane.color);
+    let (fill, border) = doc.bio_colors(bio);
+    let color = to_color(fill);
     let h = lane.thickness;
     let r = Rect::from_min_max(
         Pos2::new(x0, lane.center - h * 0.5),
@@ -553,7 +555,19 @@ fn paint_biography_band(
             with_alpha(theme.selection, 90),
         );
     }
-    p.rect_filled(r, CornerRadius::same((h * 0.5) as u8), with_alpha(color, 210));
+    let corner = CornerRadius::same((h * 0.5) as u8);
+    p.rect_filled(r, corner, with_alpha(color, 210));
+    // The culture's own colour as a border, so a fill driven by category
+    // (see `Document::bio_colors`) does not hide which culture this person
+    // belongs to.
+    if let Some(border) = border {
+        p.rect_stroke(
+            r,
+            corner,
+            Stroke::new(1.5, with_alpha(to_color(border), 235)),
+            StrokeKind::Inside,
+        );
+    }
 
     // An open-ended life (no death date) fades out rather than stopping hard.
     if bio.death.is_none() {
