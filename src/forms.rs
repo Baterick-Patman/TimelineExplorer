@@ -102,26 +102,50 @@ fn category_picker(ui: &mut egui::Ui, doc: &Document, selected: &mut BTreeSet<Id
         .max_height(110.0)
         .id_salt("cats")
         .show(ui, |ui| {
-            for c in &doc.categories {
-                let mut on = selected.contains(&c.id);
-                ui.horizontal(|ui| {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::Vec2::new(10.0, 10.0), egui::Sense::hover());
-                    ui.painter().rect_filled(
-                        rect,
-                        egui::CornerRadius::same(2),
-                        crate::theme::to_color(c.color),
-                    );
-                    if ui.checkbox(&mut on, &c.name).changed() {
-                        if on {
-                            selected.insert(c.id);
-                        } else {
-                            selected.remove(&c.id);
-                        }
-                    }
-                });
+            let mut guard = 0usize;
+            category_picker_rows(ui, doc, None, 0, &mut guard, selected);
+        });
+}
+
+/// Indented so subcategories read as nested under their parent, same tree
+/// order as the category editor. Ticking a subcategory here tags the entry
+/// with exactly that subcategory; the filter-side cascade (a parent's filter
+/// covering its children) does not apply to tagging, only to visibility.
+fn category_picker_rows(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    parent: Option<Id>,
+    depth: usize,
+    guard: &mut usize,
+    selected: &mut BTreeSet<Id>,
+) {
+    *guard += 1;
+    if *guard > 512 || depth > 12 {
+        return;
+    }
+    let indent = depth as f32 * 14.0;
+
+    for c in doc.child_categories(parent) {
+        let mut on = selected.contains(&c.id);
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            let (rect, _) =
+                ui.allocate_exact_size(egui::Vec2::new(10.0, 10.0), egui::Sense::hover());
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::same(2),
+                crate::theme::to_color(c.color),
+            );
+            if ui.checkbox(&mut on, &c.name).changed() {
+                if on {
+                    selected.insert(c.id);
+                } else {
+                    selected.remove(&c.id);
+                }
             }
         });
+        category_picker_rows(ui, doc, Some(c.id), depth + 1, guard, selected);
+    }
 }
 
 fn owner_picker(ui: &mut egui::Ui, doc: &Document, owner: &mut OwnerRef) {
@@ -1187,6 +1211,96 @@ fn biography_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Biogr
 pub struct CategoryEditor {
     pub new_name: String,
     pub new_color: Option<Rgb>,
+    pub new_parent: Option<Id>,
+}
+
+/// Choose a parent category, excluding any choice that would create a cycle.
+/// Mirrors `group_combo` for [`GroupForm`].
+fn category_combo(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    id_salt: &str,
+    value: &mut Option<Id>,
+    moving: Option<Id>,
+) {
+    let text = value
+        .and_then(|id| doc.category(id))
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| "— none (top level) —".into());
+    egui::ComboBox::from_id_salt(id_salt)
+        .selected_text(text)
+        .width(170.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, "— none (top level) —");
+            for c in &doc.categories {
+                // Never offer a move that would make a category its own ancestor.
+                if let Some(m) = moving {
+                    if c.id == m || doc.would_cycle_category(m, Some(c.id)) {
+                        continue;
+                    }
+                }
+                ui.selectable_value(value, Some(c.id), &c.name);
+            }
+        });
+}
+
+enum CatAction {
+    Rename(Id, String),
+    Recolour(Id, Rgb),
+    Reparent(Id, Option<Id>),
+    Remove(Id),
+}
+
+/// One level of the category tree, then recurse — same shape as
+/// `panels::group_tree`, but every category is always shown (there is no
+/// collapse state to speak of for a tag list).
+#[allow(clippy::too_many_arguments)]
+fn category_editor_tree(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    parent: Option<Id>,
+    depth: usize,
+    guard: &mut usize,
+    actions: &mut Vec<CatAction>,
+) {
+    *guard += 1;
+    if *guard > 512 || depth > 12 {
+        return;
+    }
+    let indent = depth as f32 * 14.0;
+
+    for c in doc.child_categories(parent) {
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            let mut col = c.color;
+            if ui.color_edit_button_srgb(&mut col).changed() {
+                actions.push(CatAction::Recolour(c.id, col));
+            }
+            let mut name = c.name.clone();
+            if ui
+                .add(egui::TextEdit::singleline(&mut name).desired_width((210.0 - indent).max(80.0)))
+                .changed()
+            {
+                actions.push(CatAction::Rename(c.id, name));
+            }
+            let uses = doc.events.iter().filter(|e| e.categories.contains(&c.id)).count()
+                + doc.biographies.iter().filter(|b| b.categories.contains(&c.id)).count();
+            ui.weak(format!("{uses}"));
+            if ui.button("Delete").on_hover_text("Delete category").clicked() {
+                actions.push(CatAction::Remove(c.id));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(indent + 22.0);
+            ui.weak("in:");
+            let mut parent_val = c.parent;
+            category_combo(ui, doc, &format!("cat_parent_{}", c.id.0), &mut parent_val, Some(c.id));
+            if parent_val != c.parent {
+                actions.push(CatAction::Reparent(c.id, parent_val));
+            }
+        });
+        category_editor_tree(ui, doc, Some(c.id), depth + 1, guard, actions);
+    }
 }
 
 fn category_dialog(app: &mut TimelineApp, ctx: &egui::Context, ed: &mut CategoryEditor) -> bool {
@@ -1197,67 +1311,48 @@ fn category_dialog(app: &mut TimelineApp, ctx: &egui::Context, ed: &mut Category
     let _ = color;
 
     egui::Modal::new(egui::Id::new("cat_dialog")).show(ctx, |ui| {
-        ui.set_width(400.0);
+        ui.set_width(460.0);
         ui.heading("Categories");
-        ui.weak("Rename, recolour, add or remove freely — nothing depends on a fixed list.");
+        ui.weak("Rename, recolour, nest, add or remove freely — nothing depends on a fixed list.");
+        ui.weak("\"Inside:\" nests one category under another; ticking a parent in the sidebar filter also covers its subcategories.");
         ui.add_space(8.0);
 
-        let mut rename: Option<(Id, String)> = None;
-        let mut recolour: Option<(Id, Rgb)> = None;
-        let mut remove: Option<Id> = None;
-
+        let mut actions: Vec<CatAction> = Vec::new();
         egui::ScrollArea::vertical()
-            .max_height(280.0)
+            .max_height(300.0)
             .show(ui, |ui| {
-                for c in &app.doc.categories {
-                    ui.horizontal(|ui| {
-                        let mut col = c.color;
-                        if ui.color_edit_button_srgb(&mut col).changed() {
-                            recolour = Some((c.id, col));
-                        }
-                        let mut name = c.name.clone();
-                        if ui
-                            .add(egui::TextEdit::singleline(&mut name).desired_width(230.0))
-                            .changed()
-                        {
-                            rename = Some((c.id, name));
-                        }
-                        let uses = app
-                            .doc
-                            .events
-                            .iter()
-                            .filter(|e| e.categories.contains(&c.id))
-                            .count()
-                            + app
-                                .doc
-                                .biographies
-                                .iter()
-                                .filter(|b| b.categories.contains(&c.id))
-                                .count();
-                        ui.weak(format!("{uses}"));
-                        if ui.button("Delete").on_hover_text("Delete category").clicked() {
-                            remove = Some(c.id);
+                let mut guard = 0usize;
+                category_editor_tree(ui, &app.doc, None, 0, &mut guard, &mut actions);
+            });
+
+        for action in actions {
+            match action {
+                CatAction::Rename(id, name) => app.mutate(|doc| {
+                    if let Some(c) = doc.category_mut(id) {
+                        c.name = name;
+                    }
+                }),
+                CatAction::Recolour(id, col) => app.mutate(|doc| {
+                    if let Some(c) = doc.category_mut(id) {
+                        c.color = col;
+                    }
+                }),
+                CatAction::Reparent(id, parent) => {
+                    // Guard again at apply time: the tree may have changed
+                    // while the combo was open.
+                    let safe_parent = if app.doc.would_cycle_category(id, parent) {
+                        None
+                    } else {
+                        parent
+                    };
+                    app.mutate(|doc| {
+                        if let Some(c) = doc.category_mut(id) {
+                            c.parent = safe_parent;
                         }
                     });
                 }
-            });
-
-        if let Some((id, name)) = rename {
-            app.mutate(|doc| {
-                if let Some(c) = doc.categories.iter_mut().find(|c| c.id == id) {
-                    c.name = name;
-                }
-            });
-        }
-        if let Some((id, col)) = recolour {
-            app.mutate(|doc| {
-                if let Some(c) = doc.categories.iter_mut().find(|c| c.id == id) {
-                    c.color = col;
-                }
-            });
-        }
-        if let Some(id) = remove {
-            app.confirm = Some(Confirm::DeleteCategory(id));
+                CatAction::Remove(id) => app.confirm = Some(Confirm::DeleteCategory(id)),
+            }
         }
 
         ui.add_space(10.0);
@@ -1268,19 +1363,23 @@ fn category_dialog(app: &mut TimelineApp, ctx: &egui::Context, ed: &mut Category
             ui.color_edit_button_srgb(col);
             ui.add(
                 egui::TextEdit::singleline(&mut ed.new_name)
-                    .desired_width(200.0)
+                    .desired_width(170.0)
                     .hint_text("new category name"),
             );
+            ui.weak("in:");
+            category_combo(ui, &app.doc, "cat_new_parent", &mut ed.new_parent, None);
             let ok = !ed.new_name.trim().is_empty();
             if ui.add_enabled(ok, egui::Button::new("Add")).clicked() {
                 let name = ed.new_name.trim().to_string();
                 let color = *col;
+                let parent = ed.new_parent;
                 app.mutate(|doc| {
                     let id = doc.new_id();
-                    doc.categories.push(Category { id, name, color });
+                    doc.categories.push(Category { id, name, color, parent });
                 });
                 ed.new_name.clear();
                 ed.new_color = None;
+                ed.new_parent = None;
             }
         });
 

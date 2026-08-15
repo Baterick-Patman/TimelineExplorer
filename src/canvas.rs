@@ -42,7 +42,10 @@ pub fn draw(app: &mut TimelineApp, ui: &mut egui::Ui) {
     );
     let content_top = content_rect.top() + 10.0;
 
-    let filters = app.doc.view.filters.clone();
+    // Expanded so ticking a parent category also covers its subcategories —
+    // the sidebar checkboxes themselves still reflect the raw, un-expanded
+    // selection.
+    let filters = app.doc.effective_filters();
     // Two passes: plan the lanes, measure how many label rows each one really
     // needs at this zoom, then place them so dense stretches get the room they
     // need instead of silently dropping labels.
@@ -86,7 +89,8 @@ pub fn draw(app: &mut TimelineApp, ui: &mut egui::Ui) {
 
     for lane in &lanes {
         paint_lane_events(
-            &clip, app, lane, &centers, &axis, content_rect, &theme, view_from, view_to, &mut hits,
+            &clip, app, lane, &centers, &axis, content_rect, &theme, &filters, view_from, view_to,
+            &mut hits,
         );
     }
 
@@ -402,10 +406,8 @@ fn paint_timeline_band(
     // follows the curve through a merge/origin transition.
     if !tl.epochs.is_empty() {
         if let Some((from, to)) = band_visible_range(doc, tl, view_from, view_to) {
-            for (seg_from, seg_to, seg_color) in band_color_segments(tl, from, to) {
-                if seg_color == tl.color {
-                    continue;
-                }
+            for (seg_from, seg_to, seg_color, name) in band_color_segments(tl, from, to) {
+                let Some(name) = name else { continue };
                 let seg_pts = band_curve(tl, lane.center, centers, axis, seg_from, seg_to);
                 if seg_pts.len() < 2 {
                     continue;
@@ -415,6 +417,9 @@ fn paint_timeline_band(
                     seg_points,
                     Stroke::new(lane.thickness, with_alpha(to_color(seg_color), 235)),
                 ));
+                epoch_segment_label(
+                    p, tl, lane.center, centers, axis, seg_from, seg_to, name, theme,
+                );
             }
         }
     }
@@ -469,6 +474,58 @@ fn junction_label(p: &egui::Painter, label: &str, x: f32, y: f32, theme: &Theme)
         with_alpha(theme.canvas_bg, 200),
     );
     p.galley(pos, galley, theme.text_dim);
+}
+
+/// An epoch's name, sat directly on its band segment rather than in the
+/// label rows above — that placement is the point: colour alone told
+/// "Archaic" from "Classical" apart, this gives it a name too, and keeping it
+/// *inside* the ribbon (own pill, own row) reads as clearly distinct from
+/// event titles, which always live above the band.
+///
+/// `seg_from`/`seg_to` are already clipped to the visible window, so
+/// centring on their midpoint keeps the label on screen while a long era is
+/// scrolled through rather than pinning it to a point that may be off screen.
+#[allow(clippy::too_many_arguments)]
+fn epoch_segment_label(
+    p: &egui::Painter,
+    tl: &Timeline,
+    own_center: f32,
+    centers: &std::collections::HashMap<Id, f32>,
+    axis: &TimeAxis,
+    seg_from: f64,
+    seg_to: f64,
+    name: &str,
+    theme: &Theme,
+) {
+    if name.trim().is_empty() {
+        return;
+    }
+    let mid = (seg_from + seg_to) * 0.5;
+    let center = Pos2::new(
+        axis.x(mid),
+        band_center_at(tl, own_center, centers, mid, axis.ppy),
+    );
+    let seg_px = (axis.x(seg_to) - axis.x(seg_from)).abs();
+
+    let font = FontId::proportional(10.5);
+    let size = p
+        .layout_no_wrap(name.to_owned(), font.clone(), theme.text)
+        .size();
+    // A segment too narrow for its own name just keeps the colour coding —
+    // better than crowding it with a clipped or overlapping label.
+    if size.x + 12.0 > seg_px {
+        return;
+    }
+
+    let pill = Rect::from_center_size(center, size + Vec2::new(10.0, 4.0));
+    p.rect_filled(pill, CornerRadius::same(3), with_alpha(theme.canvas_bg, 220));
+    p.rect_stroke(
+        pill,
+        CornerRadius::same(3),
+        Stroke::new(1.0, with_alpha(theme.text_dim, 100)),
+        StrokeKind::Outside,
+    );
+    p.text(center, Align2::CENTER_CENTER, name, font, theme.text);
 }
 
 fn paint_biography_band(
@@ -623,6 +680,7 @@ fn paint_lane_events(
     axis: &TimeAxis,
     content_rect: Rect,
     theme: &Theme,
+    filters: &Filters,
     view_from: f64,
     view_to: f64,
     hits: &mut Vec<Hit>,
@@ -639,7 +697,6 @@ fn paint_lane_events(
     }
 
     let doc = &app.doc;
-    let filters = &doc.view.filters;
 
     let mut events: Vec<&Event> = visible_events(doc, lane.kind, filters, axis, view_from, view_to);
     // Most important first, so the scarce label rows go to what matters.

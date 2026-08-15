@@ -681,6 +681,10 @@ pub fn band_polyline(
 /// Coloured sub-ranges to paint along a band within `[from, to]`: the
 /// timeline's own epochs, with every gap between/around them filled by its
 /// base colour so the whole range is always covered by exactly one colour.
+/// The fourth element is the epoch's name, `None` for a base-colour gap —
+/// callers use this (rather than comparing colours) to tell an epoch segment
+/// from a gap, since an epoch could coincidentally be given the timeline's
+/// own colour.
 ///
 /// Epochs need not be sorted or disjoint on input. Where two overlap, the
 /// later-starting one wins: an earlier epoch's painted end is capped at the
@@ -688,7 +692,7 @@ pub fn band_polyline(
 /// the common case — entering each era's start date and a rough, possibly
 /// stale end date — behave the way it reads: "Classical starts in 500 BC"
 /// unambiguously ends the Archaic era there too.
-pub fn band_color_segments(tl: &Timeline, from: f64, to: f64) -> Vec<(f64, f64, Rgb)> {
+pub fn band_color_segments(tl: &Timeline, from: f64, to: f64) -> Vec<(f64, f64, Rgb, Option<&str>)> {
     if to <= from {
         return Vec::new();
     }
@@ -707,13 +711,13 @@ pub fn band_color_segments(tl: &Timeline, from: f64, to: f64) -> Vec<(f64, f64, 
             continue; // Outside the range, or fully swallowed by a neighbour.
         }
         if e0 > cursor {
-            segments.push((cursor, e0, tl.color));
+            segments.push((cursor, e0, tl.color, None));
         }
-        segments.push((e0, e1, e.color));
+        segments.push((e0, e1, e.color, Some(e.name.as_str())));
         cursor = e1;
     }
     if cursor < to {
-        segments.push((cursor, to, tl.color));
+        segments.push((cursor, to, tl.color, None));
     }
     segments
 }
@@ -1166,7 +1170,7 @@ mod tests {
     fn no_epochs_means_one_segment_in_the_base_colour() {
         let tl = timeline_with_epochs(vec![]);
         let segs = band_color_segments(&tl, -800.0, -300.0);
-        assert_eq!(segs, vec![(-800.0, -300.0, tl.color)]);
+        assert_eq!(segs, vec![(-800.0, -300.0, tl.color, None)]);
     }
 
     #[test]
@@ -1182,9 +1186,9 @@ mod tests {
         assert_eq!(
             segs,
             vec![
-                (-800.0, -500.0, [1, 1, 1]),
-                (-500.0, -322.0, [2, 2, 2]),
-                (-322.0, -300.0, tl.color),
+                (-800.0, -500.0, [1, 1, 1], Some("Archaic")),
+                (-500.0, -322.0, [2, 2, 2], Some("Classical")),
+                (-322.0, -300.0, tl.color, None),
             ]
         );
     }
@@ -1193,7 +1197,7 @@ mod tests {
     fn an_epoch_outside_the_range_is_dropped_entirely() {
         let tl = timeline_with_epochs(vec![epoch("Bronze age", [1, 1, 1], -2000, -1200)]);
         let segs = band_color_segments(&tl, -800.0, -300.0);
-        assert_eq!(segs, vec![(-800.0, -300.0, tl.color)]);
+        assert_eq!(segs, vec![(-800.0, -300.0, tl.color, None)]);
     }
 
     #[test]
@@ -1209,9 +1213,9 @@ mod tests {
         assert_eq!(
             segs,
             vec![
-                (-800.0, -500.0, [1, 1, 1]),
-                (-500.0, -322.0, [2, 2, 2]),
-                (-322.0, -300.0, tl.color),
+                (-800.0, -500.0, [1, 1, 1], Some("Archaic")),
+                (-500.0, -322.0, [2, 2, 2], Some("Classical")),
+                (-322.0, -300.0, tl.color, None),
             ]
         );
     }
@@ -1393,6 +1397,7 @@ mod tests {
             id: cat,
             name: "Writers".into(),
             color: [0, 0, 0],
+            parent: None,
         });
         doc.biographies[0].categories = vec![cat];
         let mut f = Filters {

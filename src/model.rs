@@ -455,12 +455,23 @@ pub fn importance_name(level: u8) -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// A user-defined tag. Entries may carry several.
+///
+/// Categories can nest — "Politics" > "Domestic politics" / "Foreign
+/// politics" — the same "Inside:" pattern as [`Group`]. Nesting is purely
+/// organisational except for one deliberate effect on filtering: ticking a
+/// parent in the Include/Exclude filter also covers everything tagged with
+/// one of its subcategories, so filtering by "Politics" does not require
+/// separately ticking every subcategory too. See
+/// [`Document::effective_filters`].
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct Category {
     pub id: Id,
     pub name: String,
     #[serde(default = "default_category_color")]
     pub color: Rgb,
+    /// Parent category, or `None` for a top-level category.
+    #[serde(default)]
+    pub parent: Option<Id>,
 }
 
 fn default_category_color() -> Rgb {
@@ -830,6 +841,7 @@ impl Document {
                 id,
                 name: name.to_string(),
                 color,
+                parent: None,
             });
         }
         doc
@@ -940,6 +952,76 @@ impl Document {
 
     pub fn category(&self, id: Id) -> Option<&Category> {
         self.categories.iter().find(|c| c.id == id)
+    }
+
+    pub fn category_mut(&mut self, id: Id) -> Option<&mut Category> {
+        self.categories.iter_mut().find(|c| c.id == id)
+    }
+
+    /// Direct child categories of `parent` (`None` for top level), in the
+    /// order they appear in the document.
+    pub fn child_categories(&self, parent: Option<Id>) -> Vec<&Category> {
+        self.categories.iter().filter(|c| c.parent == parent).collect()
+    }
+
+    /// Would nesting `category` under `new_parent` make it its own ancestor?
+    ///
+    /// Walks defensively, as with [`Self::would_cycle`]: a hand-edited file
+    /// could contain a parent cycle, and this must terminate rather than hang.
+    pub fn would_cycle_category(&self, category: Id, new_parent: Option<Id>) -> bool {
+        let mut cursor = new_parent;
+        let mut hops = 0;
+        while let Some(id) = cursor {
+            if id == category {
+                return true;
+            }
+            hops += 1;
+            if hops > self.categories.len() + 1 {
+                return true;
+            }
+            cursor = self.category(id).and_then(|c| c.parent);
+        }
+        false
+    }
+
+    /// Every category in `category`'s subtree, `category` itself excluded.
+    ///
+    /// Used to cascade an Include/Exclude filter selection onto
+    /// subcategories — see [`Self::effective_filters`]. Walks defensively, as
+    /// with [`Self::group_timelines`]: a hand-edited file could contain a
+    /// parent cycle, and this must terminate rather than hang the UI.
+    pub fn category_descendants(&self, category: Id) -> Vec<Id> {
+        let mut frontier = vec![category];
+        let mut seen: BTreeSet<Id> = BTreeSet::new();
+        seen.insert(category);
+        let mut out = Vec::new();
+        while let Some(id) = frontier.pop() {
+            for child in self.categories.iter().filter(|c| c.parent == Some(id)) {
+                if seen.insert(child.id) {
+                    out.push(child.id);
+                    frontier.push(child.id);
+                }
+            }
+        }
+        out
+    }
+
+    /// The document's filters with `selected` expanded to include every
+    /// descendant of a selected category — ticking "Politics" in the sidebar
+    /// covers "Domestic politics" too, without requiring it to be ticked
+    /// separately. Rendering and visibility checks should use this rather
+    /// than `view.filters` directly; the sidebar itself still reads the
+    /// un-expanded set, since a subcategory's own checkbox should not appear
+    /// ticked just because its parent is.
+    pub fn effective_filters(&self) -> Filters {
+        let mut filters = self.view.filters.clone();
+        let extra: Vec<Id> = filters
+            .selected
+            .iter()
+            .flat_map(|&id| self.category_descendants(id))
+            .collect();
+        filters.selected.extend(extra);
+        filters
     }
 
     pub fn category_names(&self, ids: &[Id]) -> String {
@@ -1057,7 +1139,16 @@ impl Document {
         self.clear_dangling_event_parents();
     }
 
+    /// Remove a category, lifting its subcategories up to its own parent
+    /// rather than deleting them — the same "lift contents up" rule as
+    /// [`Self::delete_group`] and [`Self::delete_event`].
     pub fn delete_category(&mut self, id: Id) {
+        let parent = self.category(id).and_then(|c| c.parent);
+        for c in &mut self.categories {
+            if c.parent == Some(id) {
+                c.parent = parent;
+            }
+        }
         self.categories.retain(|c| c.id != id);
         for e in &mut self.events {
             e.categories.retain(|c| *c != id);
@@ -1198,6 +1289,7 @@ mod tests {
             id: Id(77),
             name: "x".into(),
             color: [0, 0, 0],
+            parent: None,
         });
         assert_eq!(doc.new_id(), Id(78));
     }
@@ -1338,6 +1430,96 @@ mod tests {
         // The clause moves up to the treaty's own parent — the war — rather
         // than being deleted or left dangling.
         assert_eq!(doc.event(clause).unwrap().parent, Some(war));
+    }
+
+    // --- Category hierarchy --------------------------------------------------
+
+    fn make_category(id: Id, name: &str, parent: Option<Id>) -> Category {
+        Category {
+            id,
+            name: name.into(),
+            color: [0, 0, 0],
+            parent,
+        }
+    }
+
+    #[test]
+    fn nesting_a_category_under_its_own_descendant_is_a_cycle() {
+        let mut doc = Document::default();
+        let politics = doc.new_id();
+        let domestic = doc.new_id();
+        doc.categories.push(make_category(politics, "Politics", None));
+        doc.categories.push(make_category(domestic, "Domestic politics", Some(politics)));
+
+        // Politics becoming a child of its own subcategory is a cycle...
+        assert!(doc.would_cycle_category(politics, Some(domestic)));
+        // ...but nesting a fresh category under either of them is fine.
+        let fresh = doc.new_id();
+        assert!(!doc.would_cycle_category(fresh, Some(domestic)));
+    }
+
+    #[test]
+    fn deleting_a_category_lifts_its_subcategories_up_a_level() {
+        let mut doc = Document::default();
+        let politics = doc.new_id();
+        let domestic = doc.new_id();
+        let elections = doc.new_id();
+        doc.categories.push(make_category(politics, "Politics", None));
+        doc.categories.push(make_category(domestic, "Domestic politics", Some(politics)));
+        doc.categories.push(make_category(elections, "Elections", Some(domestic)));
+
+        doc.delete_category(domestic);
+
+        assert!(doc.category(domestic).is_none());
+        // Elections moves up to Domestic politics' own parent — Politics —
+        // rather than being deleted or left dangling.
+        assert_eq!(doc.category(elections).unwrap().parent, Some(politics));
+    }
+
+    #[test]
+    fn category_descendants_gathers_the_whole_subtree() {
+        let mut doc = Document::default();
+        let politics = doc.new_id();
+        let domestic = doc.new_id();
+        let elections = doc.new_id();
+        let foreign = doc.new_id();
+        let unrelated = doc.new_id();
+        doc.categories.push(make_category(politics, "Politics", None));
+        doc.categories.push(make_category(domestic, "Domestic politics", Some(politics)));
+        doc.categories.push(make_category(elections, "Elections", Some(domestic)));
+        doc.categories.push(make_category(foreign, "Foreign politics", Some(politics)));
+        doc.categories.push(make_category(unrelated, "Literature", None));
+
+        let mut descendants = doc.category_descendants(politics);
+        descendants.sort();
+        let mut expected = vec![domestic, elections, foreign];
+        expected.sort();
+        assert_eq!(descendants, expected);
+        assert!(!descendants.contains(&unrelated));
+    }
+
+    #[test]
+    fn effective_filters_expands_a_selected_category_to_its_subcategories() {
+        let mut doc = Document::default();
+        let politics = doc.new_id();
+        let domestic = doc.new_id();
+        let literature = doc.new_id();
+        doc.categories.push(make_category(politics, "Politics", None));
+        doc.categories.push(make_category(domestic, "Domestic politics", Some(politics)));
+        doc.categories.push(make_category(literature, "Literature", None));
+
+        doc.view.filters.mode = FilterMode::Include;
+        doc.view.filters.selected.insert(politics);
+
+        let effective = doc.effective_filters();
+        assert!(effective.selected.contains(&politics));
+        assert!(effective.selected.contains(&domestic));
+        assert!(!effective.selected.contains(&literature));
+
+        // The stored filters themselves are untouched — the sidebar checkbox
+        // for "Domestic politics" must not appear ticked just because its
+        // parent's is.
+        assert!(!doc.view.filters.selected.contains(&domestic));
     }
 
     #[test]

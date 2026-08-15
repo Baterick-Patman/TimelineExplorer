@@ -382,7 +382,7 @@ impl TimelineApp {
             }
             Confirm::DeleteCategory(id) => {
                 self.mutate(|d| d.delete_category(id));
-                self.info("Category deleted — Ctrl+Z to undo.");
+                self.info("Category deleted; any subcategories moved up a level — Ctrl+Z to undo.");
             }
             Confirm::NewLibrary => {
                 self.mutate(|d| *d = Document::with_starter_categories());
@@ -757,7 +757,7 @@ impl TimelineApp {
             Confirm::DeleteCategory(id) => (
                 "Delete category?",
                 format!(
-                    "“{}” will be removed from every entry that uses it.",
+                    "“{}” will be removed from every entry that uses it. Any subcategories are kept and move up a level.",
                     self.doc.category(*id).map(|c| c.name.clone()).unwrap_or_default()
                 ),
             ),

@@ -11,16 +11,21 @@ on it* — environment, gotchas, and the traps that cost time the first time rou
 Working and complete against `timeline_app_planning.md`, all four phases:
 multiple parallel timelines, biographies (inline and own-lane), fuzzy dates,
 categories with include/exclude filtering, zoom-dependent importance, and
-converging/diverging timelines. Two later requests are also in: nestable
-super-categories ("groups"), and single-year-resolution work on biographies.
+converging/diverging timelines. Several later requests are also in: nestable
+super-categories ("groups"), single-year-resolution work on biographies,
+colour-coded epochs (now with their name painted directly on the band, not
+just the colour), nestable events, and nestable categories (ticking a parent
+category in the filter cascades onto its subcategories).
 
-- **~7,700 lines** of Rust across 10 files in `src/`.
-- **92 tests**, all passing, no compiler warnings.
+- **~9,000 lines** of Rust across 10 files in `src/`.
+- **110 tests**, all passing, no compiler warnings.
 - Release binary: `target/release/timeline_explorer.exe`, ~6.4 MB, single file.
 
-**Not implemented:** export to image/PDF. This was open question 5 in the
-planning document and was deliberately left for a decision rather than guessed
-at. Everything else in that document is done.
+**Not implemented:** export to image/PDF (open question 5 in the planning
+document, deliberately left for a decision rather than guessed at), and
+day/month-precision zoom (the ruler bottoms out at whole-year ticks even
+though events carry day precision internally — deferred deliberately, see
+item 2 in §7 below, as the display could get crowded at that resolution).
 
 ### Git
 
@@ -221,6 +226,42 @@ collapse to a slim dimmed row. If you add a new lane type, it needs a
 `LABEL_ROW_HEIGHT` must stay ≥ the largest label's line height or big titles
 overlap the row above. There is a guard test for exactly this in `theme.rs`.
 
+### Categories cascade through a second, expanded `Filters`, not the stored one
+
+`Category.parent` makes categories nestable, the same "Inside:" pattern as
+`Group`. The one behavioural effect of nesting: ticking a parent category in
+the Include/Exclude filter should also cover its subcategories, so the user
+does not have to tick "Domestic politics" and "Foreign politics" separately
+after ticking "Politics".
+
+This is deliberately **not** implemented by mutating `Filters.selected`
+itself. `Document::effective_filters()` returns a clone with `selected`
+expanded to include every descendant of a selected category;
+`canvas::draw()` computes this once per frame and threads it through
+`plan_lanes` / `measure_lanes` / `paint_lane_events`. `panels::filters_section`
+and the sidebar checkboxes still read `doc.view.filters` (the raw, un-expanded
+set) directly — a subcategory's own checkbox must not appear ticked just
+because its parent's is, the same way a collapsed group does not flip its
+members' own `visible` flags. **If you add a new place that decides
+visibility from categories, make sure it receives the expanded `Filters`, not
+`doc.view.filters` directly** — `paint_lane_events` used to fetch the raw one
+itself before this was added, which would have silently ignored the cascade.
+
+### An epoch segment's name, not its colour, is the ground truth for "is this a gap"
+
+`band_color_segments` returns `(from, to, colour, name)`, where `name` is
+`None` for the base-colour filler between/around epochs and `Some` for an
+actual epoch. Painting used to skip a segment by comparing `colour == tl.color`
+— that breaks if a user ever colours an epoch to match its timeline's own
+colour (unlikely, but not invalid), silently dropping both the stroke *and*
+the label for it. Compare on `name.is_none()` instead if you touch this code.
+
+The epoch name itself is painted with `canvas::epoch_segment_label`, centred
+on the segment and skipped if the segment is narrower than the label —
+deliberately placed *on* the band (its own pill, `theme.canvas_bg` behind it)
+rather than in the label rows above, so it reads as structural (like a lane
+name) rather than as an event title.
+
 ### The egui hover-reflow workaround
 
 `theme::visuals()` normalises `bg_stroke.width` across all interactive widget
@@ -242,6 +283,14 @@ backup, then `fs::rename`s over the live file. `fs::rename` replaces atomically
 on Windows too — **do not add a `remove_file` before it.** An earlier version did
 and left a window where a crash would have destroyed the whole library. There is
 a test named `overwriting_never_leaves_the_library_missing` guarding this.
+
+Backup rotation is age-gated (`MIN_BACKUP_AGE`, 10 minutes): if slot 1 is
+younger than that, a save leaves the whole backup ring untouched. Without this,
+autosave firing 1.2s after every small edit filled all 10 slots within minutes
+of active editing, so the "history" was a few seconds deep instead of hours.
+`rotate_backups_impl` takes the age threshold as a parameter precisely so the
+cap and the age-gating can each be tested deterministically (`Duration::ZERO`
+forces every save to rotate) without racing the wall clock.
 
 Loading tolerates a UTF-8 BOM, because Notepad writes one and the file is
 advertised as user-editable. A file that fails to parse is **never** overwritten;

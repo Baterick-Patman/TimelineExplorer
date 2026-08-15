@@ -4,6 +4,7 @@ use crate::app::{Confirm, Selection, TimelineApp};
 use crate::forms::{CategoryEditor, Dialog, EventForm, GroupForm};
 use crate::model::*;
 use crate::theme::to_color;
+use std::collections::BTreeSet;
 
 /// Deferred edits, collected while iterating the document immutably.
 enum Action {
@@ -324,6 +325,46 @@ fn biographies_section(app: &TimelineApp, ui: &mut egui::Ui, actions: &mut Vec<A
     }
 }
 
+/// One level of the category tree in the sidebar filter, then recurse.
+///
+/// Ticking a parent category is enough to also cover its subcategories when
+/// filtering (see `Document::effective_filters`) — the checkbox here still
+/// only reflects a category's own membership in `selected`, so a
+/// subcategory's box does not appear ticked just because its parent's is.
+#[allow(clippy::too_many_arguments)]
+fn category_filter_tree(
+    ui: &mut egui::Ui,
+    doc: &Document,
+    parent: Option<Id>,
+    depth: usize,
+    guard: &mut usize,
+    selected: &mut BTreeSet<Id>,
+    changed: &mut bool,
+) {
+    *guard += 1;
+    if *guard > 512 || depth > 12 {
+        return;
+    }
+    let indent = depth as f32 * 14.0;
+
+    for c in doc.child_categories(parent) {
+        let mut on = selected.contains(&c.id);
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            color_chip(ui, c.color);
+            if ui.checkbox(&mut on, &c.name).changed() {
+                if on {
+                    selected.insert(c.id);
+                } else {
+                    selected.remove(&c.id);
+                }
+                *changed = true;
+            }
+        });
+        category_filter_tree(ui, doc, Some(c.id), depth + 1, guard, selected, changed);
+    }
+}
+
 fn filters_section(app: &mut TimelineApp, ui: &mut egui::Ui) {
     section_header(ui, "Categories & filter", app.doc.categories.len());
 
@@ -347,22 +388,11 @@ fn filters_section(app: &mut TimelineApp, ui: &mut egui::Ui) {
     let mut keep_uncat = app.doc.view.filters.keep_uncategorised;
 
     ui.add_space(4.0);
-    for c in &app.doc.categories {
-        let mut on = selected.contains(&c.id);
-        ui.horizontal(|ui| {
-            color_chip(ui, c.color);
-            if ui.checkbox(&mut on, &c.name).changed() {
-                if on {
-                    selected.insert(c.id);
-                } else {
-                    selected.remove(&c.id);
-                }
-                changed = true;
-            }
-        });
-    }
     if app.doc.categories.is_empty() {
         ui.weak("No categories yet.");
+    } else {
+        let mut guard = 0usize;
+        category_filter_tree(ui, &app.doc, None, 0, &mut guard, &mut selected, &mut changed);
     }
 
     ui.add_space(4.0);

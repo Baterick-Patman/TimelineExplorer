@@ -122,14 +122,44 @@ pub fn save(path: &Path, doc: &Document) -> Result<(), String> {
     Ok(())
 }
 
-/// Shift `library.bak1..bakN` down by one and copy the current file into slot 1.
+/// Minimum age of the newest backup before a save starts a fresh generation
+/// rather than just refreshing it in place.
+///
+/// Autosave fires 1.2s after the last edit, so without this a burst of small
+/// edits (nudging a date, retyping a title) would shove a genuinely old backup
+/// out of the 10-slot ring every few seconds. Gating on age instead means the
+/// 10 slots span real time — roughly the last couple of hours of editing —
+/// rather than the last couple of minutes.
+const MIN_BACKUP_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 fn rotate_backups(path: &Path) {
+    rotate_backups_impl(path, MIN_BACKUP_AGE);
+}
+
+/// Shift `library.bak1..bakN` down by one and copy the current file into slot
+/// 1 — unless slot 1 is younger than `min_age`, in which case the backups are
+/// left untouched entirely. That makes slot 1 a stable checkpoint of "the
+/// state before this editing burst started" for as long as the burst
+/// continues, rather than sliding forward with every single save (which would
+/// leave it barely different from the live file). `min_age` is a parameter
+/// (rather than always reading `MIN_BACKUP_AGE`) so tests can force either
+/// behaviour deterministically instead of racing the wall clock.
+fn rotate_backups_impl(path: &Path, min_age: std::time::Duration) {
     let dir = path.parent().unwrap_or(Path::new("."));
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "library".into());
     let slot = |n: usize| dir.join(format!("{stem}.bak{n}.json"));
+
+    let slot1_is_fresh = fs::metadata(slot(1))
+        .and_then(|m| m.modified())
+        .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+        .is_ok_and(|age| age < min_age);
+
+    if slot1_is_fresh {
+        return;
+    }
 
     let _ = fs::remove_file(slot(BACKUP_COUNT));
     for n in (1..BACKUP_COUNT).rev() {
@@ -289,13 +319,49 @@ mod tests {
 
     #[test]
     fn backups_are_capped() {
+        // Forces every save to start a fresh generation (min_age = 0), which
+        // is what a real ring of *spaced-out* saves looks like — this is the
+        // scenario `rotate_backups` degrades to once each backup is old
+        // enough to no longer be "fresh".
         let dir = temp_dir("cap");
         let path = dir.join("library.json");
         let doc = sample();
+        save(&path, &doc).unwrap();
         for _ in 0..(BACKUP_COUNT + 5) {
-            save(&path, &doc).unwrap();
+            rotate_backups_impl(&path, std::time::Duration::ZERO);
         }
         assert!(backups(&path).len() <= BACKUP_COUNT);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rapid_saves_coalesce_into_the_newest_backup_slot_instead_of_flooding_it() {
+        // A burst of small edits (autosave fires 1.2s after each one) used to
+        // shove a fresh backup into the ring every time, so 10 slots covered
+        // only the last few minutes of editing instead of real history. Back
+        // to back saves within MIN_BACKUP_AGE of each other must leave the
+        // backups untouched instead of rotating the chain each time.
+        let dir = temp_dir("coalesce");
+        let path = dir.join("library.json");
+        let mut doc = sample();
+        save(&path, &doc).unwrap();
+
+        for i in 0..5 {
+            doc.timelines[0].name = format!("Edit {i}");
+            save(&path, &doc).unwrap();
+        }
+
+        let list = backups(&path);
+        assert_eq!(
+            list.len(),
+            1,
+            "rapid saves should share one backup slot, not rotate a new one each time"
+        );
+        // Slot 1 must hold the content from just before the *first* of the
+        // rapid edits — the pre-burst snapshot, not overwritten with a
+        // half-way state and not lost either.
+        let prev = load(&list[0].0).unwrap().unwrap();
+        assert_eq!(prev.timelines[0].name, "Roman Republic");
         fs::remove_dir_all(&dir).ok();
     }
 
