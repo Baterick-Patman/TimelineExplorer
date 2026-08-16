@@ -107,6 +107,8 @@ pub fn draw(app: &mut TimelineApp, ui: &mut egui::Ui) {
         );
     }
 
+    paint_epoch_labels(&clip, &app.doc, &lanes, &centers, &axis, view_from, view_to, &theme);
+
     paint_lane_names(
         &clip, &app.doc, &lanes, content_rect, &axis, view_from, view_to, &theme, &mut hits,
     );
@@ -430,11 +432,14 @@ fn paint_timeline_band(
 
     // Colour-coded eras — "Archaic", "Classical" — painted as separate
     // strokes over the base band. Each is sampled independently so it still
-    // follows the curve through a merge/origin transition.
+    // follows the curve through a merge/origin transition. Their *names*
+    // are deliberately not painted here — see `paint_epoch_labels`.
     if !tl.epochs.is_empty() {
         if let Some((from, to)) = band_visible_range(doc, tl, view_from, view_to) {
             for (seg_from, seg_to, seg_color, name) in band_color_segments(tl, from, to) {
-                let Some(name) = name else { continue };
+                if name.is_none() {
+                    continue;
+                }
                 let seg_pts = band_curve(tl, lane.center, centers, axis, seg_from, seg_to);
                 if seg_pts.len() < 2 {
                     continue;
@@ -444,9 +449,6 @@ fn paint_timeline_band(
                     seg_points,
                     Stroke::new(lane.thickness, with_alpha(to_color(seg_color), 235)),
                 ));
-                epoch_segment_label(
-                    p, tl, lane.center, centers, axis, seg_from, seg_to, name, theme,
-                );
             }
         }
     }
@@ -495,12 +497,50 @@ fn junction_label(p: &egui::Painter, label: &str, x: f32, y: f32, theme: &Theme)
         theme.text_dim,
     );
     let pos = Pos2::new(x, y + 3.0);
+    // Fully opaque — a semi-transparent label background lets whatever is
+    // behind it (band colour, an event marker scrolled underneath) bleed
+    // through and look like a rendering glitch rather than a deliberate
+    // overlay. See the same fix on the lane-name gutter tag for the bug this
+    // was actually caught by.
     p.rect_filled(
         Rect::from_min_size(pos, galley.size()).expand2(Vec2::new(3.0, 1.0)),
         CornerRadius::same(3),
-        with_alpha(theme.canvas_bg, 200),
+        theme.canvas_bg,
     );
     p.galley(pos, galley, theme.text_dim);
+}
+
+/// Below this on-screen width, an epoch or life-phase segment no longer gets
+/// a label at all — a fixed value, deliberately independent of any
+/// particular name's length, so *whether* a label shows is governed purely
+/// by the segment's own duration on screen. Otherwise "Spätminoische Zeit"
+/// and "Frühminoische Zeit" — same name length, different real durations —
+/// would disappear at the same zoom regardless of which one actually lasted
+/// longer, just because they happen to measure the same width.
+const SEGMENT_LABEL_MIN_PX: f32 = 34.0;
+
+/// An event title never grows wider than this on screen — a long title
+/// ("Untergang des Weströmischen Reichs - Einfall der Langobarden")
+/// ellipsises instead, so one event's label cannot dwarf the date it
+/// actually marks or crowd out its neighbours.
+const EVENT_LABEL_MAX_PX: f32 = 260.0;
+
+/// Shortens `text` with a trailing "…" until it measures within `max_width`,
+/// re-measuring at each step. A name too long for its segment degrades
+/// gracefully this way instead of either overflowing into a neighbouring
+/// segment or vanishing outright the moment it no longer fits verbatim.
+fn fit_text(p: &egui::Painter, text: &str, font: &FontId, color: Color32, max_width: f32) -> String {
+    if p.layout_no_wrap(text.to_owned(), font.clone(), color).size().x <= max_width {
+        return text.to_owned();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    for len in (0..chars.len()).rev() {
+        let candidate: String = chars[..len].iter().collect::<String>() + "…";
+        if p.layout_no_wrap(candidate.clone(), font.clone(), color).size().x <= max_width {
+            return candidate;
+        }
+    }
+    "…".to_owned()
 }
 
 /// An epoch's name, sat directly on its band segment rather than in the
@@ -527,32 +567,80 @@ fn epoch_segment_label(
     if name.trim().is_empty() {
         return;
     }
+    let seg_px = (axis.x(seg_to) - axis.x(seg_from)).abs();
+    // A segment shorter than this, on screen, keeps its colour coding but
+    // loses its name — the same zoomed-out-enough-and-detail-drops-away
+    // idea events already follow, just driven by duration instead of an
+    // explicit importance value.
+    if seg_px < SEGMENT_LABEL_MIN_PX {
+        return;
+    }
+
     let mid = (seg_from + seg_to) * 0.5;
     let center = Pos2::new(
         axis.x(mid),
         band_center_at(tl, own_center, centers, mid, axis.ppy),
     );
-    let seg_px = (axis.x(seg_to) - axis.x(seg_from)).abs();
 
     let font = FontId::proportional(10.5);
-    let size = p
-        .layout_no_wrap(name.to_owned(), font.clone(), theme.text)
-        .size();
-    // A segment too narrow for its own name just keeps the colour coding —
-    // better than crowding it with a clipped or overlapping label.
-    if size.x + 12.0 > seg_px {
-        return;
-    }
+    let fitted = fit_text(p, name, &font, theme.text, (seg_px - 12.0).max(0.0));
+    let size = p.layout_no_wrap(fitted.clone(), font.clone(), theme.text).size();
 
     let pill = Rect::from_center_size(center, size + Vec2::new(10.0, 4.0));
-    p.rect_filled(pill, CornerRadius::same(3), with_alpha(theme.canvas_bg, 220));
+    // Fully opaque — see the comment on `junction_label`'s identical fix.
+    p.rect_filled(pill, CornerRadius::same(3), theme.canvas_bg);
     p.rect_stroke(
         pill,
         CornerRadius::same(3),
         Stroke::new(1.0, with_alpha(theme.text_dim, 100)),
         StrokeKind::Outside,
     );
-    p.text(center, Align2::CENTER_CENTER, name, font, theme.text);
+    p.text(center, Align2::CENTER_CENTER, &fitted, font, theme.text);
+}
+
+/// Every visible timeline's epoch names, painted in their own pass *after*
+/// every band (including any other timeline's curve) is already on screen.
+///
+/// Epoch names used to be painted inline as part of `paint_timeline_band`,
+/// in the same pass and lane order as every other band. A curve travelling
+/// several lanes to reach a distant merge target is just another band drawn
+/// in that same pass — if it happened to be painted after a nearer
+/// timeline's epoch label, it painted directly over that label along the
+/// way, exactly as if the label had never been there. Repainting every
+/// epoch name in its own later pass means it always sits on top of whatever
+/// else crosses through that stretch of screen, not just its own band.
+#[allow(clippy::too_many_arguments)]
+fn paint_epoch_labels(
+    p: &egui::Painter,
+    doc: &Document,
+    lanes: &[Lane],
+    centers: &std::collections::HashMap<Id, f32>,
+    axis: &TimeAxis,
+    view_from: f64,
+    view_to: f64,
+    theme: &Theme,
+) {
+    for lane in lanes {
+        if !lane.active {
+            continue;
+        }
+        let LaneKind::Timeline(id) = lane.kind else {
+            continue;
+        };
+        let Some(tl) = doc.timeline(id) else {
+            continue;
+        };
+        if tl.epochs.is_empty() {
+            continue;
+        }
+        let Some((from, to)) = band_visible_range(doc, tl, view_from, view_to) else {
+            continue;
+        };
+        for (seg_from, seg_to, _, name) in band_color_segments(tl, from, to) {
+            let Some(name) = name else { continue };
+            epoch_segment_label(p, tl, lane.center, centers, axis, seg_from, seg_to, name, theme);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -649,17 +737,17 @@ fn phase_segment_label(p: &egui::Painter, seg_rect: Rect, name: &str, theme: &Th
     if name.trim().is_empty() {
         return;
     }
-    let center = seg_rect.center();
-    let font = FontId::proportional(10.0);
-    let size = p
-        .layout_no_wrap(name.to_owned(), font.clone(), theme.text)
-        .size();
-    if size.x + 10.0 > seg_rect.width() {
+    if seg_rect.width() < SEGMENT_LABEL_MIN_PX {
         return;
     }
+    let center = seg_rect.center();
+    let font = FontId::proportional(10.0);
+    let fitted = fit_text(p, name, &font, theme.text, (seg_rect.width() - 10.0).max(0.0));
+    let size = p.layout_no_wrap(fitted.clone(), font.clone(), theme.text).size();
     let pill = Rect::from_center_size(center, size + Vec2::new(8.0, 3.0));
-    p.rect_filled(pill, CornerRadius::same(3), with_alpha(theme.canvas_bg, 220));
-    p.text(center, Align2::CENTER_CENTER, name, font, theme.text);
+    // Fully opaque — see the comment on `junction_label`'s identical fix.
+    p.rect_filled(pill, CornerRadius::same(3), theme.canvas_bg);
+    p.text(center, Align2::CENTER_CENTER, &fitted, font, theme.text);
 }
 
 // ---------------------------------------------------------------------------
@@ -747,7 +835,10 @@ fn measure_lanes(
                     FontId::proportional(label_font_size(importance)),
                     Color32::WHITE,
                 );
-                let w = galley.size().x;
+                // Capped the same way the real paint pass ellipsises a long
+                // title — otherwise a lane could reserve far more row-width
+                // than the label actually ends up using on screen.
+                let w = galley.size().x.min(EVENT_LABEL_MAX_PX);
                 let lx = (at - w * 0.5)
                     .max(rect.left() + 2.0)
                     .min(rect.right() - w - 2.0);
@@ -877,8 +968,18 @@ fn paint_lane_events(
         }
 
         let font = FontId::proportional(label_font_size(ev.importance));
-        let color = with_alpha(label_color(lane_color, theme.dark), alpha);
-        let galley = p.layout_no_wrap(ev.title.clone(), font, color);
+        // A neutral colour, not a tint of the lane's own hue — a light band
+        // (e.g. cyan) tinted the same way its label was coloured produced
+        // low-contrast, barely-legible text once the two sat close together
+        // at a cramped zoom. Which lane a label belongs to is already clear
+        // from its position and the marker beside it.
+        let color = with_alpha(theme.text, alpha);
+        // Capped and ellipsised rather than left to grow arbitrarily wide —
+        // a long title ("Untergang des Weströmischen Reichs - Einfall der
+        // Langobarden") would otherwise span a huge stretch of the timeline
+        // on its own, out of proportion with the date it actually marks.
+        let fitted = fit_text(p, &ev.title, &font, color, EVENT_LABEL_MAX_PX);
+        let galley = p.layout_no_wrap(fitted, font, color);
         let w = galley.size().x;
         let lx = (x - w * 0.5)
             .max(content_rect.left() + 2.0)
@@ -1243,19 +1344,33 @@ fn paint_lane_names(
             }
             continue;
         }
-        let size = if lane.is_nested() { 11.5 } else { 13.5 };
-        let mut color = label_color(to_color(lane.color), theme.dark);
+        // Nothing on this lane — band or events — falls in the visible
+        // window, so its name shouldn't either: seeing "Seleukidenreich"
+        // pinned to the left edge while looking at 200 AD, centuries past
+        // where it ever existed, is exactly the kind of stale label a
+        // biography's on-band name already avoids by disappearing once
+        // scrolled past. A dormant lane still reserves its (slim) row for
+        // scroll-position consistency — only the name is skipped here.
         if !lane.active {
-            // Nothing on this lane falls in the visible window.
-            color = with_alpha(color, 105);
+            continue;
         }
+        let size = if lane.is_nested() { 11.5 } else { 13.5 };
+        // Neutral text colour — see the comment in `paint_lane_events` on
+        // why this is no longer tinted by the lane's own colour.
+        let color = theme.text;
         let galley = p.layout_no_wrap(lane.name.clone(), FontId::proportional(size), color);
         let pos = Pos2::new(
             rect.left() + GUTTER + lane.depth as f32 * 13.0,
             lane.center - galley.size().y * 0.5,
         );
         let bg = Rect::from_min_size(pos, galley.size()).expand2(Vec2::new(6.0, 3.0));
-        p.rect_filled(bg, CornerRadius::same(4), with_alpha(theme.canvas_bg, 215));
+        // Fully opaque — this tag is pinned to the left edge regardless of
+        // scroll, so whatever content is scrolled underneath it (band, an
+        // event marker) must be cleanly hidden rather than bleeding through
+        // at partial alpha. The bleed-through used to look exactly like a
+        // displaced, ghostly event marker wherever one happened to scroll
+        // under the tag — a real, reported bug, not a hypothetical one.
+        p.rect_filled(bg, CornerRadius::same(4), theme.canvas_bg);
         // A colour chip repeats the band identity next to the name.
         p.rect_filled(
             Rect::from_min_size(Pos2::new(bg.left() - 5.0, bg.top() + 2.0), Vec2::new(3.0, bg.height() - 4.0)),
@@ -1299,7 +1414,9 @@ fn paint_biography_name(
     let center = Pos2::new(axis.x((from + to) * 0.5), lane.center);
 
     let size = if lane.is_nested() { 11.5 } else { 13.5 };
-    let color = label_color(to_color(lane.color), theme.dark);
+    // Neutral text colour — see the comment in `paint_lane_events`; doubly
+    // so here, since this name sits directly on top of the band's own fill.
+    let color = theme.text;
     let font = FontId::proportional(size);
     let galley_size = p.layout_no_wrap(bio.name.clone(), font.clone(), color).size();
     // Too little room to show the name without clipping or overlapping the
@@ -1310,7 +1427,8 @@ fn paint_biography_name(
 
     let pos = Pos2::new(center.x - galley_size.x * 0.5, center.y - galley_size.y * 0.5);
     let bg = Rect::from_min_size(pos, galley_size).expand2(Vec2::new(6.0, 3.0));
-    p.rect_filled(bg, CornerRadius::same(4), with_alpha(theme.canvas_bg, 215));
+    // Fully opaque — see the comment on the lane-name gutter tag's identical fix.
+    p.rect_filled(bg, CornerRadius::same(4), theme.canvas_bg);
     let galley = p.layout_no_wrap(bio.name.clone(), font, color);
     p.galley(pos, galley, theme.text);
     hits.push(Hit {

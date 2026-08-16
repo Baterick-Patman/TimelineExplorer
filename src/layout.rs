@@ -683,6 +683,31 @@ fn smoothstep(t: f64) -> f64 {
 /// This is what makes convergence a first-class visual: within a transition
 /// window before a merge, the band eases from its own lane onto the lane of the
 /// timeline it is being absorbed into, and symmetrically after a split.
+/// The easing window (in years) an origin/merge transition gets at this
+/// zoom — normally a fixed `TRANSITION_PX` in screen space, so the curve
+/// keeps the same shape at every zoom level.
+///
+/// If a timeline has both an origin and a merge, the two windows must not
+/// overlap — otherwise, once zoomed out far enough that a fixed 110px
+/// window exceeds the gap between the two dates (routine for a short-lived
+/// timeline like a few-decade successor kingdom), the merge easing would
+/// start interpolating from a `y` the origin easing had already pulled away
+/// from `own_center`, instead of from `own_center` itself. The band would
+/// curve out from its parent, immediately curve again into its target, and
+/// never actually look "connected" to either — reported as a connection
+/// that "runs too far" or "isn't attached." Capping each window at half the
+/// origin-merge gap keeps the two easings from ever touching, at any zoom.
+fn transition_window(tl: &Timeline, ppy: f64) -> f64 {
+    let raw_window = (TRANSITION_PX / ppy).max(f64::MIN_POSITIVE);
+    match (&tl.origin, &tl.merge) {
+        (Some(o), Some(m)) => {
+            let gap = (m.date.decimal() - o.date.decimal()).abs();
+            raw_window.min(gap / 2.0)
+        }
+        _ => raw_window,
+    }
+}
+
 pub fn band_center_at(
     tl: &Timeline,
     own_center: f32,
@@ -690,7 +715,7 @@ pub fn band_center_at(
     t: f64,
     ppy: f64,
 ) -> f32 {
-    let window = (TRANSITION_PX / ppy).max(f64::MIN_POSITIVE);
+    let window = transition_window(tl, ppy);
     let mut y = own_center as f64;
 
     // Splitting off from a parent: start on the parent's lane, ease to our own.
@@ -756,7 +781,7 @@ pub fn band_curve(
 
     // Straight sections need only their endpoints; curves need real sampling.
     let mut cuts: Vec<f64> = vec![from, to];
-    let window = TRANSITION_PX / axis.ppy;
+    let window = transition_window(tl, axis.ppy);
     for (date, start) in [
         (tl.origin.as_ref().map(|j| j.date.decimal()), true),
         (tl.merge.as_ref().map(|j| j.date.decimal()), false),
@@ -1168,6 +1193,75 @@ mod tests {
             let t = merge_t - window + window * (i as f64 / 20.0);
             let y = band_center_at(&macedon, 200.0, &centers, t, ppy);
             assert!(y <= prev + 1e-3, "band should descend steadily, got {y} after {prev}");
+            prev = y;
+        }
+    }
+
+    /// A short-lived successor timeline: splits off from `parent` at -323 and
+    /// merges into `target` at -283, a 40-year gap — deliberately shorter
+    /// than `TRANSITION_PX` worth of years at the zoomed-out `ppy` the test
+    /// below uses, so the origin and merge windows would overlap without the
+    /// cap in `transition_window`.
+    fn short_lived_successor_doc() -> (Timeline, HashMap<Id, f32>) {
+        let parent = Id(1);
+        let target = Id(2);
+        let successor = Id(3);
+        let tl = Timeline {
+            id: successor,
+            name: "Kurzlebiges Nachfolgereich".into(),
+            color: [150, 150, 150],
+            visible: true,
+            group: None,
+            order: 0,
+            span: Some(Span::range(HDate::year(-323), HDate::year(-283))),
+            origin: Some(Junction {
+                other: parent,
+                date: HDate::year(-323),
+                label: String::new(),
+            }),
+            merge: Some(Junction {
+                other: target,
+                date: HDate::year(-283),
+                label: String::new(),
+            }),
+            notes: String::new(),
+            epochs: Vec::new(),
+        };
+        let centers = HashMap::from([(parent, 100.0f32), (target, 300.0f32)]);
+        (tl, centers)
+    }
+
+    #[test]
+    fn an_origin_and_merge_close_together_do_not_overlap_when_zoomed_far_out() {
+        let (tl, centers) = short_lived_successor_doc();
+        let own = 200.0;
+        // Zoomed out enough that a bare `TRANSITION_PX / ppy` (110 years at
+        // ppy=1.0) would more than cover the whole 40-year gap on its own,
+        // let alone both windows combined.
+        let ppy = 1.0;
+
+        // Right at the origin, still on the parent's lane.
+        let at_origin = band_center_at(&tl, own, &centers, -323.0, ppy);
+        assert!((at_origin - 100.0).abs() < 0.01, "expected to start on the parent, got {at_origin}");
+
+        // Right at the merge, arrived on the target's lane.
+        let at_merge = band_center_at(&tl, own, &centers, -283.0, ppy);
+        assert!((at_merge - 300.0).abs() < 0.01, "expected to end on the target, got {at_merge}");
+
+        // Exactly at the midpoint, the origin easing must have *fully*
+        // completed (reaching `own`) before the merge easing takes over —
+        // if the two windows overlapped, this would land somewhere between
+        // the parent and `own` instead, never actually reaching its own lane.
+        let mid = band_center_at(&tl, own, &centers, -303.0, ppy);
+        assert!((mid - own).abs() < 0.01, "expected to reach its own lane at the midpoint, got {mid}");
+
+        // The whole span must be monotonic (parent -> own -> target), not an
+        // overshoot or a double-back caused by compounding interpolations.
+        let mut prev = f32::NEG_INFINITY;
+        for i in 0..=40 {
+            let t = -323.0 + 40.0 * (i as f64 / 40.0);
+            let y = band_center_at(&tl, own, &centers, t, ppy);
+            assert!(y >= prev - 1e-3, "band should rise steadily, got {y} after {prev}");
             prev = y;
         }
     }

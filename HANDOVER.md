@@ -78,10 +78,53 @@ there as an unreadable pixel-wide bar with its own sub-phases crammed
 underneath — see below; and table import can now target an existing range
 event directly (`ImportForm::nest_under`), so a table of a war's phases can
 be imported straight into that war's own event instead of the timeline's top
-level.
+level. Two tests lock in that the whole save-file schema stays additive-only
+going forward (see the dedicated section on this below) — this shipped as
+v0.7.0.
 
-- **~12,150 lines** of Rust across 14 files in `src/`.
-- **145 tests**, all passing, no compiler warnings (5 pre-existing clippy
+Immediately on top of *that* release, four more fixes from the next round of
+hands-on use: `HDate::parse` now understands German seasons (`Sommer`,
+`Herbst`, with `früh`/`spät` prefixes for early/late) and calendar
+quarters/halves (`1. Quartal`, `Q1`, `1. Hälfte`, `Halbjahr` — see
+`month_from_period`/`fuse_period_tokens`), each mapped to a representative
+month and automatically qualified `Circa`; selecting a range event and
+adding a new one now defaults to nesting the new one inside it
+(`TimelineApp::default_parent_event`), since forgetting the "Verschachtelt
+in:" field was an easy way to end up with a sub-event that silently wasn't
+nested at all; every on-canvas label switched from a tint of its own lane's
+colour to the theme's plain neutral text colour, since a light band (cyan,
+say) tinted the same way its label was produced barely-legible text once the
+two sat close together (`theme::label_color` is gone entirely, along with
+the now-untrue `Theme.dark` field it was the last reader of); and an
+epoch's or life phase's label now disappears purely by its own on-screen
+duration rather than by whether its *particular name* happens to fit —
+see the entry below on `SEGMENT_LABEL_MIN_PX`/`fit_text`.
+
+Same-day follow-up, once real data with real epoch counts and real
+origin/merge chains started exposing the next layer of rough edges: **every**
+modal dialog (event/group/timeline/biography/category/export, not just
+import) now caps its middle content in a height-responsive `ScrollArea`, the
+same fix import got earlier — a timeline with nine epochs used to overflow
+the window with no way to reach "Speichern." An origin and a merge close
+together in time (a short-lived successor timeline) used to produce a
+visibly wrong curve once zoomed out far enough for their two 110px-in-years
+easing windows to overlap and compound — `layout::transition_window` now
+caps each at half the gap between the two dates, so they never touch (see
+its test, `an_origin_and_merge_close_together_do_not_overlap_when_zoomed_far_out`).
+Epoch names are now repainted in their own pass, `canvas::paint_epoch_labels`,
+strictly after every band (including any other timeline's curve) — they used
+to be painted inline as part of the same first "bands" pass as everything
+else, so a curve travelling several lanes to a distant merge target could
+paint directly over a nearer timeline's epoch label along the way, purely
+because of lane iteration order. A long event title no longer grows
+arbitrarily wide; it ellipsises past `EVENT_LABEL_MAX_PX` the same way an
+epoch name does. And a lane's sticky name tag now disappears entirely
+(instead of just dimming) once nothing on that lane — band or events — is in
+the current view, so a short-lived timeline's name doesn't stay pinned to
+the screen centuries after it stopped existing.
+
+- **~12,730 lines** of Rust across 14 files in `src/`.
+- **150 tests**, all passing, no compiler warnings (5 pre-existing clippy
   style lints — `derivable_impls`, `collapsible_if`,
   `field_reassign_with_default` — left as-is, not regressions).
 - Release binary: `target/release/timeline_explorer.exe`, single file, ~9 MB
@@ -689,6 +732,88 @@ list, top to bottom. No change to the underlying heuristic itself, and
 `panels.rs`'s `Action::TidyGroups` now just calls it directly
 (`app.mutate(layout::tidy_all_group_levels)`) rather than inlining the
 top-level-only version.
+
+### Seasons and quarters are parsed by fusing them into ordinary month tokens, not a second code path
+
+`model::month_from_period` extends the same one-token-at-a-time month
+lookup `parse_ymd`'s token loop already used for "Jul"/"Aug" — a season
+word ("sommer", "frühherbst", "spätwinter") is just another single token
+that resolves to a representative month (chosen so the whole sequence,
+including `früh`/`spät` variants, sorts chronologically within a year;
+Winter is the one exception — see the comment on its table entry for why
+it deliberately does *not* try to split across the Dec→Feb calendar-year
+boundary). Quarters and halves ("1. Quartal", "Q1", "1. Hälfte",
+"Halbjahr") need an extra step first: `fuse_period_tokens` turns "1.
+Quartal" / "1.Quartal" / "Quartal 1" all into the single token "quartal1"
+(ordinal fused onto the keyword, stray '.' turned into a space) *before*
+tokenising, specifically so `month_from_period` can treat it exactly like
+any other month name rather than needing a whole parallel parsing path
+just to handle the separate ordinal. This fusing only ever runs when one of
+`PERIOD_KEYWORDS` is actually present in the input — unconditionally
+turning '.' into a space would otherwise wreck the day.month.year form
+("14.07.1789") parsed just above it in `parse_ymd`. All of these are
+inherently approximate (a season or a quarter is months wide), which is why
+`HDate::parse` automatically upgrades the qualifier to `Circa` when
+`parse_ymd` reports the date came from one of these — unless the user
+already gave an explicit qualifier of their own (`vor Sommer 1789` keeps
+`Before`, it is not overridden).
+
+### An epoch/life-phase label's visibility is now driven by duration, not by its own name's length
+
+`epoch_segment_label`/`phase_segment_label` used to hide a label the moment
+its own *measured text* no longer fit the segment's on-screen width. That
+conflates two different things: whether this era is significant enough to
+still show a name at this zoom (which should depend on how long it actually
+lasted) and whether this specific string happens to be short enough to fit
+(which depends on nothing but how the era was named). Two eras of very
+different real duration but coincidentally same-length names — "Spätminoische
+Zeit" / "Frühminoische Zeit" are exactly the same length — would disappear
+at exactly the same zoom under the old rule regardless of which one actually
+lasted longer. `SEGMENT_LABEL_MIN_PX` (a fixed pixel width, independent of
+any particular name) now gates whether a label shows *at all*; `fit_text`
+then shortens the name with a trailing "…" to whatever space is actually
+available, so a long name in a tight-but-still-above-the-minimum segment
+degrades gracefully instead of vanishing outright the moment it stops
+fitting verbatim.
+
+### Labels are a neutral colour now, not a tint of their own lane's hue
+
+`theme::label_color(band, dark)` used to shade a lane's own colour toward
+white (dark mode) or black (light mode) for its label text. The existing
+test for this only checked "lighter than the band" in every channel, which
+a light cyan/blue band still satisfies while being genuinely hard to read
+once its label ends up rendered close to (or, for a biography name and a
+life-phase name, directly on top of) that same band — light-on-mid-blue is
+low contrast even though it is technically "lighter." Every label call site
+(event titles, lane-name gutter tabs, biography names) now uses `theme.text`
+directly — always high-contrast against the dark/light canvas background by
+construction, since it does not depend on the colour it happens to sit near.
+`label_color` and its test are gone entirely; `Theme.dark` went with them,
+since that field's only reader was this function. Which lane something
+belongs to is still conveyed by the marker/band colour and the gutter tab's
+colour chip — just not by tinting the *readable text* any more.
+
+### A new event defaults to nesting inside whatever range event is selected
+
+`TimelineApp::default_parent_event()` (next to the older `default_owner()`)
+returns the current selection's id when it is an `Event` that is itself a
+range — wired into `new_event_dialog()` so the toolbar's generic "+
+Ereignis" (Strg+N) pre-fills the "Verschachtelt in:" field the same way it
+already pre-filled the owner. Without this, selecting "Peloponnesischer
+Krieg" and adding "Archidamischer Krieg" via the generic button produced an
+event that shared its *owner* (correct) but not its *parent* — nesting only
+happens if that separate combo is explicitly set, an easy step to forget,
+and the result silently renders as its own independent event on the
+timeline instead of a sub-segment tethered to the intended parent. The
+dedicated "+ Verschachteltes Ereignis" button next to a range event already
+covered this explicitly; this just extends the same convenience to the
+generic path.
+
+### Semi-transparent label backgrounds bled through into whatever scrolled underneath them
+
+Reported as "an event marker floats disconnected, below the band, inside a notch" — for one specific event (a 5-year range that had collapsed to a point marker), at one specific scroll position, and nowhere else. That specificity was the tell: it wasn't the marker's own position that was wrong (confirmed by loading the user's actual `library.json` into a local build and reproducing pixel-for-pixel — the marker painted exactly on the band, as the code says it should), it was the **lane-name gutter tag** — pinned to the left edge of the viewport regardless of scroll — happening to sit at the same screen position as that marker at that particular scroll offset. The tag's background was `with_alpha(theme.canvas_bg, 215)`, not fully opaque, so the band's colour and the marker's own halo/ring bled through at ~84% strength instead of being cleanly hidden — which reads as a rendering glitch (a ghostly, wrongly-shaped, partially-visible circle) rather than as "oh, the label is just covering that." Fixed by making every label background that can end up overlapping scrolling content fully opaque: the lane-name gutter tag, the biography on-band name, the epoch/life-phase pill, and the origin/merge junction label. `paint_point`'s own background halo (the one *inside* a marker, there to separate it from a same-hued band) was deliberately left semi-transparent — that one blends by design, it isn't a text label with something potentially scrolling underneath it.
+
+**Diagnostic note for next time a "something floats in the wrong place" report comes in**: before assuming the position math is wrong, check whether the described element is a *label with an opaque-looking background* — if the bug only reproduces at one specific pan/zoom and disappears at others with no code change, a fixed-position UI element (gutter tags, the scroll indicator) overlapping scrolled content is a more likely cause than the position calculation itself. Reproducing against the user's actual save file in a local build (drop it at whatever `store::default_path()` resolves to — `%APPDATA%\TimelineExplorer\library.json` when running from a `target/` build, since `portable_dir()` deliberately refuses to treat a cargo build directory as portable) and grabbing a `PrintWindow` capture settled in minutes what several rounds of asking the user to check settings could not.
 
 ### The egui hover-reflow workaround
 

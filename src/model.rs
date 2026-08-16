@@ -226,13 +226,23 @@ impl HDate {
             }
         }
 
-        let (year, month, day) = parse_ymd(&s)?;
+        let (year, month, day, is_period) = parse_ymd(&s)?;
         let year = if era_seen && era_bc {
             -year.abs()
         } else if era_seen {
             year.abs()
         } else {
             year
+        };
+        // A season, quarter or half-year is inherently approximate — a
+        // representative month standing in for a stretch of several real
+        // ones — so it defaults to "circa" the same way typing "um 1789"
+        // would, unless the user already gave an explicit qualifier of
+        // their own (e.g. "vor Sommer 1789"), which is left alone.
+        let qualifier = if is_period && qualifier == DateQualifier::Exact {
+            DateQualifier::Circa
+        } else {
+            qualifier
         };
 
         Some(Self {
@@ -321,8 +331,95 @@ fn month_from_name(s: &str) -> Option<u8> {
     None
 }
 
+/// Quarter/half-year keywords that need an adjacent ordinal fused onto them
+/// before they can be looked up like any other month name — see
+/// `fuse_period_tokens`.
+const PERIOD_KEYWORDS: [&str; 4] = ["quartal", "vierteljahr", "hälfte", "halbjahr"];
+
+/// "1. Quartal", "1.Quartal", "Quartal 1" all become the single token
+/// "quartal1" — normalising the ordinal's position and the stray '.' before
+/// tokenising, so `month_from_period` can treat a quarter/half exactly like
+/// any other month name instead of needing a second parsing path just for
+/// the ordinal.
+fn fuse_period_tokens(s: &str) -> String {
+    let cleaned = s.replace('.', " ");
+    let tokens: Vec<&str> = cleaned.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        if PERIOD_KEYWORDS.contains(&tok) {
+            if let Some(last) = out.last() {
+                if let Ok(n @ 1..=4u8) = last.parse() {
+                    let fused = format!("{tok}{n}");
+                    out.pop();
+                    out.push(fused);
+                    i += 1;
+                    continue;
+                }
+            }
+            if let Some(&next) = tokens.get(i + 1) {
+                if let Ok(n @ 1..=4u8) = next.parse() {
+                    out.push(format!("{tok}{n}"));
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        out.push(tok.to_string());
+        i += 1;
+    }
+    out.join(" ")
+}
+
+/// Recognises a German season name — optionally "früh"/"spät" prefixed for
+/// early/late ("Frühherbst", "Spätsommer") — or a calendar quarter/half-year
+/// (after `fuse_period_tokens` has attached its ordinal, or the "q1".."q4"/
+/// "h1"/"h2" shorthand), and maps it to the month that places it correctly
+/// relative to ordinary months and to its own neighbours. All of these are
+/// inherently approximate — a season or a quarter is months wide — which is
+/// why `HDate::parse` pairs this with `DateQualifier::Circa`.
+fn month_from_period(tok: &str) -> Option<u8> {
+    // (root, early, mid, late)
+    const SEASONS: [(&str, u8, u8, u8); 5] = [
+        ("frühling", 3, 4, 5),
+        ("frühjahr", 3, 4, 5),
+        ("sommer", 6, 7, 8),
+        ("herbst", 9, 10, 11),
+        // Winter straddles the calendar-year boundary (Dec-Feb); rather
+        // than silently rolling "Spätwinter 1789" into 1790, every variant
+        // stays in December of the stated year.
+        ("winter", 12, 12, 12),
+    ];
+    for (root, early, mid, late) in SEASONS {
+        if let Some(rest) = tok.strip_prefix("früh") {
+            if rest == root {
+                return Some(early);
+            }
+        }
+        if let Some(rest) = tok.strip_prefix("spät") {
+            if rest == root {
+                return Some(late);
+            }
+        }
+        if tok == root {
+            return Some(mid);
+        }
+    }
+
+    const PERIODS: [(&str, u8); 18] = [
+        ("quartal1", 2), ("vierteljahr1", 2), ("q1", 2),
+        ("quartal2", 5), ("vierteljahr2", 5), ("q2", 5),
+        ("quartal3", 8), ("vierteljahr3", 8), ("q3", 8),
+        ("quartal4", 11), ("vierteljahr4", 11), ("q4", 11),
+        ("hälfte1", 4), ("halbjahr1", 4), ("h1", 4),
+        ("hälfte2", 10), ("halbjahr2", 10), ("h2", 10),
+    ];
+    PERIODS.iter().find(|(k, _)| *k == tok).map(|(_, m)| *m)
+}
+
 /// Parse the date body once qualifier and era have been stripped.
-fn parse_ymd(s: &str) -> Option<(i32, Option<u8>, Option<u8>)> {
+fn parse_ymd(s: &str) -> Option<(i32, Option<u8>, Option<u8>, bool)> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -338,7 +435,7 @@ fn parse_ymd(s: &str) -> Option<(i32, Option<u8>, Option<u8>)> {
             let year = if negative { -year } else { year };
             let month: u8 = parts[1].parse().ok()?;
             let day = parts.get(2).and_then(|p| p.parse::<u8>().ok());
-            return Some((year, Some(month.clamp(1, 12)), day.map(|d| d.clamp(1, 31))));
+            return Some((year, Some(month.clamp(1, 12)), day.map(|d| d.clamp(1, 31)), false));
         }
     }
 
@@ -352,31 +449,50 @@ fn parse_ymd(s: &str) -> Option<(i32, Option<u8>, Option<u8>)> {
             let year = if negative { -year } else { year };
             if parts.len() == 2 {
                 let month: u8 = parts[0].parse().ok()?;
-                return Some((year, Some(month.clamp(1, 12)), None));
+                return Some((year, Some(month.clamp(1, 12)), None, false));
             }
             let day: u8 = parts[0].parse().ok()?;
             let month: u8 = parts[1].parse().ok()?;
-            return Some((year, Some(month.clamp(1, 12)), Some(day.clamp(1, 31))));
+            return Some((year, Some(month.clamp(1, 12)), Some(day.clamp(1, 31)), false));
         }
     }
 
+    // Quarter/half-year expressions ("1. Quartal 1789") contain a literal
+    // '.' that would otherwise look like the day.month.year separator just
+    // above, so they're normalised — ordinal fused onto the keyword, '.'
+    // turned to a space — before falling into the ordinary token form
+    // below. Harmless to do unconditionally in the sense that it only ever
+    // changes anything when one of these keywords is actually present.
+    let fused;
+    let s: &str = if PERIOD_KEYWORDS.iter().any(|k| s.contains(k)) {
+        fused = fuse_period_tokens(s);
+        &fused
+    } else {
+        s
+    };
+
     // Token form: "14 jul 1789", "jul 14 1789", "jul 14, 1789", "jul 1789",
-    // "1789", "-44". Two passes rather than one: first collect the month (if
-    // any) and every bare number in the order written, *then* decide which
-    // number is the day and which is the year. A single pass that decided
-    // "is this a day?" as each token arrived used to require the month to
-    // still be unseen at that point — which happens to hold for "14 Jul
-    // 1789" but not for "Jul 14, 1789", so month-day-year order silently
-    // mis-parsed (the day fell through into the year, and the real year was
-    // dropped on the floor). Deciding only once every token is in hand
-    // fixes that regardless of which order day and month were written in.
+    // "sommer 1789", "spätherbst 1789", "1789", "-44". Two passes rather
+    // than one: first collect the month (if any) and every bare number in
+    // the order written, *then* decide which number is the day and which is
+    // the year. A single pass that decided "is this a day?" as each token
+    // arrived used to require the month to still be unseen at that point —
+    // which happens to hold for "14 Jul 1789" but not for "Jul 14, 1789", so
+    // month-day-year order silently mis-parsed (the day fell through into
+    // the year, and the real year was dropped on the floor). Deciding only
+    // once every token is in hand fixes that regardless of which order day
+    // and month were written in.
     let tokens: Vec<&str> = s.split_whitespace().collect();
     let mut month: Option<u8> = None;
+    let mut is_period = false;
     let mut numbers: Vec<i32> = Vec::new();
     for tok in tokens {
         let tok = tok.trim_end_matches(',');
         if let Some(m) = month_from_name(tok) {
             month = Some(m);
+        } else if let Some(m) = month_from_period(tok) {
+            month = Some(m);
+            is_period = true;
         } else if let Ok(v) = tok.parse::<i32>() {
             numbers.push(v);
         } else {
@@ -410,7 +526,7 @@ fn parse_ymd(s: &str) -> Option<(i32, Option<u8>, Option<u8>)> {
         }
         _ => return None, // three or more bare numbers isn't a date this understands
     };
-    Some((year, month, day.map(|d| d.clamp(1, 31) as u8)))
+    Some((year, month, day.map(|d| d.clamp(1, 31) as u8), is_period))
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,6 +1491,63 @@ mod tests {
         });
         assert_eq!(HDate::parse("July 1789"), month_year);
         assert_eq!(HDate::parse("1789 July"), month_year);
+    }
+
+    #[test]
+    fn parses_german_seasons_with_early_late_prefixes_in_chronological_order() {
+        // Within one year, each season's early/mid/late variant must land in
+        // a month that keeps the whole sequence in order — a season is
+        // approximate by nature, hence `Circa`.
+        let month_of = |s: &str| HDate::parse(s).map(|d| d.month);
+        let months = [
+            "Frühling 1789",
+            "Sommer 1789",
+            "Herbst 1789",
+            "Spätherbst 1789",
+        ]
+        .map(|s| month_of(s).flatten().unwrap());
+        assert!(months.windows(2).all(|w| w[0] < w[1]), "{months:?} must be strictly increasing");
+
+        assert_eq!(HDate::parse("Frühherbst 1789").unwrap().month, Some(9));
+        assert_eq!(HDate::parse("Herbst 1789").unwrap().month, Some(10));
+        assert_eq!(HDate::parse("Spätherbst 1789").unwrap().month, Some(11));
+        // "Frühjahr" is the other common German word for spring.
+        assert_eq!(HDate::parse("Frühjahr 1789").unwrap().month, HDate::parse("Frühling 1789").unwrap().month);
+
+        assert_eq!(HDate::parse("Sommer 1789").unwrap().qualifier, DateQualifier::Circa);
+        assert_eq!(HDate::parse("Winter 1789").unwrap().year, 1789);
+    }
+
+    #[test]
+    fn an_explicit_qualifier_on_a_season_is_not_overridden_by_the_automatic_circa() {
+        assert_eq!(HDate::parse("vor Sommer 1789").unwrap().qualifier, DateQualifier::Before);
+    }
+
+    #[test]
+    fn parses_quarters_and_halves_in_several_written_forms() {
+        let want_q1 = Some(HDate {
+            month: Some(2),
+            qualifier: DateQualifier::Circa,
+            ..HDate::year(1789)
+        });
+        assert_eq!(HDate::parse("1. Quartal 1789"), want_q1);
+        assert_eq!(HDate::parse("1.Quartal 1789"), want_q1);
+        assert_eq!(HDate::parse("Quartal 1 1789"), want_q1);
+        assert_eq!(HDate::parse("1. Vierteljahr 1789"), want_q1);
+        assert_eq!(HDate::parse("Q1 1789"), want_q1);
+        assert_eq!(HDate::parse("1789 Q1"), want_q1);
+
+        // The four quarters, and both halves, must sort chronologically —
+        // and a half-year's midpoint should fall between its own quarters.
+        let month_of = |s: &str| HDate::parse(s).unwrap().month.unwrap();
+        let q = [1, 2, 3, 4].map(|n| month_of(&format!("Q{n} 1789")));
+        assert!(q.windows(2).all(|w| w[0] < w[1]), "{q:?} must be strictly increasing");
+        let h1 = month_of("1. Hälfte 1789");
+        let h2 = month_of("2. Hälfte 1789");
+        assert!(h1 < h2);
+        assert!(q[0] < h1 && h1 < q[2], "H1 should sit between Q1 and Q3");
+
+        assert_eq!(HDate::parse("2. Halbjahr 1789").unwrap().month, Some(h2));
     }
 
     #[test]

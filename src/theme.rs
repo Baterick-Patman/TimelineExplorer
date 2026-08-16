@@ -9,7 +9,6 @@ use crate::model::{Rgb, IMPORTANCE_MAX, IMPORTANCE_MIN};
 use egui::Color32;
 
 pub struct Theme {
-    pub dark: bool,
     pub canvas_bg: Color32,
     pub lane_stripe: Color32,
     pub grid_minor: Color32,
@@ -25,7 +24,6 @@ impl Theme {
     pub fn new(dark: bool) -> Self {
         if dark {
             Self {
-                dark,
                 canvas_bg: Color32::from_rgb(0x15, 0x17, 0x1c),
                 lane_stripe: Color32::from_rgba_unmultiplied(255, 255, 255, 6),
                 grid_minor: Color32::from_rgba_unmultiplied(255, 255, 255, 12),
@@ -38,7 +36,6 @@ impl Theme {
             }
         } else {
             Self {
-                dark,
                 canvas_bg: Color32::from_rgb(0xfa, 0xfa, 0xf7),
                 lane_stripe: Color32::from_rgba_unmultiplied(0, 0, 0, 8),
                 grid_minor: Color32::from_rgba_unmultiplied(0, 0, 0, 18),
@@ -106,15 +103,6 @@ pub fn shade(c: Color32, amount: f32) -> Color32 {
 
 pub fn with_alpha(c: Color32, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
-}
-
-/// Readable label colour for a band of the given colour.
-pub fn label_color(band: Color32, dark: bool) -> Color32 {
-    if dark {
-        shade(band, 0.45)
-    } else {
-        shade(band, -0.35)
-    }
 }
 
 // --- Importance encoding ----------------------------------------------------
@@ -212,18 +200,6 @@ mod tests {
         assert_eq!(shade(c, 1.0), Color32::WHITE);
     }
 
-    #[test]
-    fn label_colour_contrasts_with_the_background_in_both_themes() {
-        let band = Color32::from_rgb(120, 90, 200);
-        let dark_theme = Theme::new(true);
-        let light_theme = Theme::new(false);
-        let on_dark = label_color(band, true);
-        let on_light = label_color(band, false);
-        // Lighter than the band on dark, darker than the band on light.
-        assert!(on_dark.r() > band.r() && on_dark.b() > band.b());
-        assert!(on_light.r() < band.r() && on_light.b() < band.b());
-        assert!(dark_theme.canvas_bg.r() < light_theme.canvas_bg.r());
-    }
 }
 
 #[cfg(test)]

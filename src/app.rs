@@ -632,9 +632,26 @@ impl TimelineApp {
         }
     }
 
+    /// The event a freshly added event should default to nesting inside,
+    /// based on whatever is selected in the sidebar — selecting a range
+    /// event (e.g. "Peloponnesischer Krieg") and then adding a new one is a
+    /// strong signal it belongs inside it, the same intent the dedicated
+    /// "+ Verschachteltes Ereignis" button already captures explicitly. The
+    /// "Verschachtelt in:" field in the form itself can always override this.
+    pub fn default_parent_event(&self) -> Option<Id> {
+        match self.selection {
+            Some(Selection::Event(id)) => self.doc.event(id).filter(|e| e.span.is_range()).map(|_| id),
+            _ => None,
+        }
+    }
+
     pub fn new_event_dialog(&mut self) {
         match self.default_owner() {
-            Some(owner) => self.dialog = Dialog::Event(EventForm::new(owner)),
+            Some(owner) => {
+                let mut form = EventForm::new(owner);
+                form.parent = self.default_parent_event();
+                self.dialog = Dialog::Event(form);
+            }
             None => self.error("Zuerst einen Zeitstrahl anlegen — Ereignisse brauchen einen Träger."),
         }
     }

@@ -311,56 +311,61 @@ fn event_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut EventForm
         ui.heading(title);
         ui.add_space(8.0);
 
-        ui.horizontal(|ui| {
-            ui.label("Titel:");
-            ui.add(
-                egui::TextEdit::singleline(&mut form.title)
-                    .desired_width(320.0)
-                    .hint_text("z. B. Schlacht bei Pydna"),
-            );
-        });
-        owner_picker(ui, &app.doc, &mut form.owner);
-        // A parent from a different owner is meaningless once the owner
-        // changes — the combo below only ever offers same-owner events.
-        if let Some(pid) = form.parent {
-            if app.doc.event(pid).map(|e| e.owner) != Some(form.owner) {
-                form.parent = None;
-            }
-        }
-        event_parent_combo(ui, &app.doc, form.owner, form.editing, &mut form.parent);
-        ui.add_space(6.0);
-
-        let start = date_field(ui, "Datum:", &mut form.start_text, false);
-        ui.checkbox(&mut form.is_range, "Erstreckt sich über einen Zeitraum");
-        let end = if form.is_range {
-            date_field(ui, "Bis:  ", &mut form.end_text, false)
-        } else {
-            Ok(None)
-        };
-
-        ui.add_space(6.0);
-        importance_picker(ui, &mut form.importance);
-        ui.add_space(6.0);
-        category_picker(ui, &app.doc, &mut form.categories);
-
-        ui.add_space(6.0);
-        ui.label("Notizen:");
-        ui.add(
-            egui::TextEdit::multiline(&mut form.description)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY),
-        );
-
-        let start_ok = start.is_ok();
-        let end_ok = end.is_ok();
+        let scroll_height = (ctx.content_rect().height() - 220.0).clamp(160.0, 620.0);
+        let mut start = Ok(None);
+        let mut end = Ok(None);
         let mut ordering_ok = true;
-        if let (Ok(Some(s)), Ok(Some(e))) = (&start, &end) {
-            if e.decimal_end() < s.decimal() {
-                ordering_ok = false;
-                ui.colored_label(BAD_RED, "das Enddatum liegt vor dem Startdatum");
+
+        egui::ScrollArea::vertical().max_height(scroll_height).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Titel:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.title)
+                        .desired_width(320.0)
+                        .hint_text("z. B. Schlacht bei Pydna"),
+                );
+            });
+            owner_picker(ui, &app.doc, &mut form.owner);
+            // A parent from a different owner is meaningless once the owner
+            // changes — the combo below only ever offers same-owner events.
+            if let Some(pid) = form.parent {
+                if app.doc.event(pid).map(|e| e.owner) != Some(form.owner) {
+                    form.parent = None;
+                }
             }
-        }
-        let can_save = start_ok && end_ok && ordering_ok && !form.title.trim().is_empty();
+            event_parent_combo(ui, &app.doc, form.owner, form.editing, &mut form.parent);
+            ui.add_space(6.0);
+
+            start = date_field(ui, "Datum:", &mut form.start_text, false);
+            ui.checkbox(&mut form.is_range, "Erstreckt sich über einen Zeitraum");
+            end = if form.is_range {
+                date_field(ui, "Bis:  ", &mut form.end_text, false)
+            } else {
+                Ok(None)
+            };
+
+            ui.add_space(6.0);
+            importance_picker(ui, &mut form.importance);
+            ui.add_space(6.0);
+            category_picker(ui, &app.doc, &mut form.categories);
+
+            ui.add_space(6.0);
+            ui.label("Notizen:");
+            ui.add(
+                egui::TextEdit::multiline(&mut form.description)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            );
+
+            if let (Ok(Some(s)), Ok(Some(e))) = (&start, &end) {
+                if e.decimal_end() < s.decimal() {
+                    ordering_ok = false;
+                    ui.colored_label(BAD_RED, "das Enddatum liegt vor dem Startdatum");
+                }
+            }
+        });
+
+        let can_save = start.is_ok() && end.is_ok() && ordering_ok && !form.title.trim().is_empty();
 
         match dialog_buttons(ui, can_save, "Speichern") {
             Some(true) => {
@@ -504,29 +509,32 @@ fn group_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut GroupForm
         ui.weak("Eine Oberkategorie, z. B. \"Europäische Geschichte\" oder \"Griechische Antike\". Einklappen, um ganze Kulturen zu vergleichen; ausklappen, um die enthaltenen Zeitstrahlen zu sehen.");
         ui.add_space(10.0);
 
-        ui.horizontal(|ui| {
-            ui.label("Name:");
+        let scroll_height = (ctx.content_rect().height() - 220.0).clamp(160.0, 620.0);
+        egui::ScrollArea::vertical().max_height(scroll_height).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.name)
+                        .desired_width(280.0)
+                        .hint_text("z. B. Griechische Antike"),
+                );
+                ui.color_edit_button_srgb(&mut form.color);
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("In:");
+                group_combo(ui, &app.doc, "group_parent", &mut form.parent, form.editing);
+            });
+
+            ui.add_space(6.0);
+            ui.label("Notizen:");
             ui.add(
-                egui::TextEdit::singleline(&mut form.name)
-                    .desired_width(280.0)
-                    .hint_text("z. B. Griechische Antike"),
+                egui::TextEdit::multiline(&mut form.notes)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
             );
-            ui.color_edit_button_srgb(&mut form.color);
         });
-
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("In:");
-            group_combo(ui, &app.doc, "group_parent", &mut form.parent, form.editing);
-        });
-
-        ui.add_space(6.0);
-        ui.label("Notizen:");
-        ui.add(
-            egui::TextEdit::multiline(&mut form.notes)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        );
 
         let can_save = !form.name.trim().is_empty();
         match dialog_buttons(ui, can_save, "Speichern") {
@@ -746,166 +754,179 @@ fn timeline_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Timeli
         ui.heading(heading);
         ui.add_space(8.0);
 
-        ui.horizontal(|ui| {
-            ui.label("Name:");
-            ui.add(
-                egui::TextEdit::singleline(&mut form.name)
-                    .desired_width(280.0)
-                    .hint_text("z. B. Römische Republik"),
-            );
-            ui.color_edit_button_srgb(&mut form.color);
-        });
+        // Only the scrollable middle grows with the content — heading above
+        // and Abbrechen/Speichern below always stay on screen, however many
+        // epochs a long-lived culture like "Ägyptische Antike" accumulates.
+        let scroll_height = (ctx.content_rect().height() - 220.0).clamp(160.0, 620.0);
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("In Gruppe:");
-            group_combo(ui, &app.doc, "tl_group", &mut form.group, None);
-        });
-
-        ui.add_space(6.0);
-        ui.checkbox(
-            &mut form.use_span,
-            "Expliziten Zeitraum festlegen (sonst aus den Ereignissen abgeleitet)",
-        );
-        let (start, end) = if form.use_span {
-            (
-                date_field(ui, "Von: ", &mut form.start_text, false),
-                date_field(ui, "Bis: ", &mut form.end_text, true),
-            )
-        } else {
-            (Ok(None), Ok(None))
-        };
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.label(
-            egui::RichText::new("Beziehungen zu anderen Zeitstrahlen")
-                .strong(),
-        );
-        ui.weak("Bänder biegen an diesen Punkten ineinander, statt nur nebeneinander zu verlaufen.");
-        ui.add_space(6.0);
-
-        ui.checkbox(&mut form.origin_on, "Spaltet sich ab von einem anderen Zeitstrahl");
-        let origin_date = if form.origin_on {
-            ui.horizontal(|ui| {
-                timeline_combo(
-                    ui,
-                    &app.doc,
-                    "origin_combo",
-                    "ist der Ursprung",
-                    &mut form.origin_other,
-                    form.editing,
-                );
-            });
-            let d = date_field(ui, "am:  ", &mut form.origin_date, false);
-            ui.horizontal(|ui| {
-                ui.label("Beschriftung:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut form.origin_label)
-                        .desired_width(240.0)
-                        .hint_text("optional, z. B. Diadochenkriege"),
-                );
-            });
-            d
-        } else {
-            Ok(None)
-        };
-
-        ui.add_space(6.0);
-        ui.checkbox(&mut form.merge_on, "Geht auf in einem anderen Zeitstrahl");
-        let merge_date = if form.merge_on {
-            ui.horizontal(|ui| {
-                timeline_combo(
-                    ui,
-                    &app.doc,
-                    "merge_combo",
-                    "nimmt ihn auf",
-                    &mut form.merge_other,
-                    form.editing,
-                );
-            });
-            let d = date_field(ui, "am:  ", &mut form.merge_date, false);
-            ui.horizontal(|ui| {
-                ui.label("Beschriftung:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut form.merge_label)
-                        .desired_width(240.0)
-                        .hint_text("optional, z. B. Schlacht bei Pydna"),
-                );
-            });
-            d
-        } else {
-            Ok(None)
-        };
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.label(egui::RichText::new("Epochen").strong());
-        ui.weak("Epochen entlang dieses Bands farblich kennzeichnen — \"Archaisch\", \"Klassisch\" — ohne es in separate Zeitstrahlen aufzuteilen.");
-        ui.add_space(4.0);
-
-        let mut remove_epoch = None;
+        let mut start = Ok(None);
+        let mut end = Ok(None);
+        let mut origin_date = Ok(None);
+        let mut merge_date = Ok(None);
         let mut epochs_ready = true;
-        for (i, row) in form.epochs.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.color_edit_button_srgb(&mut row.color);
-                ui.add(
-                    egui::TextEdit::singleline(&mut row.name)
-                        .desired_width(110.0)
-                        .hint_text("z. B. Archaisch"),
-                );
-                ui.add(
-                    egui::TextEdit::singleline(&mut row.start_text)
-                        .desired_width(85.0)
-                        .hint_text("Beginn"),
-                );
-                ui.label("–");
-                ui.add(
-                    egui::TextEdit::singleline(&mut row.end_text)
-                        .desired_width(85.0)
-                        .hint_text("Ende"),
-                );
-                if ui.small_button("Löschen").clicked() {
-                    remove_epoch = Some(i);
-                }
-            });
-            let name_ok = !row.name.trim().is_empty();
-            let dates_ok = HDate::parse(&row.start_text).is_some() && HDate::parse(&row.end_text).is_some();
-            if !name_ok || !dates_ok {
-                epochs_ready = false;
-                ui.indent("epoch_err", |ui| {
-                    ui.colored_label(BAD_RED, "braucht einen Namen und zwei gültige Daten");
-                });
-            }
-        }
-        if let Some(i) = remove_epoch {
-            form.epochs.remove(i);
-        }
-        if ui.small_button("+ Epoche").clicked() {
-            let color = form
-                .epochs
-                .last()
-                .map(|e| e.color)
-                .unwrap_or(form.color);
-            form.epochs.push(EpochRow::new(color));
-        }
 
-        ui.add_space(8.0);
-        ui.label("Notizen:");
-        ui.add(
-            egui::TextEdit::multiline(&mut form.notes)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        );
+        egui::ScrollArea::vertical().max_height(scroll_height).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut form.name)
+                        .desired_width(280.0)
+                        .hint_text("z. B. Römische Republik"),
+                );
+                ui.color_edit_button_srgb(&mut form.color);
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("In Gruppe:");
+                group_combo(ui, &app.doc, "tl_group", &mut form.group, None);
+            });
+
+            ui.add_space(6.0);
+            ui.checkbox(
+                &mut form.use_span,
+                "Expliziten Zeitraum festlegen (sonst aus den Ereignissen abgeleitet)",
+            );
+            (start, end) = if form.use_span {
+                (
+                    date_field(ui, "Von: ", &mut form.start_text, false),
+                    date_field(ui, "Bis: ", &mut form.end_text, true),
+                )
+            } else {
+                (Ok(None), Ok(None))
+            };
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Beziehungen zu anderen Zeitstrahlen")
+                    .strong(),
+            );
+            ui.weak("Bänder biegen an diesen Punkten ineinander, statt nur nebeneinander zu verlaufen.");
+            ui.add_space(6.0);
+
+            ui.checkbox(&mut form.origin_on, "Spaltet sich ab von einem anderen Zeitstrahl");
+            origin_date = if form.origin_on {
+                ui.horizontal(|ui| {
+                    timeline_combo(
+                        ui,
+                        &app.doc,
+                        "origin_combo",
+                        "ist der Ursprung",
+                        &mut form.origin_other,
+                        form.editing,
+                    );
+                });
+                let d = date_field(ui, "am:  ", &mut form.origin_date, false);
+                ui.horizontal(|ui| {
+                    ui.label("Beschriftung:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.origin_label)
+                            .desired_width(240.0)
+                            .hint_text("optional, z. B. Diadochenkriege"),
+                    );
+                });
+                d
+            } else {
+                Ok(None)
+            };
+
+            ui.add_space(6.0);
+            ui.checkbox(&mut form.merge_on, "Geht auf in einem anderen Zeitstrahl");
+            merge_date = if form.merge_on {
+                ui.horizontal(|ui| {
+                    timeline_combo(
+                        ui,
+                        &app.doc,
+                        "merge_combo",
+                        "nimmt ihn auf",
+                        &mut form.merge_other,
+                        form.editing,
+                    );
+                });
+                let d = date_field(ui, "am:  ", &mut form.merge_date, false);
+                ui.horizontal(|ui| {
+                    ui.label("Beschriftung:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut form.merge_label)
+                            .desired_width(240.0)
+                            .hint_text("optional, z. B. Schlacht bei Pydna"),
+                    );
+                });
+                d
+            } else {
+                Ok(None)
+            };
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(egui::RichText::new("Epochen").strong());
+            ui.weak("Epochen entlang dieses Bands farblich kennzeichnen — \"Archaisch\", \"Klassisch\" — ohne es in separate Zeitstrahlen aufzuteilen.");
+            ui.add_space(4.0);
+
+            let mut remove_epoch = None;
+            for (i, row) in form.epochs.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgb(&mut row.color);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut row.name)
+                            .desired_width(110.0)
+                            .hint_text("z. B. Archaisch"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut row.start_text)
+                            .desired_width(85.0)
+                            .hint_text("Beginn"),
+                    );
+                    ui.label("–");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut row.end_text)
+                            .desired_width(85.0)
+                            .hint_text("Ende"),
+                    );
+                    if ui.small_button("Löschen").clicked() {
+                        remove_epoch = Some(i);
+                    }
+                });
+                let name_ok = !row.name.trim().is_empty();
+                let dates_ok = HDate::parse(&row.start_text).is_some() && HDate::parse(&row.end_text).is_some();
+                if !name_ok || !dates_ok {
+                    epochs_ready = false;
+                    ui.indent("epoch_err", |ui| {
+                        ui.colored_label(BAD_RED, "braucht einen Namen und zwei gültige Daten");
+                    });
+                }
+            }
+            if let Some(i) = remove_epoch {
+                form.epochs.remove(i);
+            }
+            if ui.small_button("+ Epoche").clicked() {
+                let color = form
+                    .epochs
+                    .last()
+                    .map(|e| e.color)
+                    .unwrap_or(form.color);
+                form.epochs.push(EpochRow::new(color));
+            }
+
+            ui.add_space(8.0);
+            ui.label("Notizen:");
+            ui.add(
+                egui::TextEdit::multiline(&mut form.notes)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
+
+            if form.origin_on && form.origin_other.is_none() {
+                ui.colored_label(BAD_RED, "den Zeitstrahl wählen, von dem es sich abspaltet");
+            }
+            if form.merge_on && form.merge_other.is_none() {
+                ui.colored_label(BAD_RED, "den Zeitstrahl wählen, in den es aufgeht");
+            }
+        });
 
         let origin_ready = !form.origin_on || (form.origin_other.is_some() && origin_date.is_ok());
         let merge_ready = !form.merge_on || (form.merge_other.is_some() && merge_date.is_ok());
-        if form.origin_on && form.origin_other.is_none() {
-            ui.colored_label(BAD_RED, "den Zeitstrahl wählen, von dem es sich abspaltet");
-        }
-        if form.merge_on && form.merge_other.is_none() {
-            ui.colored_label(BAD_RED, "den Zeitstrahl wählen, in den es aufgeht");
-        }
         let can_save = !form.name.trim().is_empty()
             && start.is_ok()
             && end.is_ok()
@@ -1070,141 +1091,148 @@ fn biography_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut Biogr
         ui.heading(heading);
         ui.add_space(8.0);
 
-        ui.horizontal(|ui| {
-            ui.label("Name:");
-            ui.add(
-                egui::TextEdit::singleline(&mut form.name)
-                    .desired_width(300.0)
-                    .hint_text("z. B. Marcus Tullius Cicero"),
-            );
-        });
-
-        ui.horizontal(|ui| {
-            let text = form
-                .timeline
-                .and_then(|id| app.doc.timeline(id))
-                .map(|t| t.name.clone())
-                .unwrap_or_else(|| "— keine —".into());
-            egui::ComboBox::from_id_salt("bio_tl")
-                .selected_text(text)
-                .width(220.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut form.timeline, None, "— keine —");
-                    for t in &app.doc.timelines {
-                        ui.selectable_value(&mut form.timeline, Some(t.id), &t.name);
-                    }
-                });
-            ui.label("Kultur / Zeitstrahl");
-        });
-
-        ui.add_space(6.0);
-        let birth = date_field(ui, "Geboren:", &mut form.birth_text, false);
-        let death = date_field(ui, "Gestorben:", &mut form.death_text, true);
-
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("Anzeigen als:");
-            for d in [BioDisplay::Hidden, BioDisplay::Inline, BioDisplay::Lane] {
-                let enabled = d != BioDisplay::Inline || form.timeline.is_some();
-                let resp = ui.add_enabled(
-                    enabled,
-                    egui::Button::selectable(form.display == d, d.name()),
-                );
-                if resp.clicked() {
-                    form.display = d;
-                }
-                if !enabled {
-                    resp.on_hover_text("Eingebettet braucht eine übergeordnete Kultur");
-                }
-            }
-        });
-        // Inline is meaningless without a parent to nest under.
-        if form.display == BioDisplay::Inline && form.timeline.is_none() {
-            form.display = BioDisplay::Lane;
-        }
-
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut form.own_color, "Eigene Farbe");
-            if form.own_color {
-                ui.color_edit_button_srgb(&mut form.color);
-            } else {
-                ui.weak("übernimmt die Farbe der Kultur");
-            }
-        });
-
-        ui.add_space(6.0);
-        importance_picker(ui, &mut form.importance);
-        ui.add_space(6.0);
-        category_picker(ui, &app.doc, &mut form.categories);
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.label(egui::RichText::new("Lebensphasen").strong());
-        ui.weak("Abschnitte dieses Lebens farblich kennzeichnen — z. B. \"wurde Kaiser\" — wie Epochen bei einem Zeitstrahl.");
-        ui.add_space(4.0);
-
-        let mut remove_phase = None;
+        let scroll_height = (ctx.content_rect().height() - 220.0).clamp(160.0, 620.0);
+        let mut birth = Ok(None);
+        let mut death = Ok(None);
         let mut phases_ready = true;
-        for (i, row) in form.life_phases.iter_mut().enumerate() {
+        let mut ordering_ok = true;
+
+        egui::ScrollArea::vertical().max_height(scroll_height).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.color_edit_button_srgb(&mut row.color);
+                ui.label("Name:");
                 ui.add(
-                    egui::TextEdit::singleline(&mut row.name)
-                        .desired_width(110.0)
-                        .hint_text("z. B. Als Kaiser"),
+                    egui::TextEdit::singleline(&mut form.name)
+                        .desired_width(300.0)
+                        .hint_text("z. B. Marcus Tullius Cicero"),
                 );
-                ui.add(
-                    egui::TextEdit::singleline(&mut row.start_text)
-                        .desired_width(85.0)
-                        .hint_text("Beginn"),
-                );
-                ui.label("–");
-                ui.add(
-                    egui::TextEdit::singleline(&mut row.end_text)
-                        .desired_width(85.0)
-                        .hint_text("Ende"),
-                );
-                if ui.small_button("Löschen").clicked() {
-                    remove_phase = Some(i);
+            });
+
+            ui.horizontal(|ui| {
+                let text = form
+                    .timeline
+                    .and_then(|id| app.doc.timeline(id))
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| "— keine —".into());
+                egui::ComboBox::from_id_salt("bio_tl")
+                    .selected_text(text)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut form.timeline, None, "— keine —");
+                        for t in &app.doc.timelines {
+                            ui.selectable_value(&mut form.timeline, Some(t.id), &t.name);
+                        }
+                    });
+                ui.label("Kultur / Zeitstrahl");
+            });
+
+            ui.add_space(6.0);
+            birth = date_field(ui, "Geboren:", &mut form.birth_text, false);
+            death = date_field(ui, "Gestorben:", &mut form.death_text, true);
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Anzeigen als:");
+                for d in [BioDisplay::Hidden, BioDisplay::Inline, BioDisplay::Lane] {
+                    let enabled = d != BioDisplay::Inline || form.timeline.is_some();
+                    let resp = ui.add_enabled(
+                        enabled,
+                        egui::Button::selectable(form.display == d, d.name()),
+                    );
+                    if resp.clicked() {
+                        form.display = d;
+                    }
+                    if !enabled {
+                        resp.on_hover_text("Eingebettet braucht eine übergeordnete Kultur");
+                    }
                 }
             });
-            let name_ok = !row.name.trim().is_empty();
-            let dates_ok = HDate::parse(&row.start_text).is_some() && HDate::parse(&row.end_text).is_some();
-            if !name_ok || !dates_ok {
-                phases_ready = false;
-                ui.indent("phase_err", |ui| {
-                    ui.colored_label(BAD_RED, "braucht einen Namen und zwei gültige Daten");
+            // Inline is meaningless without a parent to nest under.
+            if form.display == BioDisplay::Inline && form.timeline.is_none() {
+                form.display = BioDisplay::Lane;
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut form.own_color, "Eigene Farbe");
+                if form.own_color {
+                    ui.color_edit_button_srgb(&mut form.color);
+                } else {
+                    ui.weak("übernimmt die Farbe der Kultur");
+                }
+            });
+
+            ui.add_space(6.0);
+            importance_picker(ui, &mut form.importance);
+            ui.add_space(6.0);
+            category_picker(ui, &app.doc, &mut form.categories);
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(egui::RichText::new("Lebensphasen").strong());
+            ui.weak("Abschnitte dieses Lebens farblich kennzeichnen — z. B. \"wurde Kaiser\" — wie Epochen bei einem Zeitstrahl.");
+            ui.add_space(4.0);
+
+            let mut remove_phase = None;
+            for (i, row) in form.life_phases.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.color_edit_button_srgb(&mut row.color);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut row.name)
+                            .desired_width(110.0)
+                            .hint_text("z. B. Als Kaiser"),
+                    );
+                    ui.add(
+                        egui::TextEdit::singleline(&mut row.start_text)
+                            .desired_width(85.0)
+                            .hint_text("Beginn"),
+                    );
+                    ui.label("–");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut row.end_text)
+                            .desired_width(85.0)
+                            .hint_text("Ende"),
+                    );
+                    if ui.small_button("Löschen").clicked() {
+                        remove_phase = Some(i);
+                    }
                 });
+                let name_ok = !row.name.trim().is_empty();
+                let dates_ok = HDate::parse(&row.start_text).is_some() && HDate::parse(&row.end_text).is_some();
+                if !name_ok || !dates_ok {
+                    phases_ready = false;
+                    ui.indent("phase_err", |ui| {
+                        ui.colored_label(BAD_RED, "braucht einen Namen und zwei gültige Daten");
+                    });
+                }
             }
-        }
-        if let Some(i) = remove_phase {
-            form.life_phases.remove(i);
-        }
-        if ui.small_button("+ Lebensphase").clicked() {
-            let color = form
-                .life_phases
-                .last()
-                .map(|e| e.color)
-                .unwrap_or(form.color);
-            form.life_phases.push(EpochRow::new(color));
-        }
-
-        ui.add_space(6.0);
-        ui.label("Notizen:");
-        ui.add(
-            egui::TextEdit::multiline(&mut form.notes)
-                .desired_rows(2)
-                .desired_width(f32::INFINITY),
-        );
-
-        let mut ordering_ok = true;
-        if let (Ok(Some(b)), Ok(Some(d))) = (&birth, &death) {
-            if d.decimal_end() < b.decimal() {
-                ordering_ok = false;
-                ui.colored_label(BAD_RED, "das Sterbedatum liegt vor dem Geburtsdatum");
+            if let Some(i) = remove_phase {
+                form.life_phases.remove(i);
             }
-        }
+            if ui.small_button("+ Lebensphase").clicked() {
+                let color = form
+                    .life_phases
+                    .last()
+                    .map(|e| e.color)
+                    .unwrap_or(form.color);
+                form.life_phases.push(EpochRow::new(color));
+            }
+
+            ui.add_space(6.0);
+            ui.label("Notizen:");
+            ui.add(
+                egui::TextEdit::multiline(&mut form.notes)
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
+
+            if let (Ok(Some(b)), Ok(Some(d))) = (&birth, &death) {
+                if d.decimal_end() < b.decimal() {
+                    ordering_ok = false;
+                    ui.colored_label(BAD_RED, "das Sterbedatum liegt vor dem Geburtsdatum");
+                }
+            }
+        });
+
         let can_save = !form.name.trim().is_empty()
             && birth.is_ok()
             && death.is_ok()
@@ -1392,8 +1420,9 @@ fn category_dialog(app: &mut TimelineApp, ctx: &egui::Context, ed: &mut Category
         ui.add_space(8.0);
 
         let mut actions: Vec<CatAction> = Vec::new();
+        let scroll_height = (ctx.content_rect().height() - 320.0).clamp(160.0, 500.0);
         egui::ScrollArea::vertical()
-            .max_height(300.0)
+            .max_height(scroll_height)
             .show(ui, |ui| {
                 let mut guard = 0usize;
                 category_editor_tree(ui, &app.doc, None, 0, &mut guard, &mut actions);
@@ -1590,8 +1619,9 @@ fn export_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut ExportFo
         ui.add_space(10.0);
         ui.separator();
         ui.label(egui::RichText::new("Zeitstrahlen").strong());
+        let scroll_height = (ctx.content_rect().height() - 420.0).clamp(120.0, 400.0);
         egui::ScrollArea::vertical()
-            .max_height(220.0)
+            .max_height(scroll_height)
             .show(ui, |ui| {
                 let mut guard = 0usize;
                 export_tree(ui, &app.doc, None, 0, &mut guard, &mut form.timelines);
