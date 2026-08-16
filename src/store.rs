@@ -413,4 +413,65 @@ mod tests {
         assert!(doc.events.is_empty());
         fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn a_completely_empty_file_still_loads_as_a_blank_library() {
+        // The strongest possible backward-compatibility canary: every field
+        // on `Document` has a `#[serde(default)]` (or a custom default fn),
+        // so an empty JSON object is a valid, if blank, library. If a future
+        // field is ever added to `Document` *without* one, this test starts
+        // failing immediately — the loud, mechanical alternative to
+        // discovering it later as "my library from before that change won't
+        // open any more."
+        let dir = temp_dir("compat_empty");
+        let path = dir.join("library.json");
+        fs::write(&path, "{}").unwrap();
+        let doc = load(&path).unwrap().unwrap();
+        assert!(doc.groups.is_empty());
+        assert!(doc.timelines.is_empty());
+        assert!(doc.biographies.is_empty());
+        assert!(doc.events.is_empty());
+        assert!(doc.categories.is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_holding_only_each_entitys_original_required_fields_still_loads() {
+        // The same canary as above, one level down: one instance of every
+        // entity type, written with only the fields that were required when
+        // each was first introduced — no colour override, no `visible`
+        // flag, no `epochs`/`life_phases`, no importance, nothing that was
+        // added later as an optional extra. This is what an actual library
+        // someone has been building up since the very first release looks
+        // like; every field added since must keep defaulting sensibly, or
+        // it stops loading for exactly the people who have used this app
+        // the longest.
+        let dir = temp_dir("compat_minimal_entities");
+        let path = dir.join("library.json");
+        fs::write(
+            &path,
+            r#"{
+                "categories": [{"id": 1, "name": "Politik"}],
+                "groups": [{"id": 2, "name": "Antike", "color": [1, 2, 3]}],
+                "timelines": [{"id": 3, "name": "Rom", "color": [4, 5, 6]}],
+                "biographies": [{"id": 4, "name": "Cicero", "birth": {"year": -106}}],
+                "events": [
+                    {"id": 5, "owner": {"Timeline": 3}, "title": "Gründung", "span": {"start": {"year": -753}}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let doc = load(&path).unwrap().unwrap();
+
+        assert_eq!(doc.categories[0].color, [140, 140, 150], "Category.color must default");
+        assert!(doc.groups[0].visible, "Group.visible must default to true");
+        assert!(doc.timelines[0].visible, "Timeline.visible must default to true");
+        assert!(doc.timelines[0].epochs.is_empty(), "Timeline.epochs must default to empty");
+        assert_eq!(doc.biographies[0].importance, 3, "Biography.importance must default");
+        assert!(doc.biographies[0].life_phases.is_empty(), "Biography.life_phases must default to empty");
+        assert_eq!(doc.events[0].importance, 3, "Event.importance must default");
+        assert!(doc.events[0].categories.is_empty(), "Event.categories must default to empty");
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }

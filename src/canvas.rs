@@ -49,7 +49,15 @@ pub fn draw(app: &mut TimelineApp, ui: &mut egui::Ui) {
     // Two passes: plan the lanes, measure how many label rows each one really
     // needs at this zoom, then place them so dense stretches get the room they
     // need instead of silently dropping labels.
-    let plans = plan_lanes(&app.doc, &filters);
+    let mut plans = plan_lanes(&app.doc, &filters);
+    for plan in &mut plans {
+        // Many stacked biographies (a dozen Roman emperors) get unreadable at
+        // a fixed size, so their lanes ease narrower as you zoom out — unless
+        // pinned open (click, or Ctrl+click for several) to stay prominent.
+        if let LaneKind::Biography(id) = plan.kind {
+            plan.thickness = bio_thickness(axis.ppy, app.enlarged_biographies.contains(&id));
+        }
+    }
     let demands =
         measure_lanes(&app.doc, &plans, &axis, &painter, &filters, rect, view_from, view_to);
     let lanes = place_lanes(&plans, &demands, content_top - app.y_offset);
@@ -78,7 +86,10 @@ pub fn draw(app: &mut TimelineApp, ui: &mut egui::Ui) {
             }
             LaneKind::Biography(id) => {
                 if let Some(bio) = app.doc.biography(id) {
-                    paint_biography_band(&clip, &app.doc, bio, lane, &axis, &theme, app.selection);
+                    paint_biography_band(
+                        &clip, &app.doc, bio, lane, &axis, &theme, app.selection, view_from,
+                        view_to, &mut hits,
+                    );
                 }
             }
             LaneKind::Group(id) => {
@@ -96,7 +107,9 @@ pub fn draw(app: &mut TimelineApp, ui: &mut egui::Ui) {
         );
     }
 
-    paint_lane_names(&clip, &lanes, content_rect, &theme, &mut hits);
+    paint_lane_names(
+        &clip, &app.doc, &lanes, content_rect, &axis, view_from, view_to, &theme, &mut hits,
+    );
     paint_ruler(&painter, &axis, rect, &theme);
     paint_scroll_indicator(&painter, content_rect, app, &theme);
 
@@ -226,6 +239,18 @@ fn handle_picking(app: &mut TimelineApp, ui: &egui::Ui, resp: &egui::Response, h
 
     if resp.clicked() {
         app.selection = hit.map(|h| h.sel);
+        if let Some(Selection::Biography(id)) = app.selection {
+            let multi = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            if multi {
+                // Toggle just this one, so several can be pinned open at once.
+                if !app.enlarged_biographies.remove(&id) {
+                    app.enlarged_biographies.insert(id);
+                }
+            } else {
+                app.enlarged_biographies.clear();
+                app.enlarged_biographies.insert(id);
+            }
+        }
     }
     if resp.double_clicked() {
         match hit.map(|h| h.sel) {
@@ -530,6 +555,7 @@ fn epoch_segment_label(
     p.text(center, Align2::CENTER_CENTER, name, font, theme.text);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_biography_band(
     p: &egui::Painter,
     doc: &Document,
@@ -538,6 +564,9 @@ fn paint_biography_band(
     axis: &TimeAxis,
     theme: &Theme,
     selection: Option<Selection>,
+    view_from: f64,
+    view_to: f64,
+    hits: &mut Vec<Hit>,
 ) {
     let span = bio.span();
     let x0 = axis.x(span.t0());
@@ -559,6 +588,26 @@ fn paint_biography_band(
     }
     let corner = CornerRadius::same((h * 0.5) as u8);
     p.rect_filled(r, corner, with_alpha(color, 210));
+
+    // Life phases — "became emperor" — recolour a stretch of the lifeline,
+    // the same idea as a timeline's epochs. The band is flat (biographies
+    // never curve), so unlike `band_color_segments` this needs no per-segment
+    // sampling: each phase is just a straight sub-rect over the base fill.
+    if !bio.life_phases.is_empty() {
+        let seg_from = span.t0().max(view_from);
+        let seg_to = span.t1().min(view_to);
+        if seg_to > seg_from {
+            for (s0, s1, seg_color, name) in color_segments(&bio.life_phases, fill, seg_from, seg_to) {
+                let Some(name) = name else { continue };
+                let seg_rect = Rect::from_min_max(
+                    Pos2::new(axis.x(s0), r.top()),
+                    Pos2::new(axis.x(s1), r.bottom()),
+                );
+                p.rect_filled(seg_rect, 0.0, with_alpha(to_color(seg_color), 210));
+                phase_segment_label(p, seg_rect, name, theme);
+            }
+        }
+    }
     // The culture's own colour as a border, so a fill driven by category
     // (see `Document::bio_colors`) does not hide which culture this person
     // belongs to.
@@ -583,6 +632,34 @@ fn paint_biography_band(
             );
         }
     }
+
+    // Clicking anywhere along the band selects it — previously only the
+    // fixed left-gutter name tab was clickable, which is being replaced by a
+    // name that rides along the band itself (see `paint_lane_names`).
+    hits.push(Hit {
+        rect: r,
+        sel: Selection::Biography(bio.id),
+    });
+}
+
+/// A life phase's name, sat directly on its coloured stretch of the band.
+/// Mirrors `epoch_segment_label`, minus the curve sampling a biography's
+/// flat band never needs.
+fn phase_segment_label(p: &egui::Painter, seg_rect: Rect, name: &str, theme: &Theme) {
+    if name.trim().is_empty() {
+        return;
+    }
+    let center = seg_rect.center();
+    let font = FontId::proportional(10.0);
+    let size = p
+        .layout_no_wrap(name.to_owned(), font.clone(), theme.text)
+        .size();
+    if size.x + 10.0 > seg_rect.width() {
+        return;
+    }
+    let pill = Rect::from_center_size(center, size + Vec2::new(8.0, 3.0));
+    p.rect_filled(pill, CornerRadius::same(3), with_alpha(theme.canvas_bg, 220));
+    p.text(center, Align2::CENTER_CENTER, name, font, theme.text);
 }
 
 // ---------------------------------------------------------------------------
@@ -652,7 +729,7 @@ fn measure_lanes(
             // below the band whether or not text labels are switched on.
             let nested_rows = roots
                 .iter()
-                .filter(|e| e.span.is_range())
+                .filter(|e| e.span.is_range() && !range_collapsed(e, axis.ppy))
                 .map(|e| nested_depth(doc, filters, axis.ppy, e.id, 0))
                 .max()
                 .unwrap_or(0);
@@ -722,7 +799,6 @@ fn paint_lane_events(
             .then(a.span.t0().partial_cmp(&b.span.t0()).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    let band_top = lane.center - lane.thickness * 0.5;
     let max_rows = lane.label_rows.max(1);
     let mut packer = LabelPacker::new();
 
@@ -736,6 +812,10 @@ fn paint_lane_events(
             },
             LaneKind::Biography(_) | LaneKind::Group(_) => lane.center,
         };
+        // The band may be mid-curve (origin/merge transition) at this event's
+        // own date, so the label's anchor has to track the same curved `y` as
+        // the marker rather than the lane's flat resting position.
+        let band_top = y - lane.thickness * 0.5;
         let x = axis.x(t0);
         let alpha = importance_alpha(ev.importance);
         let selected = app.selection == Some(Selection::Event(ev.id));
@@ -748,7 +828,11 @@ fn paint_lane_events(
             .and_then(|c| doc.category(*c))
             .map(|c| to_color(c.color));
 
-        let marker_rect = if ev.span.is_range() {
+        // A range zoomed down to a sliver stops looking like its own bar and
+        // falls back to the same point-style marker an ordinary event gets —
+        // see `range_collapsed` for why.
+        let shown_as_range = ev.span.is_range() && !range_collapsed(ev, axis.ppy);
+        let marker_rect = if shown_as_range {
             paint_range(p, ev, axis, y, lane_color, alpha, ring, selected, theme)
         } else {
             paint_point(p, ev, axis, x, y, lane_color, alpha, ring, selected, theme)
@@ -758,7 +842,7 @@ fn paint_lane_events(
             sel: Selection::Event(ev.id),
         });
 
-        if ev.span.is_range() {
+        if shown_as_range {
             paint_nested_events(
                 p,
                 app,
@@ -780,9 +864,10 @@ fn paint_lane_events(
         }
 
         // Clamping a label into view is right for a range whose bar is on
-        // screen, but for a point event whose marker is off screen it would
-        // park the title at a date it has nothing to do with.
-        let on_screen = if ev.span.is_range() {
+        // screen, but for a point event (or a collapsed range, painted the
+        // same way) whose marker is off screen it would park the title at a
+        // date it has nothing to do with.
+        let on_screen = if shown_as_range {
             axis.x(ev.span.t1()) >= content_rect.left() && x <= content_rect.right()
         } else {
             x >= content_rect.left() && x <= content_rect.right()
@@ -915,20 +1000,27 @@ fn paint_nested_events(
             p.galley(Pos2::new(rect.right() + 3.0, rect.top()), galley, theme.text_dim);
         }
 
-        paint_nested_events(
-            p,
-            app,
-            doc,
-            filters,
-            child,
-            rect,
-            axis,
-            lane_color,
-            lane_bottom_limit,
-            theme,
-            depth + 1,
-            hits,
-        );
+        // Same collapse rule as the top level: a nested range event zoomed
+        // down to a sliver stops offering up its own further sub-detail —
+        // e.g. once "Archidamischer Krieg" itself is too thin to read, its
+        // "429 v. Chr.: Einfall der Spartaner in Attika" sub-event should not
+        // still be drawn in an even tinier row underneath it.
+        if !range_collapsed(child, axis.ppy) {
+            paint_nested_events(
+                p,
+                app,
+                doc,
+                filters,
+                child,
+                rect,
+                axis,
+                lane_color,
+                lane_bottom_limit,
+                theme,
+                depth + 1,
+                hits,
+            );
+        }
     }
 }
 
@@ -1124,16 +1216,31 @@ fn paint_group_lane(
 // ---------------------------------------------------------------------------
 
 /// Sticky names pinned to the left edge, so you always know which band is which
-/// however far along the axis you have panned.
+/// however far along the axis you have panned. Biographies are the
+/// exception — with many of them stacked (a dozen Roman emperors), a
+/// permanent left-side tab per lane gets unreadable, so a person's name
+/// instead rides along their own band and disappears once you have scrolled
+/// past their lifespan; see `paint_biography_name`.
+#[allow(clippy::too_many_arguments)]
 fn paint_lane_names(
     p: &egui::Painter,
+    doc: &Document,
     lanes: &[Lane],
     rect: Rect,
+    axis: &TimeAxis,
+    view_from: f64,
+    view_to: f64,
     theme: &Theme,
     hits: &mut Vec<Hit>,
 ) {
     for lane in lanes {
         if lane.bottom < rect.top() || lane.top > rect.bottom() {
+            continue;
+        }
+        if let LaneKind::Biography(id) = lane.kind {
+            if let Some(bio) = doc.biography(id) {
+                paint_biography_name(p, bio, lane, axis, view_from, view_to, theme, hits);
+            }
             continue;
         }
         let size = if lane.is_nested() { 11.5 } else { 13.5 };
@@ -1165,4 +1272,49 @@ fn paint_lane_names(
             },
         });
     }
+}
+
+/// A biography's name, sat on its own band rather than in a fixed left-side
+/// tab — centred on whatever portion of their life is currently on screen,
+/// so it simply disappears once you have scrolled past it instead of
+/// piling up in a permanent list the way a dozen Roman emperors would.
+#[allow(clippy::too_many_arguments)]
+fn paint_biography_name(
+    p: &egui::Painter,
+    bio: &Biography,
+    lane: &Lane,
+    axis: &TimeAxis,
+    view_from: f64,
+    view_to: f64,
+    theme: &Theme,
+    hits: &mut Vec<Hit>,
+) {
+    let span = bio.span();
+    let from = span.t0().max(view_from);
+    let to = span.t1().min(view_to);
+    if to <= from {
+        return; // Scrolled entirely out of view.
+    }
+    let seg_px = (axis.x(to) - axis.x(from)).max(0.0);
+    let center = Pos2::new(axis.x((from + to) * 0.5), lane.center);
+
+    let size = if lane.is_nested() { 11.5 } else { 13.5 };
+    let color = label_color(to_color(lane.color), theme.dark);
+    let font = FontId::proportional(size);
+    let galley_size = p.layout_no_wrap(bio.name.clone(), font.clone(), color).size();
+    // Too little room to show the name without clipping or overlapping the
+    // band's own edges — better to just leave it off than crowd it in.
+    if galley_size.x + 12.0 > seg_px {
+        return;
+    }
+
+    let pos = Pos2::new(center.x - galley_size.x * 0.5, center.y - galley_size.y * 0.5);
+    let bg = Rect::from_min_size(pos, galley_size).expand2(Vec2::new(6.0, 3.0));
+    p.rect_filled(bg, CornerRadius::same(4), with_alpha(theme.canvas_bg, 215));
+    let galley = p.layout_no_wrap(bio.name.clone(), font, color);
+    p.galley(pos, galley, theme.text);
+    hits.push(Hit {
+        rect: bg,
+        sel: Selection::Biography(bio.id),
+    });
 }

@@ -13,6 +13,29 @@ use std::collections::{BTreeSet, HashMap};
 pub const BAND_THICKNESS: f32 = 16.0;
 /// Thickness of a biography's lifeline.
 pub const BIO_BAND_THICKNESS: f32 = 8.0;
+/// Floor for a biography lane's thickness when fully zoomed out — with many
+/// stacked lifelines (a dozen Roman emperors) something has to give, and
+/// shrinking is preferable to overlapping or paging through a huge list.
+pub const BIO_BAND_THICKNESS_MIN: f32 = 4.0;
+/// Pixels-per-year at or above which a biography lane already has its normal
+/// thickness; below it, thickness eases down toward `BIO_BAND_THICKNESS_MIN`.
+const BIO_ZOOM_REFERENCE_PPY: f64 = 15.0;
+/// A biography pinned open — click, or Ctrl+click to pin several at once —
+/// stays at this thickness regardless of zoom, so it keeps standing out.
+pub const BIO_BAND_THICKNESS_ENLARGED: f32 = 20.0;
+
+/// A biography lane's thickness at the current zoom. Eases down toward a
+/// legible minimum as the view zooms out, so a crowd of biographies does not
+/// turn into an unreadable wall of thin colour; a lane the user has pinned
+/// open (see `TimelineApp::enlarged_biographies`) ignores zoom entirely and
+/// stays large so it can be picked out even from far away.
+pub fn bio_thickness(ppy: f64, enlarged: bool) -> f32 {
+    if enlarged {
+        return BIO_BAND_THICKNESS_ENLARGED;
+    }
+    let t = (ppy / BIO_ZOOM_REFERENCE_PPY).clamp(0.0, 1.0) as f32;
+    BIO_BAND_THICKNESS_MIN + (BIO_BAND_THICKNESS - BIO_BAND_THICKNESS_MIN) * t
+}
 /// Horizontal length, in pixels, of a merge/split curve. Expressed in pixels so
 /// the curve keeps the same shape at every zoom level.
 pub const TRANSITION_PX: f64 = 110.0;
@@ -162,6 +185,26 @@ pub fn event_visible(event: &Event, filters: &Filters, ppy: f64) -> bool {
         return false;
     }
     matches_search(&[&event.title, &event.description], &filters.search)
+}
+
+/// Below this on-screen width, a range event's own span stops being
+/// meaningful to look at.
+pub const RANGE_COLLAPSE_PX: f64 = 18.0;
+
+/// Has this range event zoomed out far enough that it should collapse to a
+/// point (just a marker and its label) instead of painting its own bar?
+///
+/// A years- or decades-long war is worth its own visible span up close, but
+/// once it has shrunk to a sliver a handful of pixels wide, a bar with
+/// nothing legible inside it just adds visual noise; falling back to the
+/// same point-style rendering an ordinary event gets keeps it readable as
+/// "this happened here", with the detail deferred to zooming back in. Nested
+/// events inside a collapsed range are not painted either — there is no bar
+/// left to visually hang them off, and the whole point of collapsing is that
+/// this level of detail is not what the current zoom is for. Always `false`
+/// for a point event, which has no span to collapse.
+pub fn range_collapsed(event: &Event, ppy: f64) -> bool {
+    event.span.is_range() && (event.span.t1() - event.span.t0()) * ppy < RANGE_COLLAPSE_PX
 }
 
 /// Should a biography's lane be drawn at all?
@@ -566,6 +609,29 @@ pub fn suggest_group_order(doc: &Document, parent: Option<Id>) -> Vec<Id> {
     placed
 }
 
+/// Apply `suggest_group_order` at *every* level of the group tree, not just
+/// the top. The "Verbundene Gruppen zusammenrücken" button used to only
+/// tidy top-level siblings — two connected cultures sitting side by side as
+/// subgroups of a shared parent (e.g. "Griechische Antike" and "Griechische
+/// Bronzezeit", both under "Antike") were never touched, since neither one
+/// is a top-level group itself. Recursing into every subgroup's own
+/// siblings fixes that without changing the underlying heuristic at all.
+pub fn tidy_all_group_levels(doc: &mut Document) {
+    tidy_group_level(doc, None);
+}
+
+fn tidy_group_level(doc: &mut Document, parent: Option<Id>) {
+    let order = suggest_group_order(doc, parent);
+    for (i, id) in order.iter().enumerate() {
+        if let Some(g) = doc.group_mut(*id) {
+            g.order = i as u32;
+        }
+    }
+    for child in doc.child_groups(parent).iter().map(|g| g.id).collect::<Vec<_>>() {
+        tidy_group_level(doc, Some(child));
+    }
+}
+
 // --- Band geometry ----------------------------------------------------------
 
 /// The span a timeline's band actually covers, honouring junctions and falling
@@ -752,10 +818,23 @@ pub fn band_polyline(
 /// stale end date — behave the way it reads: "Classical starts in 500 BC"
 /// unambiguously ends the Archaic era there too.
 pub fn band_color_segments(tl: &Timeline, from: f64, to: f64) -> Vec<(f64, f64, Rgb, Option<&str>)> {
+    color_segments(&tl.epochs, tl.color, from, to)
+}
+
+/// Same gap-filling logic as [`band_color_segments`], generalised to any list
+/// of colour-coded sub-ranges and a base colour — reused for a biography's
+/// `life_phases`, which recolour stretches of a lifeline the same way epochs
+/// recolour stretches of a timeline's band.
+pub fn color_segments(
+    epochs: &[Epoch],
+    base_color: Rgb,
+    from: f64,
+    to: f64,
+) -> Vec<(f64, f64, Rgb, Option<&str>)> {
     if to <= from {
         return Vec::new();
     }
-    let mut epochs: Vec<&Epoch> = tl.epochs.iter().collect();
+    let mut epochs: Vec<&Epoch> = epochs.iter().collect();
     epochs.sort_by(|a, b| a.t0().partial_cmp(&b.t0()).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut segments = Vec::new();
@@ -770,13 +849,13 @@ pub fn band_color_segments(tl: &Timeline, from: f64, to: f64) -> Vec<(f64, f64, 
             continue; // Outside the range, or fully swallowed by a neighbour.
         }
         if e0 > cursor {
-            segments.push((cursor, e0, tl.color, None));
+            segments.push((cursor, e0, base_color, None));
         }
         segments.push((e0, e1, e.color, Some(e.name.as_str())));
         cursor = e1;
     }
     if cursor < to {
-        segments.push((cursor, to, tl.color, None));
+        segments.push((cursor, to, base_color, None));
     }
     segments
 }
@@ -1397,10 +1476,43 @@ mod tests {
     }
 
     #[test]
+    fn bio_thickness_eases_from_the_minimum_up_to_the_normal_size_as_you_zoom_in() {
+        assert_eq!(bio_thickness(0.0, false), BIO_BAND_THICKNESS_MIN);
+        assert_eq!(bio_thickness(BIO_ZOOM_REFERENCE_PPY, false), BIO_BAND_THICKNESS);
+        // Zooming in further must not overshoot the normal thickness.
+        assert_eq!(bio_thickness(BIO_ZOOM_REFERENCE_PPY * 10.0, false), BIO_BAND_THICKNESS);
+        let mid = bio_thickness(BIO_ZOOM_REFERENCE_PPY * 0.5, false);
+        assert!(mid > BIO_BAND_THICKNESS_MIN && mid < BIO_BAND_THICKNESS);
+    }
+
+    #[test]
+    fn a_pinned_open_biography_ignores_zoom_entirely() {
+        assert_eq!(bio_thickness(0.0, true), BIO_BAND_THICKNESS_ENLARGED);
+        assert_eq!(bio_thickness(1000.0, true), BIO_BAND_THICKNESS_ENLARGED);
+    }
+
+    #[test]
     fn an_empty_range_produces_no_segments() {
         let tl = timeline_with_epochs(vec![epoch("Archaic", [1, 1, 1], -800, -500)]);
         assert!(band_color_segments(&tl, -300.0, -300.0).is_empty());
         assert!(band_color_segments(&tl, -300.0, -400.0).is_empty());
+    }
+
+    #[test]
+    fn color_segments_works_without_a_timeline_for_biography_life_phases() {
+        // The generalised helper behind `band_color_segments` — a
+        // biography's life phases recolour stretches of its lifeline the
+        // same way, but there is no `Timeline` to hang them off.
+        let phases = vec![epoch("Als Kaiser", [9, 9, 9], -27, -14)];
+        let segs = color_segments(&phases, [5, 5, 5], -63.0, -10.0);
+        assert_eq!(
+            segs,
+            vec![
+                (-63.0, -27.0, [5, 5, 5], None),
+                (-27.0, -13.0, [9, 9, 9], Some("Als Kaiser")),
+                (-13.0, -10.0, [5, 5, 5], None),
+            ]
+        );
     }
 
     // --- Nested events -------------------------------------------------------
@@ -1443,6 +1555,32 @@ mod tests {
         doc.events.push(nested_event(Id(2), Some(Id(1)), 1));
         assert_eq!(nested_depth(&doc, &Filters::default(), 0.1, Id(1), 0), 0);
         assert_eq!(nested_depth(&doc, &Filters::default(), 50.0, Id(1), 0), 1);
+    }
+
+    fn ranged_event(id: Id, start: i32, end: i32) -> Event {
+        Event {
+            id,
+            owner: OwnerRef::Timeline(Id(1)),
+            title: "war".into(),
+            description: String::new(),
+            span: Span::range(HDate::year(start), HDate::year(end)),
+            importance: 3,
+            categories: vec![],
+            parent: None,
+        }
+    }
+
+    #[test]
+    fn a_point_event_never_collapses() {
+        assert!(!range_collapsed(&nested_event(Id(1), None, 3), 0.0001));
+    }
+
+    #[test]
+    fn a_range_collapses_once_its_on_screen_width_drops_below_the_threshold() {
+        // 27 years (the Peloponnesian War, roughly) at these two zoom levels.
+        let war = ranged_event(Id(1), -431, -404);
+        assert!(!range_collapsed(&war, 5.0), "27 years * 5 px/yr = 135px, well above the threshold");
+        assert!(range_collapsed(&war, 0.1), "27 years * 0.1 px/yr = 2.7px, a sliver");
     }
 
     // --- Lanes -------------------------------------------------------------
@@ -1495,6 +1633,7 @@ mod tests {
             categories: vec![],
             importance: 4,
             display: BioDisplay::Inline,
+            life_phases: Vec::new(),
             notes: String::new(),
         });
         let b_lane = doc.new_id();
@@ -1508,6 +1647,7 @@ mod tests {
             categories: vec![],
             importance: 5,
             display: BioDisplay::Lane,
+            life_phases: Vec::new(),
             notes: String::new(),
         });
         let b_hidden = doc.new_id();
@@ -1521,6 +1661,7 @@ mod tests {
             categories: vec![],
             importance: 2,
             display: BioDisplay::Hidden,
+            life_phases: Vec::new(),
             notes: String::new(),
         });
         doc
@@ -1749,6 +1890,86 @@ mod tests {
             })
             .collect();
         assert_eq!(suggest_group_order(&doc, None), ids);
+    }
+
+    #[test]
+    fn tidy_all_group_levels_reaches_into_subgroups_too() {
+        // The reported bug: two connected cultures sitting as *subgroups* of
+        // a shared parent ("Griechische Antike" and "Griechische Bronzezeit"
+        // under "Antike") were never nudged together, because the old
+        // top-level-only tidy only ever looked at `suggest_group_order(doc,
+        // None)` — neither subgroup is a top-level group itself, so nothing
+        // about their connection was visible from the top.
+        let mut doc = Document::default();
+        let antike = doc.new_id();
+        doc.groups.push(Group {
+            id: antike,
+            name: "Antike".into(),
+            color: [0, 0, 0],
+            parent: None,
+            order: 0,
+            collapsed: false,
+            visible: true,
+            notes: String::new(),
+        });
+        let bronze = doc.new_id();
+        let greek = doc.new_id();
+        let unrelated = doc.new_id();
+        // Deliberately ordered so the connected pair starts apart, with an
+        // unrelated subgroup between them.
+        for (i, (id, name)) in [(bronze, "Bronzezeit"), (unrelated, "Unrelated"), (greek, "Griechische Antike")]
+            .into_iter()
+            .enumerate()
+        {
+            doc.groups.push(Group {
+                id,
+                name: name.into(),
+                color: [0, 0, 0],
+                parent: Some(antike),
+                order: i as u32,
+                collapsed: false,
+                visible: true,
+                notes: String::new(),
+            });
+        }
+        let bronze_tl = doc.new_id();
+        let greek_tl = doc.new_id();
+        doc.timelines.push(Timeline {
+            id: bronze_tl,
+            name: "Bronze age culture".into(),
+            color: [0, 0, 0],
+            visible: true,
+            group: Some(bronze),
+            order: 0,
+            span: None,
+            origin: None,
+            merge: Some(Junction { other: greek_tl, date: HDate::year(-1200), label: String::new() }),
+            notes: String::new(),
+            epochs: Vec::new(),
+        });
+        doc.timelines.push(Timeline {
+            id: greek_tl,
+            name: "Greek antiquity".into(),
+            color: [0, 0, 0],
+            visible: true,
+            group: Some(greek),
+            order: 0,
+            span: None,
+            origin: None,
+            merge: None,
+            notes: String::new(),
+            epochs: Vec::new(),
+        });
+
+        tidy_all_group_levels(&mut doc);
+
+        let siblings = doc.child_groups(Some(antike));
+        let pos = |id: Id| siblings.iter().position(|g| g.id == id).unwrap();
+        assert!(
+            (pos(bronze) as i32 - pos(greek) as i32).abs() == 1,
+            "the connected subgroups should end up adjacent, got {:?}",
+            siblings.iter().map(|g| &g.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]

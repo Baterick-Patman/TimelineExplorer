@@ -259,6 +259,7 @@ pub fn build() -> Document {
         categories: cats(&doc, &["Literatur", "Philosophie", "Politik"]),
         importance: 4,
         display: BioDisplay::Inline,
+        life_phases: Vec::new(),
         notes: "Orator, consul, and prolific correspondent.".into(),
     });
 
@@ -277,6 +278,7 @@ pub fn build() -> Document {
         categories: cats(&doc, &["Politik", "Militär", "Literatur"]),
         importance: 5,
         display: BioDisplay::Lane,
+        life_phases: Vec::new(),
         notes: String::new(),
     });
 
@@ -364,6 +366,7 @@ pub fn build() -> Document {
         categories: lit_phil.clone(),
         importance: 4,
         display: BioDisplay::Inline,
+        life_phases: Vec::new(),
         notes: "Tragedian; seven plays survive.".into(),
     });
     let euripides = doc.new_id();
@@ -377,6 +380,7 @@ pub fn build() -> Document {
         categories: literature.clone(),
         importance: 4,
         display: BioDisplay::Inline,
+        life_phases: Vec::new(),
         notes: "Tragedian; his late plays track the war closely.".into(),
     });
 

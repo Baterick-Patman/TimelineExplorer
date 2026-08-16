@@ -148,6 +148,9 @@ pub struct EventColumnMap {
     pub date: usize,
     pub end_date: Option<usize>,
     pub description: Option<usize>,
+    /// Matched against existing categories by name (case-insensitive); a
+    /// name with no existing match becomes a new category.
+    pub category: Option<usize>,
 }
 
 pub struct EventDraft {
@@ -155,6 +158,7 @@ pub struct EventDraft {
     pub start: HDate,
     pub end: Option<HDate>,
     pub description: String,
+    pub category_name: Option<String>,
 }
 
 /// Which detected column feeds which biography field.
@@ -202,7 +206,11 @@ pub fn build_event_drafts(table: &ParsedTable, map: &EventColumnMap) -> (Vec<Eve
         };
         let end = map.end_date.and_then(|idx| HDate::parse(cell(row, idx)));
         let description = map.description.map(|idx| cell(row, idx).trim().to_string()).unwrap_or_default();
-        drafts.push(EventDraft { title, start, end, description });
+        let category_name = map
+            .category
+            .map(|idx| cell(row, idx).trim().to_string())
+            .filter(|s| !s.is_empty());
+        drafts.push(EventDraft { title, start, end, description, category_name });
     }
     (drafts, skipped)
 }
@@ -295,7 +303,7 @@ mod tests {
                 vec!["Death of Augustus".into(), "14".into()],
             ],
         };
-        let map = EventColumnMap { title: 0, date: 1, end_date: None, description: None };
+        let map = EventColumnMap { title: 0, date: 1, end_date: None, description: None, category: None };
         let (drafts, skipped) = build_event_drafts(&table, &map);
         assert_eq!(drafts.len(), 2);
         assert_eq!(drafts[0].title, "Battle of Actium");
@@ -309,7 +317,7 @@ mod tests {
             headers: vec!["Title".into(), "Year".into()],
             rows: vec![vec![String::new(), "14".into()]],
         };
-        let map = EventColumnMap { title: 0, date: 1, end_date: None, description: None };
+        let map = EventColumnMap { title: 0, date: 1, end_date: None, description: None, category: None };
         let (drafts, skipped) = build_event_drafts(&table, &map);
         assert!(drafts.is_empty());
         assert_eq!(skipped.len(), 1);

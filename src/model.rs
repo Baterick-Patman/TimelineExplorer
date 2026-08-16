@@ -360,34 +360,57 @@ fn parse_ymd(s: &str) -> Option<(i32, Option<u8>, Option<u8>)> {
         }
     }
 
-    // Token form: "14 jul 1789", "jul 1789", "1789", "-44"
+    // Token form: "14 jul 1789", "jul 14 1789", "jul 14, 1789", "jul 1789",
+    // "1789", "-44". Two passes rather than one: first collect the month (if
+    // any) and every bare number in the order written, *then* decide which
+    // number is the day and which is the year. A single pass that decided
+    // "is this a day?" as each token arrived used to require the month to
+    // still be unseen at that point — which happens to hold for "14 Jul
+    // 1789" but not for "Jul 14, 1789", so month-day-year order silently
+    // mis-parsed (the day fell through into the year, and the real year was
+    // dropped on the floor). Deciding only once every token is in hand
+    // fixes that regardless of which order day and month were written in.
     let tokens: Vec<&str> = s.split_whitespace().collect();
-    let mut day = None;
-    let mut month = None;
-    let mut year = None;
+    let mut month: Option<u8> = None;
+    let mut numbers: Vec<i32> = Vec::new();
     for tok in tokens {
         let tok = tok.trim_end_matches(',');
         if let Some(m) = month_from_name(tok) {
             month = Some(m);
         } else if let Ok(v) = tok.parse::<i32>() {
-            // A bare number is a day only if it is small and a year is still to come.
-            if (1..=31).contains(&v) && year.is_none() && day.is_none() && month.is_none() {
-                day = Some(v as u8);
-            } else if year.is_none() {
-                year = Some(v);
-            }
+            numbers.push(v);
         } else {
             return None;
         }
     }
-    // "14 1789" without a month name means the 14 was really the year.
-    let year = match (year, day) {
-        (Some(y), _) => y,
-        (None, Some(d)) => d as i32,
-        (None, None) => return None,
+
+    let (year, day) = match numbers.as_slice() {
+        [] => return None,
+        [only] => (*only, None),
+        [x, y] if month.is_some() => {
+            // Whichever of the two looks like a day (1..=31) is the day,
+            // the other the year, regardless of which was written first.
+            // If both or neither look like a day, assume day-first — by
+            // far the more common shape for a genuinely ambiguous pair.
+            let x_is_day = (1..=31).contains(x);
+            let y_is_day = (1..=31).contains(y);
+            if y_is_day && !x_is_day {
+                (*x, Some(*y))
+            } else {
+                (*y, Some(*x))
+            }
+        }
+        [x, y] => {
+            // No month at all: a "day" means nothing without one, so
+            // whichever number does *not* look like a day is more likely
+            // the real year — "14 1789" and "1789 14" both read as 1789.
+            let x_is_day = (1..=31).contains(x);
+            let y_is_day = (1..=31).contains(y);
+            (if x_is_day && !y_is_day { *y } else { *x }, None)
+        }
+        _ => return None, // three or more bare numbers isn't a date this understands
     };
-    let day = if month.is_some() { day } else { None };
-    Some((year, month, day))
+    Some((year, month, day.map(|d| d.clamp(1, 31) as u8)))
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +662,11 @@ pub struct Biography {
     pub importance: u8,
     #[serde(default)]
     pub display: BioDisplay,
+    /// Colour-coded sub-ranges within this life — "became emperor" — same
+    /// idea as a timeline's `epochs`, just anchored to a person instead of a
+    /// culture.
+    #[serde(default)]
+    pub life_phases: Vec<Epoch>,
     #[serde(default)]
     pub notes: String,
 }
@@ -1324,6 +1352,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_spelled_out_months_in_either_day_month_or_month_day_order() {
+        // "Month Day, Year" (English/Wikipedia style) used to silently
+        // mis-parse: the day fell into `year`, and the real year was
+        // dropped, because the day/month/year token loop only recognised a
+        // bare number as a day if the month had not been seen yet.
+        let want = Some(HDate {
+            month: Some(7),
+            day: Some(14),
+            ..HDate::year(1789)
+        });
+        assert_eq!(HDate::parse("14 July 1789"), want, "day month year");
+        assert_eq!(HDate::parse("July 14 1789"), want, "month day year");
+        assert_eq!(HDate::parse("July 14, 1789"), want, "month day, year (comma)");
+        assert_eq!(HDate::parse("14 Jul 1789"), want, "abbreviated month still works");
+
+        // Month + year only, either order, no day.
+        let month_year = Some(HDate {
+            month: Some(7),
+            day: None,
+            ..HDate::year(1789)
+        });
+        assert_eq!(HDate::parse("July 1789"), month_year);
+        assert_eq!(HDate::parse("1789 July"), month_year);
+    }
+
+    #[test]
     fn rejects_nonsense_rather_than_inventing_a_date() {
         assert_eq!(HDate::parse(""), None);
         assert_eq!(HDate::parse("the ides of march"), None);
@@ -1402,6 +1456,7 @@ mod tests {
             categories: vec![],
             importance: 3,
             display: BioDisplay::Inline,
+            life_phases: Vec::new(),
             notes: String::new(),
         });
 
@@ -1597,6 +1652,7 @@ mod tests {
             categories,
             importance: 3,
             display: BioDisplay::Lane,
+            life_phases: Vec::new(),
             notes: String::new(),
         }
     }

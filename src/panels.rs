@@ -17,7 +17,7 @@ enum Action {
     ToggleCollapsed(Id),
     Move(Id, i32),
     MoveGroup(Id, i32),
-    TidyTopLevelGroups,
+    TidyGroups,
     SetDisplay(Id, BioDisplay),
     AddEventTo(OwnerRef),
     AddNestedEventTo(OwnerRef, Id),
@@ -77,14 +77,7 @@ fn apply(app: &mut TimelineApp, a: Action) {
         }),
         Action::Move(id, delta) => app.mutate(|doc| reorder(doc, id, delta)),
         Action::MoveGroup(id, delta) => app.mutate(|doc| reorder_group(doc, id, delta)),
-        Action::TidyTopLevelGroups => app.mutate(|doc| {
-            let order = layout::suggest_group_order(doc, None);
-            for (i, id) in order.iter().enumerate() {
-                if let Some(g) = doc.group_mut(*id) {
-                    g.order = i as u32;
-                }
-            }
-        }),
+        Action::TidyGroups => app.mutate(layout::tidy_all_group_levels),
         Action::SetDisplay(id, d) => app.mutate(|doc| {
             if let Some(b) = doc.biography_mut(id) {
                 b.display = d;
@@ -364,12 +357,12 @@ fn timelines_section(
                 .small_button("Verbundene Gruppen zusammenrücken")
                 .on_hover_text(
                     "Gruppen mit \"Spaltet sich ab von\"/\"Geht auf in\"-Verbindungen zueinander \
-                     nebeneinander anordnen (oberste Ebene) — bestmöglich, kein Garant gegen jede \
-                     Überschneidung.",
+                     nebeneinander anordnen — auf jeder Ebene der Gruppenhierarchie, bestmöglich, \
+                     kein Garant gegen jede Überschneidung.",
                 )
                 .clicked()
         {
-            actions.push(Action::TidyTopLevelGroups);
+            actions.push(Action::TidyGroups);
         }
     });
 }

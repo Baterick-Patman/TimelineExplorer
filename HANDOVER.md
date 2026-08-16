@@ -48,8 +48,42 @@ events or biographies from a pasted table or a URL — the one place in the
 app that now touches the network, and only when the user explicitly asks it
 to.
 
-- **~10,700 lines** of Rust across 13 files in `src/`.
-- **138 tests**, all passing, no compiler warnings.
+Latest batch, driven by hands-on use of the import feature and a crowded
+biography lane (many Roman emperors): the import dialog is now scrollable
+on a small screen (only the middle content scrolls, the Abbrechen/Importieren
+buttons stay outside it and always reachable); `HDate::parse` accepts a
+spelled-out month in either order (`"14 July 1789"` / `"July 14, 1789"`) —
+a real pre-existing bug, not just a missing feature, since the old parser
+silently mis-parsed that order; import gained a "Kategorie für alle" bulk
+category (Events and Biographies both), layered on top of — not replacing —
+any per-row column-mapped category; a real bug fix where an event's label
+and leader line stayed anchored to a lane's flat resting position instead of
+following the band's curve near an origin/merge transition (see below); the
+"+" toolbar buttons now default a new group/timeline's parent group, or a
+new biography's timeline, to whatever is currently selected in the sidebar;
+and a biography-rendering overhaul — see below — covering on-band names,
+epoch-style life-phase colouring, and zoom-responsive lane thickness with a
+click-to-pin-open mechanism.
+
+One more small batch on top of that: the "Verbundene Gruppen zusammenrücken"
+tidy button turned out to only ever reorder *top-level* groups — connected
+cultures sitting as subgroups of a shared parent (the far more common case,
+e.g. two Greek-antiquity cultures both nested under "Antike") were silently
+never touched, since `suggest_group_order(doc, None)` alone has no way to see
+into a subgroup's own sibling list. Fixed by recursing the same heuristic
+into every level (`layout::tidy_all_group_levels`). Also: nested/range events
+now collapse to a plain point-and-label once their own span has zoomed down
+to a sliver (`layout::range_collapsed`), so a years-long war does not sit
+there as an unreadable pixel-wide bar with its own sub-phases crammed
+underneath — see below; and table import can now target an existing range
+event directly (`ImportForm::nest_under`), so a table of a war's phases can
+be imported straight into that war's own event instead of the timeline's top
+level.
+
+- **~12,150 lines** of Rust across 14 files in `src/`.
+- **145 tests**, all passing, no compiler warnings (5 pre-existing clippy
+  style lints — `derivable_impls`, `collapsible_if`,
+  `field_reassign_with_default` — left as-is, not regressions).
 - Release binary: `target/release/timeline_explorer.exe`, single file, ~9 MB
   (image encoding, `ureq`+`rustls` for the optional URL fetch, and
   `scraper`+`html5ever` for HTML table parsing account for the growth from
@@ -265,16 +299,18 @@ Rough dependency order — `model` and `layout` are the load-bearing parts.
 
 | File | Lines | What it owns |
 | --- | --- | --- |
-| `model.rs` | 1172 | Data model + serde. Dates, spans, timelines, groups, biographies, events, categories, filters. **No UI, no geometry.** |
-| `layout.rs` | 1493 | Time axis, tick steps, visibility rules, lane planning/placement, band curves, label packing. **No painting** — that's why it holds 46 of the 92 tests. |
-| `store.rs` | 349 | Load/save, atomic replace, rotating backups. |
-| `theme.rs` | 304 | Palette, importance→size/opacity encoding, egui `Visuals` override. |
-| `canvas.rs` | 887 | All painting of the timeline surface + canvas input handling. |
-| `panels.rs` | 712 | Sidebar (group tree, biographies, filters) and inspector. |
-| `forms.rs` | 1262 | Modal editors for group/timeline/biography/event/categories. |
-| `app.rs` | 852 | `TimelineApp` state, undo/redo, autosave, menus, keyboard shortcuts, top-level layout. |
-| `example.rs` | 592 | The optional worked example dataset. |
-| `main.rs` | 39 | Entry point, window options. |
+| `model.rs` | 1724 | Data model + serde. Dates, spans, timelines, groups, biographies, events, categories, filters. **No UI, no geometry.** |
+| `layout.rs` | 2091 | Time axis, tick steps, visibility rules, lane planning/placement, band curves, label packing. **No painting** — that's why it holds the largest share of the tests. |
+| `forms.rs` | 2206 | Modal editors for group/timeline/biography/event/categories/export/import. |
+| `app.rs` | 1328 | `TimelineApp` state, undo/redo, autosave, menus, keyboard shortcuts, top-level layout. |
+| `canvas.rs` | 1308 | All painting of the timeline surface + canvas input handling. |
+| `panels.rs` | 1262 | Sidebar (group tree, biographies, filters) and inspector. |
+| `example.rs` | 604 | The optional worked example dataset. |
+| `store.rs` | 416 | Load/save, atomic replace, rotating backups. |
+| `export.rs` | 410 | PNG/PDF export by driving the real canvas painter and capturing a screenshot. |
+| `theme.rs` | 353 | Palette, importance→size/opacity encoding, egui `Visuals` override. |
+| `import.rs` | 345 | Bulk import: table parsing, HTML table extraction, column-guessing, lenient draft-building. The only file with network code (`fetch_url`, opt-in). |
+| `main.rs` | 44 | Entry point, window options. |
 
 ### The layering rule worth preserving
 
@@ -527,6 +563,133 @@ import — `import::build_event_drafts`/`build_biography_drafts` return
 how many rows landed and why any others didn't, rather than an all-or-nothing
 "table wasn't quite right, so nothing happened."
 
+### An event's label used to be anchored to the lane's flat resting position, not the curve
+
+`paint_lane_events` (canvas.rs) computes each event's marker at a genuinely
+curve-aware `y` — `band_center_at(tl, ...)` at that event's own date, correct
+even mid-transition on an origin/merge curve. But the label above it, and the
+leader line tying the two together, used to be anchored to `band_top`, a
+value computed **once per lane, outside the event loop**, from the lane's
+flat resting centre (`lane.center - thickness * 0.5`). Near a curve, the
+marker would sit at the curved position while its label and leader line
+stayed pinned to where the band would be if it weren't curving — reported as
+an event "floating in empty space, not holding onto the timeline." Fixed by
+computing `band_top` **inside** the loop, from each event's own curve-aware
+`y` (`y - lane.thickness * 0.5`), instead of once from `lane.center`. If you
+touch label placement in that function again, make sure whatever anchors a
+label is derived from that same per-event `y`, not from `lane.center`
+directly — `lane.center` is only correct where the band happens to be flat.
+
+### Biography rendering: on-band names, epoch-style life phases, zoom-responsive width
+
+A biography lane used to work exactly like a timeline lane: a name pinned in
+a fixed left-side gutter tab (`paint_lane_names`), fixed thickness
+(`BIO_BAND_THICKNESS`). That falls apart once there are a dozen of them
+stacked (a dynasty of Roman emperors) — three related changes address it,
+all scoped to `LaneKind::Biography` only; timelines and groups keep the
+original gutter-tab behaviour:
+
+- **Name rides the band, not a fixed gutter.** `paint_lane_names` now
+  special-cases `LaneKind::Biography` and delegates to
+  `canvas::paint_biography_name`, which centres the name on whatever portion
+  of the person's lifespan is currently on screen (clip `span` against
+  `view_from`/`view_to`, bail out if the clipped range is empty or too
+  narrow for the text) — so it naturally disappears once you scroll past
+  someone instead of piling up in a permanent list. This runs in the same
+  painting pass as before (after events, so it stays on top), just at a
+  different position.
+- **Life phases** (`Biography.life_phases: Vec<Epoch>`) reuse the *exact*
+  `Epoch` type a timeline's `epochs` already used — same fields, same
+  gap-filling logic. `layout::band_color_segments` (timeline-specific,
+  curve-aware) was split into a thin wrapper plus a new generic
+  `layout::color_segments(epochs, base_color, from, to)` that needs no
+  `Timeline` at all; `canvas::paint_biography_band` calls it directly since a
+  biography's band is flat and needs no curve sampling. The Biography form
+  gained its own epoch-style editor (`BiographyForm::life_phases: Vec<EpochRow>`),
+  a close copy of the Timeline form's epoch editor.
+- **Zoom-responsive thickness + pin-open.** `layout::bio_thickness(ppy,
+  enlarged)` eases a biography lane's thickness from `BIO_BAND_THICKNESS_MIN`
+  (zoomed out) up to the normal `BIO_BAND_THICKNESS` (at/above
+  `BIO_ZOOM_REFERENCE_PPY`) — applied by mutating `LanePlan.thickness` for
+  Biography lanes right after `plan_lanes()` returns in `canvas::draw()`,
+  deliberately **not** by changing `plan_lanes`'s signature, to avoid
+  touching its half-dozen existing test call sites. Clicking a biography (its
+  band or its name — both push the same `Hit`) pins it at
+  `BIO_BAND_THICKNESS_ENLARGED` regardless of zoom via
+  `TimelineApp::enlarged_biographies: BTreeSet<Id>`; Ctrl+click toggles that
+  one biography in/out of the set without clearing the others, a plain click
+  clears the set and pins just the one clicked. This set is session-only
+  view state (like `y_offset`/`timeline_search`), not part of `Document`.
+- Clicking anywhere along a biography's band now selects it, not just its
+  name label — `paint_biography_band` pushes its own `Hit` for the whole
+  band rect. Previously the gutter name tab was the *only* way to
+  click-select a biography or a timeline; that hit-testing gap still exists
+  for timelines/groups, just not for biographies any more.
+
+### New-item forms default their parent to the current sidebar selection
+
+`TimelineApp::default_group()` / `default_timeline_for_biography()` (mirroring
+the older `default_owner()` used for new events) inspect `self.selection` and
+return what a fresh group/timeline/biography should default to: a selected
+`Group` becomes the default parent group; a selected `Timeline` contributes
+its own `.group` (for a new group/timeline) or itself (for a new biography);
+a selected `Biography` contributes its own `.timeline`. Wired into the
+toolbar's "+ Gruppe"/"+ Zeitstrahl"/"+ Biografie" buttons only — the
+sidebar's own contextual "+ subgroup" action (`Action::NewGroupUnder`)
+already threaded its parent through explicitly and needed no change.
+
+### A range event zoomed to a sliver collapses to a point, and so do its nested children
+
+`layout::range_collapsed(event, ppy)` — `true` once a range event's own
+on-screen width (`(t1 - t0) * ppy`) drops below `RANGE_COLLAPSE_PX` (18px).
+`canvas::paint_lane_events` uses it to decide, per event, whether to paint
+the elaborate `paint_range` bar (rounded caps, ticks, room for nested rows
+underneath) or fall back to the plain `paint_point` marker every ordinary
+event gets — and, critically, whether to descend into `paint_nested_events`
+at all. A years-long war is worth its own visible bar up close; zoomed out
+far enough that the bar would be a couple of pixels wide, showing it (and
+its own sub-phases, in even tinier rows) adds noise instead of clarity, so
+it instead reads exactly like any other single event: a marker and a label.
+`canvas::measure_lanes`'s nested-row reservation uses the same check, so a
+lane does not keep reserving vertical space for sub-rows nobody is going to
+see. The same collapse check also gates the *recursive* call inside
+`paint_nested_events` — a nested range event (e.g. "Archidamischer Krieg"
+inside "Peloponnesischer Krieg") stops offering up its own further
+sub-detail once **it** has zoomed down far enough, independent of whatever
+its parent is doing. This is orthogonal to the existing zoom-dependent
+*importance* threshold (`event_visible`) that already hides low-importance
+events entirely at low zoom — that one is about "is this worth showing at
+all," this one is about "is this specific bar's own duration still legible."
+
+### Table import can nest straight into an existing event, not just onto a timeline's top level
+
+`ImportForm::nest_under: Option<Id>` — when importing Events, an optional
+combo (reusing `event_parent_combo`, the same widget the single-event form
+uses, with `editing: None` since these are all brand-new events) lets the
+user pick an existing **range** event on the chosen timeline; every imported
+row then gets `parent: nest_under` instead of `parent: None`. This is what
+makes "import a table of a war's phases straight into that war's own event"
+possible instead of always dropping everything at the timeline's top level.
+Changing the timeline selection resets `nest_under` — the combo's own
+`selected_text` looks the chosen event up by id regardless of which
+timeline is currently selected, so leaving it set across a timeline switch
+would silently show a stale, unrelated event's name.
+
+### The group tidy heuristic has to be applied at every level, not just the top
+
+`suggest_group_order(doc, parent)` (see the entry on group ordering above)
+was always general — it takes a `parent` and only reorders siblings that
+share it — but the sidebar button wired it to `suggest_group_order(doc,
+None)` alone, i.e. top-level groups only. Two connected cultures sitting as
+*subgroups* of a shared parent (a far more typical arrangement than two
+unrelated top-level groups) were therefore never nudged together — reported
+as "the tidy button doesn't work." `layout::tidy_all_group_levels` fixes
+this by recursing the same call down through every subgroup's own sibling
+list, top to bottom. No change to the underlying heuristic itself, and
+`panels.rs`'s `Action::TidyGroups` now just calls it directly
+(`app.mutate(layout::tidy_all_group_levels)`) rather than inlining the
+top-level-only version.
+
 ### The egui hover-reflow workaround
 
 `theme::visuals()` normalises `bg_stroke.width` across all interactive widget
@@ -561,17 +724,50 @@ Loading tolerates a UTF-8 BOM, because Notepad writes one and the file is
 advertised as user-editable. A file that fails to parse is **never** overwritten;
 the app starts empty and says so in the status bar.
 
+### The backward-compatibility rule, and how it's enforced so it can't quietly rot
+
+**Every field added to `Document` or anything it contains (`Group`,
+`Timeline`, `Biography`, `Event`, `Category`, `Epoch`, `Junction`, `Filters`,
+`SavedView`, …) must carry `#[serde(default)]` or `#[serde(default =
+"fn_name")]`.** This is the entire backward-compatibility strategy for this
+app — there is no version-gated migration system, and `Document.version`
+(currently always `1`) is written but never read; the real guarantee is
+"the schema only ever grows, and every growth is optional." A user who has
+been running this app since the very first release must be able to open
+their current `library.json` — and every rotating backup they've ever
+made — with next month's build, indefinitely, with no manual migration
+step.
+
+This is checked by two tests in `store::tests`, not just asserted in prose:
+
+- `a_completely_empty_file_still_loads_as_a_blank_library` — loads a bare
+  `{}` and expects a valid, blank `Document`. This is the strongest form of
+  the check: it only passes if *every* field on `Document` itself has a
+  default, so it fails immediately if a future one doesn't.
+- `a_file_holding_only_each_entitys_original_required_fields_still_loads` —
+  one instance of every entity type, written with only the fields each one
+  had at its very first introduction (no colour override, no `visible`, no
+  `epochs`/`life_phases`, no importance, …), and asserts the now-optional
+  fields fill in with sensible defaults.
+
+**If you add a field to any of these types, extend the second test to
+include it** (or add a new one alongside it) rather than treating "the
+existing tests still pass" as sufficient — a field that already defaults
+correctly today does not prove a *sibling* new field does too. Losing sight
+of this rule is exactly the kind of mistake that would only surface as "the
+app stopped opening my file" for someone who has invested real time in
+their library, with no error message pointing at the cause.
+
 ---
 
 ## 6. Testing approach
 
-All 92 tests are pure logic and run in ~0.2s without opening a window.
-
-- `layout` (46) — axis maths, zoom clamping, tick steps, filters, lane stacking,
-  band convergence geometry, dormant lanes, label packing.
-- `example` (11) — the sample dataset is checked for referential integrity, id
-  uniqueness, and that its dates are historically coherent.
-- `model` (9), `store` (9), `theme` (7), `forms` (5), `panels` (5).
+All 142 tests are pure logic and run in well under a second without opening a
+window — `layout` and `model` hold the largest share (axis maths, zoom
+clamping, tick steps, filters, lane stacking, band convergence geometry,
+dormant lanes, label packing, date parsing, colour-segment gap-filling), with
+the rest spread across `example` (dataset referential integrity), `store`,
+`theme`, `forms`, `panels`, `import`, and `app`.
 
 **Rendering is verified by screenshot, not by test.** During development the app
 was captured with `PrintWindow` (Win32, flag `PW_RENDERFULLCONTENT = 2`), which

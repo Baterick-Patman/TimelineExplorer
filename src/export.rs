@@ -295,6 +295,7 @@ mod tests {
             categories: vec![],
             importance: 3,
             display: BioDisplay::Lane,
+            life_phases: Vec::new(),
             notes: String::new(),
         });
         id

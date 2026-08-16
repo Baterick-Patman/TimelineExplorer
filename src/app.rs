@@ -176,6 +176,11 @@ pub struct TimelineApp {
     pub bio_search: String,
     pub bio_group_by: BioGroupBy,
 
+    /// Biographies pinned open at their enlarged size regardless of zoom —
+    /// click a biography's band to pin just it, Ctrl+click to pin several at
+    /// once. A view convenience, so it lives here rather than in `Document`.
+    pub enlarged_biographies: std::collections::BTreeSet<Id>,
+
     /// An export in progress — see `export.rs`. While `Some`, the normal
     /// panel layout is replaced with just the canvas so the screenshot it
     /// eventually takes contains nothing else.
@@ -222,6 +227,7 @@ impl TimelineApp {
             timeline_search: String::new(),
             bio_search: String::new(),
             bio_group_by: BioGroupBy::default(),
+            enlarged_biographies: std::collections::BTreeSet::new(),
             export_job: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -633,6 +639,28 @@ impl TimelineApp {
         }
     }
 
+    /// The group a freshly added group or timeline should default to nesting
+    /// under, based on whatever is selected in the sidebar — so picking
+    /// "Römische Antike" and then "+ Zeitstrahl" already has that group
+    /// chosen instead of defaulting to "keine".
+    pub fn default_group(&self) -> Option<Id> {
+        match self.selection {
+            Some(Selection::Group(id)) if self.doc.group(id).is_some() => Some(id),
+            Some(Selection::Timeline(id)) => self.doc.timeline(id).and_then(|t| t.group),
+            _ => None,
+        }
+    }
+
+    /// The timeline a freshly added biography should default to, based on
+    /// whatever is selected in the sidebar.
+    pub fn default_timeline_for_biography(&self) -> Option<Id> {
+        match self.selection {
+            Some(Selection::Timeline(id)) if self.doc.timeline(id).is_some() => Some(id),
+            Some(Selection::Biography(id)) => self.doc.biography(id).and_then(|b| b.timeline),
+            _ => self.doc.timelines.first().map(|t| t.id),
+        }
+    }
+
     // --- Confirmation -----------------------------------------------------
 
     fn apply_confirm(&mut self, c: Confirm) {
@@ -904,14 +932,17 @@ impl TimelineApp {
                 self.new_event_dialog();
             }
             if ui.button("+ Gruppe").clicked() {
-                self.dialog = Dialog::Group(GroupForm::new(self.doc.next_palette_color()));
+                let mut form = GroupForm::new(self.doc.next_palette_color());
+                form.parent = self.default_group();
+                self.dialog = Dialog::Group(form);
             }
             if ui.button("+ Zeitstrahl").clicked() {
-                self.dialog = Dialog::Timeline(TimelineForm::new(self.doc.next_palette_color()));
+                let mut form = TimelineForm::new(self.doc.next_palette_color());
+                form.group = self.default_group();
+                self.dialog = Dialog::Timeline(form);
             }
             if ui.button("+ Biografie").clicked() {
-                let default_tl = self.doc.timelines.first().map(|t| t.id);
-                self.dialog = Dialog::Biography(BiographyForm::new(default_tl));
+                self.dialog = Dialog::Biography(BiographyForm::new(self.default_timeline_for_biography()));
             }
         });
 
@@ -1263,6 +1294,7 @@ mod tests {
             categories: vec![],
             importance: 4,
             display: BioDisplay::Hidden,
+            life_phases: Vec::new(),
             notes: String::new(),
         });
 
@@ -1287,6 +1319,7 @@ mod tests {
             categories: vec![],
             importance: 3,
             display: BioDisplay::Lane,
+            life_phases: Vec::new(),
             notes: String::new(),
         });
         reveal_jump_target(&mut doc, JumpTarget::Biography(bio));
