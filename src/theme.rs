@@ -107,18 +107,33 @@ pub fn with_alpha(c: Color32, a: u8) -> Color32 {
 
 // --- Importance encoding ----------------------------------------------------
 
-/// Font size for an entry of the given significance.
+/// Below this zoom, event labels sit at their plain per-importance size;
+/// above it, they grow toward a capped maximum. Without this, a "Detail"
+/// (importance 1) event's title stayed stuck at its smallest, barely
+/// legible size even at the app's maximum zoom, since font size was
+/// otherwise driven by importance alone.
+const LABEL_ZOOM_GROWTH_START_PPY: f64 = 15.0;
+const LABEL_ZOOM_GROWTH_END_PPY: f64 = 150.0;
+const LABEL_ZOOM_GROWTH_MAX_PX: f32 = 4.0;
+
+/// Font size for an entry of the given significance, at the given zoom.
 ///
-/// The spread is deliberately wide: this is the channel the user asked for to
-/// tell major events from footnotes at a glance.
-pub fn label_font_size(importance: u8) -> f32 {
-    match importance.clamp(IMPORTANCE_MIN, IMPORTANCE_MAX) {
+/// The per-importance spread is deliberately wide: this is the channel the
+/// user asked for to tell major events from footnotes at a glance. Zoom
+/// only ever adds on top of that baseline, up to `LABEL_ZOOM_GROWTH_MAX_PX`
+/// — it never lets a low-importance label catch up to a higher one, just
+/// makes it readable once there is obviously enough room for it.
+pub fn label_font_size(importance: u8, ppy: f64) -> f32 {
+    let base = match importance.clamp(IMPORTANCE_MIN, IMPORTANCE_MAX) {
         5 => 16.0,
         4 => 14.0,
         3 => 12.5,
         2 => 11.0,
         _ => 10.0,
-    }
+    };
+    let t = ((ppy - LABEL_ZOOM_GROWTH_START_PPY) / (LABEL_ZOOM_GROWTH_END_PPY - LABEL_ZOOM_GROWTH_START_PPY))
+        .clamp(0.0, 1.0) as f32;
+    base + LABEL_ZOOM_GROWTH_MAX_PX * t
 }
 
 /// Marker radius for an entry of the given significance.
@@ -164,7 +179,7 @@ mod tests {
         // Every visual channel must agree on the ordering, or the encoding
         // sends mixed signals.
         for i in IMPORTANCE_MIN..IMPORTANCE_MAX {
-            assert!(label_font_size(i) < label_font_size(i + 1));
+            assert!(label_font_size(i, 1.0) < label_font_size(i + 1, 1.0));
             assert!(marker_radius(i) < marker_radius(i + 1));
             assert!(importance_alpha(i) < importance_alpha(i + 1));
             assert!(range_bar_height(i) < range_bar_height(i + 1));
@@ -174,21 +189,37 @@ mod tests {
     #[test]
     fn label_rows_are_tall_enough_for_the_largest_label() {
         // Rows are a uniform height while labels are not, so the row must clear
-        // the tallest line or important titles overlap their neighbours.
-        let tallest = label_font_size(IMPORTANCE_MAX) * 1.2;
+        // the tallest line — at the *most zoomed-in* a label can get, since
+        // zoom grows font size on top of the per-importance baseline — or
+        // important titles overlap their neighbours.
+        let tallest = label_font_size(IMPORTANCE_MAX, LABEL_ZOOM_GROWTH_END_PPY) * 1.2;
         assert!(
             crate::layout::LABEL_ROW_HEIGHT >= tallest,
             "row height {} is too small for a {}px label",
             crate::layout::LABEL_ROW_HEIGHT,
-            label_font_size(IMPORTANCE_MAX)
+            label_font_size(IMPORTANCE_MAX, LABEL_ZOOM_GROWTH_END_PPY)
         );
     }
 
     #[test]
     fn encoding_is_clamped_for_out_of_range_values() {
-        assert_eq!(label_font_size(0), label_font_size(1));
-        assert_eq!(label_font_size(99), label_font_size(5));
+        assert_eq!(label_font_size(0, 1.0), label_font_size(1, 1.0));
+        assert_eq!(label_font_size(99, 1.0), label_font_size(5, 1.0));
         assert_eq!(marker_radius(0), marker_radius(1));
+    }
+
+    #[test]
+    fn label_font_size_grows_with_zoom_but_keeps_the_importance_ordering() {
+        // Below the growth threshold, zoom changes nothing.
+        assert_eq!(label_font_size(1, 1.0), label_font_size(1, LABEL_ZOOM_GROWTH_START_PPY));
+        // Zoomed in past the growth window, a low-importance label grows...
+        let grown = label_font_size(1, LABEL_ZOOM_GROWTH_END_PPY);
+        assert!(grown > label_font_size(1, 1.0), "should have grown");
+        // ...but at that *same* zoom, importance must still read as a size
+        // hierarchy — the bonus is additive, not tier-catching-up.
+        assert!(grown < label_font_size(2, LABEL_ZOOM_GROWTH_END_PPY));
+        // Zooming in further than the growth window must not keep growing it.
+        assert_eq!(grown, label_font_size(1, LABEL_ZOOM_GROWTH_END_PPY * 10.0));
     }
 
     #[test]

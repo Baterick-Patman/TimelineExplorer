@@ -373,7 +373,7 @@ fn paint_ruler(p: &egui::Painter, axis: &TimeAxis, rect: Rect, theme: &Theme) {
         p.text(
             Pos2::new(x + 4.0, bar.top() + 4.0),
             Align2::LEFT_TOP,
-            axis_year_label(t),
+            axis_tick_label(t, step),
             FontId::proportional(11.5),
             theme.text_dim,
         );
@@ -832,7 +832,7 @@ fn measure_lanes(
             let mut claim = |text: &str, importance: u8, at: f32| {
                 let galley = p.layout_no_wrap(
                     text.to_owned(),
-                    FontId::proportional(label_font_size(importance)),
+                    FontId::proportional(label_font_size(importance, axis.ppy)),
                     Color32::WHITE,
                 );
                 // Capped the same way the real paint pass ellipsises a long
@@ -847,8 +847,12 @@ fn measure_lanes(
                 }
             };
 
+            // Same fan-out the real paint pass applies, so a lane doesn't
+            // under-reserve rows for events that will visually spread out.
+            let fanned = fan_out_year_only_events(roots.iter().copied());
             for ev in roots {
-                claim(&ev.title, ev.importance, axis.x(ev.span.t0()));
+                let t0 = fanned.get(&ev.id).copied().unwrap_or_else(|| ev.span.t0());
+                claim(&ev.title, ev.importance, axis.x(t0));
             }
             LaneDemand { rows: used, active, nested_rows }
         })
@@ -889,13 +893,16 @@ fn paint_lane_events(
             .cmp(&a.importance)
             .then(a.span.t0().partial_cmp(&b.span.t0()).unwrap_or(std::cmp::Ordering::Equal))
     });
+    // Several year-only-dated events sharing one year would otherwise all
+    // sit on the exact same pixel — see `fan_out_year_only_events`.
+    let fanned = fan_out_year_only_events(events.iter().copied());
 
     let max_rows = lane.label_rows.max(1);
     let mut packer = LabelPacker::new();
 
     let lane_color = to_color(lane.color);
     for ev in events {
-        let t0 = ev.span.t0();
+        let t0 = fanned.get(&ev.id).copied().unwrap_or_else(|| ev.span.t0());
         let y = match lane.kind {
             LaneKind::Timeline(id) => match doc.timeline(id) {
                 Some(tl) => band_center_at(tl, lane.center, centers, t0, axis.ppy),
@@ -967,7 +974,7 @@ fn paint_lane_events(
             continue;
         }
 
-        let font = FontId::proportional(label_font_size(ev.importance));
+        let font = FontId::proportional(label_font_size(ev.importance, axis.ppy));
         // A neutral colour, not a tint of the lane's own hue — a light band
         // (e.g. cyan) tinted the same way its label was coloured produced
         // low-contrast, barely-legible text once the two sat close together
@@ -981,7 +988,20 @@ fn paint_lane_events(
         let fitted = fit_text(p, &ev.title, &font, color, EVENT_LABEL_MAX_PX);
         let galley = p.layout_no_wrap(fitted, font, color);
         let w = galley.size().x;
-        let lx = (x - w * 0.5)
+        // A range's own bar can be wider than the whole screen once zoomed
+        // in — "Peloponnesischer Krieg" should stay centred over whatever
+        // portion of it is actually on screen and scroll along with it,
+        // the same way an epoch's name already tracks its visible segment,
+        // rather than staying anchored to the start date and scrolling
+        // off-screen the moment you pan into the middle of the range.
+        let label_x = if shown_as_range {
+            let visible_from = t0.max(view_from);
+            let visible_to = ev.span.t1().min(view_to);
+            axis.x((visible_from + visible_to) * 0.5)
+        } else {
+            x
+        };
+        let lx = (label_x - w * 0.5)
             .max(content_rect.left() + 2.0)
             .min(content_rect.right() - w - 2.0);
         let Some(row) = packer.place(lx, lx + w, max_rows) else {
@@ -1001,9 +1021,11 @@ fn paint_lane_events(
                 with_alpha(theme.selection, 40),
             );
         }
-        // A leader line ties the label back to its marker when they are offset.
+        // A leader line ties the label back to its marker (or, for a wide
+        // range, down to whatever point on its own bar sits directly below
+        // the label's now-centred, scroll-tracking position) when offset.
         p.line_segment(
-            [Pos2::new(x, band_top - 2.0), Pos2::new(x, lrect.bottom())],
+            [Pos2::new(label_x, band_top - 2.0), Pos2::new(label_x, lrect.bottom())],
             Stroke::new(1.0, with_alpha(lane_color, 70)),
         );
         p.galley(pos, galley, theme.text);
@@ -1098,7 +1120,18 @@ fn paint_nested_events(
             let font = FontId::proportional((row_h - 2.0).max(9.0));
             let color = with_alpha(theme.text_dim, alpha);
             let galley = p.layout_no_wrap(child.title.clone(), font, color);
-            p.galley(Pos2::new(rect.right() + 3.0, rect.top()), galley, theme.text_dim);
+            let pos = Pos2::new(rect.right() + 3.0, rect.top());
+            // A nested row sits right at the top-level band's own height for
+            // a range event whose bar hugs the band closely, so its title
+            // was landing directly on the band's own colour with nothing to
+            // guarantee contrast — an opaque backing, like every other
+            // on-canvas label already has, fixes that regardless of hue.
+            p.rect_filled(
+                Rect::from_min_size(pos, galley.size()).expand2(Vec2::new(2.0, 1.0)),
+                CornerRadius::same(2),
+                theme.canvas_bg,
+            );
+            p.galley(pos, galley, theme.text_dim);
         }
 
         // Same collapse rule as the top level: a nested range event zoomed

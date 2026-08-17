@@ -11,12 +11,14 @@ use std::collections::{BTreeSet, HashMap};
 
 /// Thickness of a culture band.
 pub const BAND_THICKNESS: f32 = 16.0;
-/// Thickness of a biography's lifeline.
-pub const BIO_BAND_THICKNESS: f32 = 8.0;
+/// Thickness of a biography's lifeline — deliberately closer to a nested
+/// range event's own bar (`range_bar_height`) than to a full culture band,
+/// so a biography reads as its own slim lifeline rather than another "band".
+pub const BIO_BAND_THICKNESS: f32 = 6.0;
 /// Floor for a biography lane's thickness when fully zoomed out — with many
 /// stacked lifelines (a dozen Roman emperors) something has to give, and
 /// shrinking is preferable to overlapping or paging through a huge list.
-pub const BIO_BAND_THICKNESS_MIN: f32 = 4.0;
+pub const BIO_BAND_THICKNESS_MIN: f32 = 3.0;
 /// Pixels-per-year at or above which a biography lane already has its normal
 /// thickness; below it, thickness eases down toward `BIO_BAND_THICKNESS_MIN`.
 const BIO_ZOOM_REFERENCE_PPY: f64 = 15.0;
@@ -42,9 +44,14 @@ pub const TRANSITION_PX: f64 = 110.0;
 /// Vertical gap left above a band for its event labels.
 pub const LABEL_BAND_TOP: f32 = 6.0;
 
-/// Zoom limits: from ~4000 years across a 1000px viewport, in to a single year.
+/// Zoom limits: from ~4000 years across a 1000px viewport, in to individual
+/// days — `tick_step`'s finest step (a single day) only actually gets
+/// reached once ticks 110px apart would need to be closer than a day apart,
+/// which needs `ppy` upwards of ~40,000; the cap is set with headroom above
+/// that so a few day-ticks are comfortably visible at once, not just barely
+/// reachable at the very edge of the zoom range.
 pub const MIN_PPY: f64 = 0.02;
-pub const MAX_PPY: f64 = 4000.0;
+pub const MAX_PPY: f64 = 60_000.0;
 
 // --- Time axis --------------------------------------------------------------
 
@@ -95,12 +102,40 @@ impl TimeAxis {
 
 // --- Axis ticks -------------------------------------------------------------
 
-/// A "nice" tick step in years for the current zoom, plus whether months are
-/// worth labelling.
+/// A "nice" tick step, in years (a fraction of a year for anything finer
+/// than a whole year), for the current zoom.
+///
+/// The finest steps — days, months, a season (three months), a half-year —
+/// only ever get reached at very high `ppy`, since the search always picks
+/// the *smallest* step that still keeps ticks roughly `110px` apart; at
+/// ordinary zoom the coarser, year-and-up steps win exactly as before.
 pub fn tick_step(ppy: f64) -> f64 {
-    const STEPS: [f64; 16] = [
-        1.0, 2.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 200.0, 250.0, 500.0, 1000.0, 2000.0, 2500.0,
-        5000.0, 10000.0,
+    const STEPS: [f64; 25] = [
+        1.0 / 365.0,
+        2.0 / 365.0,
+        5.0 / 365.0,
+        10.0 / 365.0,
+        15.0 / 365.0,
+        1.0 / 12.0,
+        2.0 / 12.0,
+        3.0 / 12.0,
+        6.0 / 12.0,
+        1.0,
+        2.0,
+        5.0,
+        10.0,
+        20.0,
+        25.0,
+        50.0,
+        100.0,
+        200.0,
+        250.0,
+        500.0,
+        1000.0,
+        2000.0,
+        2500.0,
+        5000.0,
+        10000.0,
     ];
     // Aim for a label roughly every 110 px.
     let target_years = 110.0 / ppy;
@@ -205,6 +240,44 @@ pub const RANGE_COLLAPSE_PX: f64 = 18.0;
 /// for a point event, which has no span to collapse.
 pub fn range_collapsed(event: &Event, ppy: f64) -> bool {
     event.span.is_range() && (event.span.t1() - event.span.t0()) * ppy < RANGE_COLLAPSE_PX
+}
+
+/// Spreads point events that share the exact same year — and have no month
+/// of their own to place them within it — evenly across that year's width,
+/// ordered by id (their creation order, which for an imported table is the
+/// order rows appeared in). Without this, every "year-only" event in the
+/// same year piles onto the exact same pixel, since `HDate::decimal`
+/// resolves a bare year to its very start — 23 events sharing one year (a
+/// real case: a war's individual engagements, each only dated "429 BC")
+/// would otherwise all draw on top of each other.
+///
+/// Returns each affected event's adjusted position on the continuous axis,
+/// keyed by id. An event with its own month, a range event, or the lone
+/// event in its year is left out entirely — callers fall back to the
+/// event's own `span.t0()` for anything not present in the map.
+pub fn fan_out_year_only_events<'a>(events: impl IntoIterator<Item = &'a Event>) -> HashMap<Id, f64> {
+    let mut by_year: HashMap<i32, Vec<Id>> = HashMap::new();
+    for e in events {
+        if e.span.is_range() || e.span.start.month.is_some() {
+            continue;
+        }
+        by_year.entry(e.span.start.year).or_default().push(e.id);
+    }
+
+    let mut out = HashMap::new();
+    for (year, mut ids) in by_year {
+        if ids.len() < 2 {
+            continue;
+        }
+        ids.sort_by_key(|id| id.0);
+        let start = HDate::year(year).decimal();
+        let end = HDate::year(year).decimal_end();
+        let n = ids.len() as f64;
+        for (i, id) in ids.into_iter().enumerate() {
+            out.insert(id, start + (i as f64 + 0.5) / n * (end - start));
+        }
+    }
+    out
 }
 
 /// Should a biography's lane be drawn at all?
@@ -329,9 +402,13 @@ pub fn lane_active(
 
 /// Height of one row of event labels.
 ///
-/// Must clear the tallest label line, or a high-importance title overflows into
-/// the row beneath it. See the guard test in `theme`.
-pub const LABEL_ROW_HEIGHT: f32 = 20.0;
+/// Must clear the tallest label line — at the largest a label can get, once
+/// zoom growth is added on top of its per-importance baseline — or a
+/// high-importance title overflows into the row beneath it. Rows are a
+/// fixed height regardless of current zoom, so this is sized for the
+/// *maximum* a label can ever reach, not the common case; see the guard
+/// test in `theme`.
+pub const LABEL_ROW_HEIGHT: f32 = 25.0;
 /// Padding under a band before the next lane starts.
 pub const LANE_BOTTOM_PAD: f32 = 10.0;
 /// Never grow a lane beyond this many label rows, however dense the data.
@@ -1010,6 +1087,22 @@ mod tests {
     }
 
     #[test]
+    fn tick_step_reaches_day_level_at_the_zoom_cap() {
+        // At MAX_PPY there must be enough room for a label roughly every
+        // 110px to actually reach the finest (single-day) step, or the
+        // whole point of raising the zoom cap for day-level ticks is moot.
+        assert_eq!(tick_step(MAX_PPY), 1.0 / 365.0);
+    }
+
+    #[test]
+    fn tick_step_passes_through_month_and_season_before_reaching_a_whole_year() {
+        // Comfortably inside each band, not right at a boundary.
+        assert_eq!(tick_step(110.0 / (0.6 / 12.0)), 1.0 / 12.0);
+        assert_eq!(tick_step(110.0 / 0.24), 3.0 / 12.0);
+        assert!(tick_step(0.001) >= 1.0, "far zoomed out should still land on whole years or coarser");
+    }
+
+    #[test]
     fn ticks_align_to_whole_multiples_and_terminate() {
         let t = ticks(-317.0, -200.0, 50.0);
         assert!(t.contains(&-300.0) && t.contains(&-250.0));
@@ -1675,6 +1768,66 @@ mod tests {
         let war = ranged_event(Id(1), -431, -404);
         assert!(!range_collapsed(&war, 5.0), "27 years * 5 px/yr = 135px, well above the threshold");
         assert!(range_collapsed(&war, 0.1), "27 years * 0.1 px/yr = 2.7px, a sliver");
+    }
+
+    fn year_only_point_event(id: Id, year: i32) -> Event {
+        Event {
+            id,
+            owner: OwnerRef::Timeline(Id(1)),
+            title: "e".into(),
+            description: String::new(),
+            span: Span::point(HDate::year(year)),
+            importance: 3,
+            categories: vec![],
+            parent: None,
+        }
+    }
+
+    #[test]
+    fn a_lone_year_only_event_is_left_at_its_own_position() {
+        let e = year_only_point_event(Id(1), -429);
+        let fanned = fan_out_year_only_events([&e]);
+        assert!(fanned.is_empty(), "a single event in its year needs no spreading");
+    }
+
+    #[test]
+    fn events_with_a_real_month_are_never_moved() {
+        let mut e = year_only_point_event(Id(1), -429);
+        e.span.start.month = Some(6);
+        let other = year_only_point_event(Id(2), -429);
+        let fanned = fan_out_year_only_events([&e, &other]);
+        assert!(!fanned.contains_key(&Id(1)), "a dated event has its own position already");
+    }
+
+    #[test]
+    fn year_only_events_sharing_a_year_spread_across_it_in_id_order() {
+        // Three engagements of a war, each only ever dated "429 BC" — exactly
+        // the shape a real ancient-history import produces.
+        let a = year_only_point_event(Id(3), -429);
+        let b = year_only_point_event(Id(1), -429);
+        let c = year_only_point_event(Id(2), -429);
+        let fanned = fan_out_year_only_events([&a, &b, &c]);
+        assert_eq!(fanned.len(), 3);
+
+        let year_start = HDate::year(-429).decimal();
+        let year_end = HDate::year(-429).decimal_end();
+        for &t in fanned.values() {
+            assert!(t > year_start && t < year_end, "must stay within the year");
+        }
+        // Ordered by id, not by the order passed in.
+        assert!(fanned[&Id(1)] < fanned[&Id(2)]);
+        assert!(fanned[&Id(2)] < fanned[&Id(3)]);
+    }
+
+    #[test]
+    fn different_years_are_never_mixed_together() {
+        let a = year_only_point_event(Id(1), -429);
+        let b = year_only_point_event(Id(2), -429);
+        let c = year_only_point_event(Id(3), -400);
+        let fanned = fan_out_year_only_events([&a, &b, &c]);
+        // -400 is a lone event in its year, so it is not spread at all.
+        assert!(!fanned.contains_key(&Id(3)));
+        assert_eq!(fanned.len(), 2);
     }
 
     // --- Lanes -------------------------------------------------------------

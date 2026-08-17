@@ -121,10 +121,44 @@ arbitrarily wide; it ellipsises past `EVENT_LABEL_MAX_PX` the same way an
 epoch name does. And a lane's sticky name tag now disappears entirely
 (instead of just dimming) once nothing on that lane — band or events — is in
 the current view, so a short-lived timeline's name doesn't stay pinned to
-the screen centuries after it stopped existing.
+the screen centuries after it stopped existing. **v0.8.0.**
 
-- **~12,730 lines** of Rust across 14 files in `src/`.
-- **150 tests**, all passing, no compiler warnings (5 pre-existing clippy
+Another same-day round, once real data with real density (23 events packed
+into a 10-year window, dozens of Egyptian dynasties) exposed the next layer:
+event label font size now grows with zoom on top of its per-importance
+baseline (capped so importance still reads as a size hierarchy — see
+`theme::label_font_size`'s `LABEL_ZOOM_GROWTH_*` constants — and
+`LABEL_ROW_HEIGHT` bumped to stay tall enough for the new maximum); several
+events sharing one bare year (no month of their own) used to all draw on the
+exact same pixel, since `HDate::decimal` resolves a year-only date to its
+very start — `layout::fan_out_year_only_events` now spreads them evenly
+across that year, ordered by id (creation order); a nested event's title
+had no background at all, so on a range event whose bar sits close to its
+own timeline's band, the title painted directly over the band's colour with
+nothing guaranteeing contrast; biographies are now visually closer to a
+nested range event's own slim bar than to a full culture band; a range
+event's label ("Peloponnesischer Krieg") now stays centred on whatever
+portion of its span is actually on screen and scrolls with it, the same way
+an epoch's name already tracks its visible segment, instead of anchoring to
+the start date and scrolling off-screen the moment you pan into the middle
+of a wide range; and the ruler now labels ticks down to individual days —
+`model::date_from_decimal` (the inverse of `HDate::decimal`) plus
+`axis_tick_label` switch precision to match the current tick step, and
+`tick_step`'s ladder gained day/month/season/half-year rungs below its
+original whole-year floor. `MAX_PPY` raised from 4,000 to 60,000 so day-level
+ticks are actually reachable, not just mathematically defined.
+
+**Deliberately not done in this pass** — each is a substantial feature in
+its own right, and squeezing it in alongside everything above risked doing
+it half-right: nested events that are themselves ranges (e.g. "Archidamischer
+Krieg" inside "Peloponnesischer Krieg") still render as small rows below
+their parent rather than as an epoch-style coloured segment *on* the
+parent's own bar; there is no dedicated fast-zoom slider next to the detail
+bias slider; and the top-left search does not yet parse a typed date and
+jump to it directly.
+
+- **~13,020 lines** of Rust across 14 files in `src/`.
+- **159 tests**, all passing, no compiler warnings (5 pre-existing clippy
   style lints — `derivable_impls`, `collapsible_if`,
   `field_reassign_with_default` — left as-is, not regressions).
 - Release binary: `target/release/timeline_explorer.exe`, single file, ~9 MB

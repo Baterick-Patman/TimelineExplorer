@@ -291,6 +291,44 @@ pub fn axis_year_label(decimal: f64) -> String {
     }
 }
 
+/// The calendar date a continuous-axis position falls within — the inverse
+/// of `HDate::decimal()`, used so the ruler can label ticks finer than a
+/// whole year once zoomed in far enough for that to matter. Positioning
+/// itself (spans, markers) never needs this; `HDate` is already the source
+/// of truth there. Uses the same simplified, uniform month length
+/// `decimal()` does, so the two stay consistent with each other even though
+/// neither reflects real (variable) calendar month lengths.
+pub fn date_from_decimal(t: f64) -> (i32, u8, u8) {
+    let base = t.floor();
+    let year = if base >= 0.0 { base as i32 + 1 } else { base as i32 };
+    // A tiny epsilon guards against the division-then-multiplication in
+    // `(t - base) * DAYS_PER_YEAR` landing a hair *below* the exact integer
+    // `decimal()` started from (e.g. 13.999999999999998 instead of 14.0),
+    // which would otherwise floor to the wrong, one-too-small day.
+    let days_into_year = ((t - base) * DAYS_PER_YEAR + 1e-6).clamp(0.0, DAYS_PER_YEAR - 0.001);
+    let month = (days_into_year / DAYS_PER_MONTH).floor().clamp(0.0, 11.0) as u8 + 1;
+    let day_frac = days_into_year - (month as f64 - 1.0) * DAYS_PER_MONTH;
+    let day = day_frac.floor().clamp(0.0, 30.0) as u8 + 1;
+    (year, month, day)
+}
+
+/// Ruler tick label at the given zoom step (in years). Falls back to
+/// whole-year formatting — what `axis_year_label` was already tuned for —
+/// whenever the step is a year or coarser; drops to month, then day,
+/// precision once zoomed in far enough that a bare year would otherwise
+/// repeat across many ticks in a row.
+pub fn axis_tick_label(t: f64, step: f64) -> String {
+    if step >= 1.0 {
+        return axis_year_label(t);
+    }
+    let (year, month, day) = date_from_decimal(t);
+    if step >= 1.0 / 12.0 {
+        format!("{} {}", month_name(month), year_label(year))
+    } else {
+        format!("{}. {} {}", day, month_name(month), year_label(year))
+    }
+}
+
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez",
 ];
@@ -1394,6 +1432,40 @@ mod tests {
         assert_eq!(axis_year_label(HDate::year(1).decimal()), "1");
         assert_eq!(axis_year_label(HDate::year(1789).decimal()), "1789");
         assert_eq!(axis_year_label(HDate::year(-1).decimal()), "1 v. Chr.");
+    }
+
+    #[test]
+    fn date_from_decimal_recovers_the_year_month_and_day_fed_into_decimal() {
+        let cases = [(1789, 7, 14), (1, 1, 1), (-44, 3, 15), (2024, 12, 28)];
+        for (year, month, day) in cases {
+            let d = HDate {
+                month: Some(month),
+                day: Some(day),
+                ..HDate::year(year)
+            };
+            let (y, m, dd) = date_from_decimal(d.decimal());
+            assert_eq!((y, m, dd), (year, month, day), "round trip for {year}-{month}-{day}");
+        }
+    }
+
+    #[test]
+    fn axis_tick_label_matches_precision_to_the_current_step() {
+        let t = HDate {
+            month: Some(7),
+            day: Some(14),
+            ..HDate::year(1789)
+        }
+        .decimal();
+        // Year-or-coarser steps: same as the plain year label, day/month
+        // dropped entirely.
+        assert_eq!(axis_tick_label(t, 1.0), "1789");
+        assert_eq!(axis_tick_label(t, 100.0), "1789");
+        // Month-level (including a season/half-year grouping of months):
+        // month and year, no day.
+        assert_eq!(axis_tick_label(t, 1.0 / 12.0), "Jul 1789");
+        assert_eq!(axis_tick_label(t, 3.0 / 12.0), "Jul 1789");
+        // Day-level: full precision.
+        assert_eq!(axis_tick_label(t, 1.0 / 365.0), "14. Jul 1789");
     }
 
     #[test]
