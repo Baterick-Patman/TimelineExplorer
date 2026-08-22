@@ -107,11 +107,15 @@ pub fn draw(app: &mut TimelineApp, ui: &mut egui::Ui) {
         );
     }
 
-    paint_epoch_labels(&clip, &app.doc, &lanes, &centers, &axis, view_from, view_to, &theme);
-
+    // A biography's own name and its life-phase names both float centred on
+    // the band rather than sitting in a fixed gutter, so painting names
+    // first and phase labels after means a phase label always wins where
+    // the two would otherwise overlap — the phase is the more specific,
+    // more informative of the two at that exact spot.
     paint_lane_names(
         &clip, &app.doc, &lanes, content_rect, &axis, view_from, view_to, &theme, &mut hits,
     );
+    paint_segment_labels(&clip, &app.doc, &lanes, &centers, &axis, view_from, view_to, &theme);
     paint_ruler(&painter, &axis, rect, &theme);
     paint_scroll_indicator(&painter, content_rect, app, &theme);
 
@@ -433,7 +437,7 @@ fn paint_timeline_band(
     // Colour-coded eras — "Archaic", "Classical" — painted as separate
     // strokes over the base band. Each is sampled independently so it still
     // follows the curve through a merge/origin transition. Their *names*
-    // are deliberately not painted here — see `paint_epoch_labels`.
+    // are deliberately not painted here — see `paint_segment_labels`.
     if !tl.epochs.is_empty() {
         if let Some((from, to)) = band_visible_range(doc, tl, view_from, view_to) {
             for (seg_from, seg_to, seg_color, name) in band_color_segments(tl, from, to) {
@@ -519,8 +523,9 @@ fn junction_label(p: &egui::Painter, label: &str, x: f32, y: f32, theme: &Theme)
 /// longer, just because they happen to measure the same width.
 const SEGMENT_LABEL_MIN_PX: f32 = 34.0;
 
-/// An event title never grows wider than this on screen — a long title
-/// ("Untergang des Weströmischen Reichs - Einfall der Langobarden")
+/// An event title never grows wider than this on screen, on either of its
+/// (at most two — see `wrap_two_lines`) lines — a long title ("Untergang des
+/// Weströmischen Reichs - Einfall der Langobarden") wraps or, failing that,
 /// ellipsises instead, so one event's label cannot dwarf the date it
 /// actually marks or crowd out its neighbours.
 const EVENT_LABEL_MAX_PX: f32 = 260.0;
@@ -541,6 +546,48 @@ fn fit_text(p: &egui::Painter, text: &str, font: &FontId, color: Color32, max_wi
         }
     }
     "…".to_owned()
+}
+
+/// Wraps `text` onto at most two lines, each within `max_width`, breaking at
+/// word boundaries. A title merely too long for one line used to lose its
+/// tail to an ellipsis immediately; splitting across a second line first
+/// keeps it fully readable, falling back to ellipsising only that second
+/// line if even two lines still are not enough. A single word wider than
+/// `max_width` on its own still gets its own line rather than looping
+/// forever trying to shrink it.
+fn wrap_two_lines(p: &egui::Painter, text: &str, font: &FontId, color: Color32, max_width: f32) -> Vec<String> {
+    let measure = |s: &str| p.layout_no_wrap(s.to_owned(), font.clone(), color).size().x;
+    if measure(text) <= max_width {
+        return vec![text.to_owned()];
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return vec![String::new()];
+    }
+    let mut line1 = String::new();
+    let mut split = 0;
+    for (i, word) in words.iter().enumerate() {
+        let candidate = if line1.is_empty() { (*word).to_owned() } else { format!("{line1} {word}") };
+        if line1.is_empty() || measure(&candidate) <= max_width {
+            line1 = candidate;
+            split = i + 1;
+        } else {
+            break;
+        }
+    }
+    // The very first word can still land on `line1` above even when it alone
+    // is wider than `max_width` — that's what keeps this loop from placing
+    // zero words and looping forever, but it means `line1` itself can still
+    // overflow at this point and needs the same ellipsis treatment as an
+    // overflowing second line would get.
+    if measure(&line1) > max_width {
+        line1 = fit_text(p, &line1, font, color, max_width);
+    }
+    if split >= words.len() {
+        return vec![line1];
+    }
+    let rest = words[split..].join(" ");
+    vec![line1, fit_text(p, &rest, font, color, max_width)]
 }
 
 /// An epoch's name, sat directly on its band segment rather than in the
@@ -598,19 +645,23 @@ fn epoch_segment_label(
     p.text(center, Align2::CENTER_CENTER, &fitted, font, theme.text);
 }
 
-/// Every visible timeline's epoch names, painted in their own pass *after*
-/// every band (including any other timeline's curve) is already on screen.
+/// Every visible timeline epoch's and biography life-phase's name, painted
+/// in their own pass *after* every band (including any other timeline's
+/// curve) is already on screen.
 ///
-/// Epoch names used to be painted inline as part of `paint_timeline_band`,
-/// in the same pass and lane order as every other band. A curve travelling
-/// several lanes to reach a distant merge target is just another band drawn
-/// in that same pass — if it happened to be painted after a nearer
-/// timeline's epoch label, it painted directly over that label along the
-/// way, exactly as if the label had never been there. Repainting every
-/// epoch name in its own later pass means it always sits on top of whatever
-/// else crosses through that stretch of screen, not just its own band.
+/// These names used to be painted inline as part of `paint_timeline_band`/
+/// `paint_biography_band`, in the same pass and lane order as every other
+/// band. A curve travelling several lanes to reach a distant merge target is
+/// just another band drawn in that same pass — if it happened to be painted
+/// after a nearer timeline's epoch label, it painted directly over that
+/// label along the way, exactly as if the label had never been there (and,
+/// for a biography's life-phase name, likewise reported as unreadable —
+/// something else on screen was simply painted on top of it afterwards).
+/// Repainting every name in its own later pass means it always sits on top
+/// of whatever else crosses through that stretch of screen, not just its
+/// own band.
 #[allow(clippy::too_many_arguments)]
-fn paint_epoch_labels(
+fn paint_segment_labels(
     p: &egui::Painter,
     doc: &Document,
     lanes: &[Lane],
@@ -624,21 +675,42 @@ fn paint_epoch_labels(
         if !lane.active {
             continue;
         }
-        let LaneKind::Timeline(id) = lane.kind else {
-            continue;
-        };
-        let Some(tl) = doc.timeline(id) else {
-            continue;
-        };
-        if tl.epochs.is_empty() {
-            continue;
-        }
-        let Some((from, to)) = band_visible_range(doc, tl, view_from, view_to) else {
-            continue;
-        };
-        for (seg_from, seg_to, _, name) in band_color_segments(tl, from, to) {
-            let Some(name) = name else { continue };
-            epoch_segment_label(p, tl, lane.center, centers, axis, seg_from, seg_to, name, theme);
+        match lane.kind {
+            LaneKind::Timeline(id) => {
+                let Some(tl) = doc.timeline(id) else { continue };
+                if tl.epochs.is_empty() {
+                    continue;
+                }
+                let Some((from, to)) = band_visible_range(doc, tl, view_from, view_to) else {
+                    continue;
+                };
+                for (seg_from, seg_to, _, name) in band_color_segments(tl, from, to) {
+                    let Some(name) = name else { continue };
+                    epoch_segment_label(p, tl, lane.center, centers, axis, seg_from, seg_to, name, theme);
+                }
+            }
+            LaneKind::Biography(id) => {
+                let Some(bio) = doc.biography(id) else { continue };
+                if bio.life_phases.is_empty() {
+                    continue;
+                }
+                let span = bio.span();
+                let seg_from = span.t0().max(view_from);
+                let seg_to = span.t1().min(view_to);
+                if seg_to <= seg_from {
+                    continue;
+                }
+                let fill = doc.bio_color(bio);
+                for (s0, s1, _, name) in color_segments(&bio.life_phases, fill, seg_from, seg_to) {
+                    let Some(name) = name else { continue };
+                    let seg_rect = Rect::from_min_max(
+                        Pos2::new(axis.x(s0), lane.center - lane.thickness * 0.5),
+                        Pos2::new(axis.x(s1), lane.center + lane.thickness * 0.5),
+                    );
+                    phase_segment_label(p, seg_rect, name, theme);
+                }
+            }
+            LaneKind::Group(_) => {}
         }
     }
 }
@@ -681,18 +753,21 @@ fn paint_biography_band(
     // the same idea as a timeline's epochs. The band is flat (biographies
     // never curve), so unlike `band_color_segments` this needs no per-segment
     // sampling: each phase is just a straight sub-rect over the base fill.
+    // The phase *name* is deliberately not painted here — see
+    // `paint_segment_labels`, same reasoning as a timeline's epoch names.
     if !bio.life_phases.is_empty() {
         let seg_from = span.t0().max(view_from);
         let seg_to = span.t1().min(view_to);
         if seg_to > seg_from {
             for (s0, s1, seg_color, name) in color_segments(&bio.life_phases, fill, seg_from, seg_to) {
-                let Some(name) = name else { continue };
+                if name.is_none() {
+                    continue;
+                }
                 let seg_rect = Rect::from_min_max(
                     Pos2::new(axis.x(s0), r.top()),
                     Pos2::new(axis.x(s1), r.bottom()),
                 );
                 p.rect_filled(seg_rect, 0.0, with_alpha(to_color(seg_color), 210));
-                phase_segment_label(p, seg_rect, name, theme);
             }
         }
     }
@@ -787,11 +862,25 @@ fn visible_events<'a>(
     events
 }
 
+/// A "long event" — a range with its own visible nested content — gets a
+/// dedicated stacked slot above the band (its own title, sections, nested
+/// event labels; see `paint_nested_events`) rather than sharing the plain
+/// below-band label rows every other event uses. Shared between
+/// `measure_lanes` and `paint_lane_events` so the two agree on exactly which
+/// events fall in which bucket.
+fn is_long_event(doc: &Document, filters: &Filters, ppy: f64, ev: &Event) -> bool {
+    ev.span.is_range()
+        && !range_collapsed(ev, ppy)
+        && doc.child_events(ev.id).into_iter().any(|c| event_visible(c, filters, ppy))
+}
+
 /// Measure what each planned lane needs at the current zoom.
 ///
-/// Runs the same packing the painter will, but with the row limit raised, so a
-/// lane can be sized to hold its labels rather than dropping them. This is what
-/// keeps a cluster of events in a single year readable.
+/// Runs the same packing the painter will, but with the row/slot limit
+/// raised, so a lane can be sized to hold everything rather than dropping
+/// it. This is what keeps a cluster of events in a single year readable, and
+/// what lets several overlapping long events each get their own slot
+/// instead of drawing on top of one another.
 #[allow(clippy::too_many_arguments)]
 fn measure_lanes(
     doc: &Document,
@@ -806,24 +895,37 @@ fn measure_lanes(
     plans
         .iter()
         .map(|plan| {
-            let active = plan.header_only
-                || lane_active(doc, plan.kind, filters, axis.ppy, view_from, view_to);
+            // Deliberately *not* `plan.header_only || ...` — an expanded
+            // group's header row used to always report itself active
+            // regardless of whether anything beneath it was actually in
+            // view, which meant its sticky name never disappeared while
+            // scrolling the way a dormant timeline's already does (both
+            // `lane_height` and `paint_lane_events` already check
+            // `header_only` on their own first, so this doesn't change
+            // anything for them — it only fixes what "active" itself means).
+            let active = lane_active(doc, plan.kind, filters, axis.ppy, view_from, view_to);
             if plan.header_only || !active {
-                return LaneDemand { rows: 0, active, nested_rows: 0 };
+                return LaneDemand { below_rows: 0, above_slots: 0, active };
             }
 
             let roots = visible_events(doc, plan.kind, filters, axis, view_from, view_to);
-            // Nested rows are markers, not just labels, so they need room
-            // below the band whether or not text labels are switched on.
-            let nested_rows = roots
-                .iter()
-                .filter(|e| e.span.is_range() && !range_collapsed(e, axis.ppy))
-                .map(|e| nested_depth(doc, filters, axis.ppy, e.id, 0))
-                .max()
-                .unwrap_or(0);
+
+            // Long events stack purely by time overlap — reusing
+            // `LabelPacker` again, just claiming an event's own date span
+            // instead of a label's pixel width, exactly the way
+            // `paint_lane_events` will when it actually draws them.
+            let mut stack_packer = LabelPacker::new();
+            let mut above_slots = 0usize;
+            for ev in roots.iter().filter(|e| is_long_event(doc, filters, axis.ppy, e)) {
+                let x0 = axis.x(ev.span.t0());
+                let x1 = axis.x(ev.span.t1()).max(x0 + 3.0);
+                if let Some(row) = stack_packer.place_rows(x0, x1, 1, MAX_LONG_EVENT_STACK) {
+                    above_slots = above_slots.max(row + 1);
+                }
+            }
 
             if !doc.view.show_labels {
-                return LaneDemand { rows: 0, active, nested_rows };
+                return LaneDemand { below_rows: 0, above_slots, active };
             }
 
             let mut packer = LabelPacker::new();
@@ -835,30 +937,52 @@ fn measure_lanes(
                     FontId::proportional(label_font_size(importance, axis.ppy)),
                     Color32::WHITE,
                 );
-                // Capped the same way the real paint pass ellipsises a long
-                // title — otherwise a lane could reserve far more row-width
-                // than the label actually ends up using on screen.
-                let w = galley.size().x.min(EVENT_LABEL_MAX_PX);
+                // A title within one line's width reserves exactly the space
+                // it needs; a longer one wraps onto a second line in the real
+                // paint pass (see `wrap_two_lines`), so it needs two rows
+                // reserved here too, or that second line would land on
+                // whatever row the packer next hands out to someone else.
+                let (w, rows_needed) = if galley.size().x <= EVENT_LABEL_MAX_PX {
+                    (galley.size().x, 1)
+                } else {
+                    (EVENT_LABEL_MAX_PX, 2)
+                };
                 let lx = (at - w * 0.5)
                     .max(rect.left() + 2.0)
                     .min(rect.right() - w - 2.0);
-                if let Some(row) = packer.place(lx, lx + w, MAX_LABEL_ROWS) {
-                    used = used.max(row + 1);
+                if let Some(row) = packer.place_rows(lx, lx + w, rows_needed, MAX_LABEL_ROWS) {
+                    used = used.max(row + rows_needed);
                 }
             };
 
             // Same fan-out the real paint pass applies, so a lane doesn't
             // under-reserve rows for events that will visually spread out.
+            // Only a *plain* event's label lives in these below-band rows —
+            // a long event's own title has its dedicated slot above instead.
             let fanned = fan_out_year_only_events(roots.iter().copied());
-            for ev in roots {
+            for ev in roots.iter().filter(|e| !is_long_event(doc, filters, axis.ppy, e)) {
                 let t0 = fanned.get(&ev.id).copied().unwrap_or_else(|| ev.span.t0());
                 claim(&ev.title, ev.importance, axis.x(t0));
             }
-            LaneDemand { rows: used, active, nested_rows }
+            LaneDemand { below_rows: used, above_slots, active }
         })
         .collect()
 }
 
+/// Paints every root event on a lane, split into two groups that live on
+/// opposite sides of the band:
+///
+/// - A **long event** — a range with its own visible nested content — gets a
+///   dedicated stacked slot *above* the band: its bar (with sections/markers
+///   for its children, see `paint_nested_events`), and its own title above
+///   that. Several long events overlapping in time stack into further slots
+///   (`paint_long_event`) instead of drawing over one another.
+/// - Every other event — a plain point, or a range with nothing nested in
+///   it — gets its marker exactly on the band as always, but its label now
+///   floats *below* the band instead of above it. This is what actually
+///   frees up the space a long event's own dedicated slot needs, and keeps
+///   a crowd of ordinary events from competing with a war's own section
+///   headers for the same real estate.
 #[allow(clippy::too_many_arguments)]
 fn paint_lane_events(
     p: &egui::Painter,
@@ -897,8 +1021,10 @@ fn paint_lane_events(
     // sit on the exact same pixel — see `fan_out_year_only_events`.
     let fanned = fan_out_year_only_events(events.iter().copied());
 
-    let max_rows = lane.label_rows.max(1);
-    let mut packer = LabelPacker::new();
+    let max_below_rows = lane.below_rows.max(1);
+    let max_above_slots = lane.above_slots.max(1);
+    let mut below_packer = LabelPacker::new();
+    let mut stack_packer = LabelPacker::new();
 
     let lane_color = to_color(lane.color);
     for ev in events {
@@ -910,14 +1036,8 @@ fn paint_lane_events(
             },
             LaneKind::Biography(_) | LaneKind::Group(_) => lane.center,
         };
-        // The band may be mid-curve (origin/merge transition) at this event's
-        // own date, so the label's anchor has to track the same curved `y` as
-        // the marker rather than the lane's flat resting position.
-        let band_top = y - lane.thickness * 0.5;
-        let x = axis.x(t0);
         let alpha = importance_alpha(ev.importance);
         let selected = app.selection == Some(Selection::Event(ev.id));
-
         // Category identity as a ring around the band-coloured marker: colour
         // still means "which timeline", the ring adds "what kind".
         let ring = ev
@@ -926,12 +1046,44 @@ fn paint_lane_events(
             .and_then(|c| doc.category(*c))
             .map(|c| to_color(c.color));
 
+        if is_long_event(doc, filters, axis.ppy, ev) {
+            paint_long_event(
+                p,
+                app,
+                doc,
+                filters,
+                ev,
+                axis,
+                y,
+                lane.top,
+                lane_color,
+                alpha,
+                ring,
+                selected,
+                &mut stack_packer,
+                max_above_slots,
+                content_rect,
+                view_from,
+                view_to,
+                theme,
+                hits,
+            );
+            continue;
+        }
+
+        // The band may be mid-curve (origin/merge transition) at this event's
+        // own date, so the label's anchor has to track the same curved `y` as
+        // the marker rather than the lane's flat resting position.
+        let band_bottom = y + lane.thickness * 0.5;
+        let x = axis.x(t0);
+
         // A range zoomed down to a sliver stops looking like its own bar and
         // falls back to the same point-style marker an ordinary event gets —
-        // see `range_collapsed` for why.
+        // see `range_collapsed` for why. (A range with visible children never
+        // reaches here at all — see `is_long_event` above.)
         let shown_as_range = ev.span.is_range() && !range_collapsed(ev, axis.ppy);
         let marker_rect = if shown_as_range {
-            paint_range(p, ev, axis, y, lane_color, alpha, ring, selected, theme)
+            paint_range(p, ev, axis, y, true, 0.0, lane_color, alpha, ring, selected, false, content_rect, theme)
         } else {
             paint_point(p, ev, axis, x, y, lane_color, alpha, ring, selected, theme)
         };
@@ -939,23 +1091,6 @@ fn paint_lane_events(
             rect: marker_rect.expand(2.0),
             sel: Selection::Event(ev.id),
         });
-
-        if shown_as_range {
-            paint_nested_events(
-                p,
-                app,
-                doc,
-                filters,
-                ev,
-                marker_rect,
-                axis,
-                lane_color,
-                lane.bottom - LANE_BOTTOM_PAD,
-                theme,
-                1,
-                hits,
-            );
-        }
 
         if !doc.view.show_labels {
             continue;
@@ -981,19 +1116,21 @@ fn paint_lane_events(
         // at a cramped zoom. Which lane a label belongs to is already clear
         // from its position and the marker beside it.
         let color = with_alpha(theme.text, alpha);
-        // Capped and ellipsised rather than left to grow arbitrarily wide —
-        // a long title ("Untergang des Weströmischen Reichs - Einfall der
-        // Langobarden") would otherwise span a huge stretch of the timeline
-        // on its own, out of proportion with the date it actually marks.
-        let fitted = fit_text(p, &ev.title, &font, color, EVENT_LABEL_MAX_PX);
-        let galley = p.layout_no_wrap(fitted, font, color);
-        let w = galley.size().x;
+        // A title too long for one line wraps onto a second rather than
+        // losing its tail to an ellipsis right away — only a title that
+        // still doesn't fit across two lines falls back to ellipsising, and
+        // only on that second line. Either way the marker itself stays
+        // exactly on the band; only the label below it grows taller.
+        let lines = wrap_two_lines(p, &ev.title, &font, color, EVENT_LABEL_MAX_PX);
+        let line_galleys: Vec<_> = lines.into_iter().map(|l| p.layout_no_wrap(l, font.clone(), color)).collect();
+        let rows_needed = line_galleys.len();
+        let w = line_galleys.iter().fold(0.0_f32, |w, g| w.max(g.size().x));
         // A range's own bar can be wider than the whole screen once zoomed
-        // in — "Peloponnesischer Krieg" should stay centred over whatever
-        // portion of it is actually on screen and scroll along with it,
-        // the same way an epoch's name already tracks its visible segment,
-        // rather than staying anchored to the start date and scrolling
-        // off-screen the moment you pan into the middle of the range.
+        // in — its label should stay centred over whatever portion of it is
+        // actually on screen and scroll along with it, the same way an
+        // epoch's name already tracks its visible segment, rather than
+        // staying anchored to the start date and scrolling off-screen the
+        // moment you pan into the middle of the range.
         let label_x = if shown_as_range {
             let visible_from = t0.max(view_from);
             let visible_to = ev.span.t1().min(view_to);
@@ -1004,15 +1141,14 @@ fn paint_lane_events(
         let lx = (label_x - w * 0.5)
             .max(content_rect.left() + 2.0)
             .min(content_rect.right() - w - 2.0);
-        let Some(row) = packer.place(lx, lx + w, max_rows) else {
+        let Some(row) = below_packer.place_rows(lx, lx + w, rows_needed, max_below_rows) else {
             continue;
         };
-        let ly = band_top - LABEL_BAND_TOP - (row as f32 + 1.0) * LABEL_ROW_HEIGHT;
-        if ly < lane.top - LABEL_ROW_HEIGHT {
+        let ly_top = band_bottom + LABEL_BAND_BOTTOM + row as f32 * LABEL_ROW_HEIGHT;
+        if ly_top + rows_needed as f32 * LABEL_ROW_HEIGHT > lane.bottom + LABEL_ROW_HEIGHT {
             continue;
         }
-        let pos = Pos2::new(lx, ly);
-        let lrect = Rect::from_min_size(pos, galley.size());
+        let lrect = Rect::from_min_size(Pos2::new(lx, ly_top), Vec2::new(w, rows_needed as f32 * LABEL_ROW_HEIGHT));
 
         if selected {
             p.rect_filled(
@@ -1022,13 +1158,15 @@ fn paint_lane_events(
             );
         }
         // A leader line ties the label back to its marker (or, for a wide
-        // range, down to whatever point on its own bar sits directly below
+        // range, up to whatever point on its own bar sits directly above
         // the label's now-centred, scroll-tracking position) when offset.
         p.line_segment(
-            [Pos2::new(label_x, band_top - 2.0), Pos2::new(label_x, lrect.bottom())],
+            [Pos2::new(label_x, band_bottom + 2.0), Pos2::new(label_x, lrect.top())],
             Stroke::new(1.0, with_alpha(lane_color, 70)),
         );
-        p.galley(pos, galley, theme.text);
+        for (i, galley) in line_galleys.into_iter().enumerate() {
+            p.galley(Pos2::new(lx, ly_top + i as f32 * LABEL_ROW_HEIGHT), galley, theme.text);
+        }
         hits.push(Hit {
             rect: lrect,
             sel: Selection::Event(ev.id),
@@ -1036,10 +1174,147 @@ fn paint_lane_events(
     }
 }
 
-/// Paint events nested inside `parent` — "Peace of Nicias" inside
-/// "Peloponnesian War" — as a row of small bars/markers directly below its
-/// own bar, with a tether line back up to it so the containment reads at a
-/// glance. Recurses one row further down for grandchildren.
+/// Paints one "long event" — a range with its own visible nested content —
+/// in its own stacked slot above the band: assigns a stack level purely by
+/// time overlap against every other long event on this lane (`stack_packer`,
+/// shared across the whole lane), draws its bar and everything nested on it
+/// (`paint_nested_events`), then its own title above the reserved nested-
+/// label area. A degenerate overlap of more long events than
+/// `MAX_LONG_EVENT_STACK` allows falls back to sharing the topmost slot
+/// rather than dropping the event outright.
+#[allow(clippy::too_many_arguments)]
+fn paint_long_event(
+    p: &egui::Painter,
+    app: &TimelineApp,
+    doc: &Document,
+    filters: &Filters,
+    ev: &Event,
+    axis: &TimeAxis,
+    y: f32,
+    lane_top: f32,
+    lane_color: Color32,
+    alpha: u8,
+    ring: Option<Color32>,
+    selected: bool,
+    stack_packer: &mut LabelPacker,
+    max_above_slots: usize,
+    content_rect: Rect,
+    view_from: f64,
+    view_to: f64,
+    theme: &Theme,
+    hits: &mut Vec<Hit>,
+) {
+    let x0 = axis.x(ev.span.t0());
+    let x1 = axis.x(ev.span.t1()).max(x0 + 3.0);
+    // A genuine slot keeps this event visually distinct from every other
+    // long event it overlaps in time; degenerately overlapping more of them
+    // than `MAX_LONG_EVENT_STACK` allows falls back to sharing the topmost
+    // slot with whatever is already there. The bar still paints in that
+    // shared slot — better a rare visual overlap than a dropped event
+    // outright — but neither its title nor its nested content does: two
+    // titles, or two independent sets of nested labels (each with its own
+    // `paint_nested_events` call and thus its own `LabelPacker`, with no
+    // visibility into the other), landing on the exact same spot renders as
+    // illegible, run-together text, worse than the one that lost the slot
+    // simply staying available via a click or the hover tooltip instead.
+    let (slot, got_own_slot) = match stack_packer.place_rows(x0, x1, 1, max_above_slots) {
+        Some(row) => (row, true),
+        None => (max_above_slots.saturating_sub(1), false),
+    };
+    let stack_offset = slot as f32 * LONG_EVENT_SLOT_HEIGHT;
+
+    let marker_rect =
+        paint_range(p, ev, axis, y, false, stack_offset, lane_color, alpha, ring, selected, true, content_rect, theme);
+    hits.push(Hit {
+        rect: marker_rect.expand(2.0),
+        sel: Selection::Event(ev.id),
+    });
+
+    paint_nested_events(p, app, doc, filters, ev, marker_rect, axis, lane_color, theme, 1, got_own_slot, hits);
+
+    if !doc.view.show_labels || !got_own_slot {
+        return;
+    }
+    let on_screen = axis.x(ev.span.t1()) >= content_rect.left() && axis.x(ev.span.t0()) <= content_rect.right();
+    if !on_screen {
+        return;
+    }
+
+    let font = FontId::proportional(label_font_size(ev.importance, axis.ppy));
+    let color = with_alpha(theme.text, alpha);
+    let lines = wrap_two_lines(p, &ev.title, &font, color, EVENT_LABEL_MAX_PX);
+    let line_galleys: Vec<_> = lines.into_iter().map(|l| p.layout_no_wrap(l, font.clone(), color)).collect();
+    let rows_needed = line_galleys.len();
+    let w = line_galleys.iter().fold(0.0_f32, |w, g| w.max(g.size().x));
+
+    let visible_from = ev.span.t0().max(view_from);
+    let visible_to = ev.span.t1().min(view_to);
+    let label_x = axis.x((visible_from + visible_to) * 0.5);
+    let lx = (label_x - w * 0.5)
+        .max(content_rect.left() + 2.0)
+        .min(content_rect.right() - w - 2.0);
+
+    // Always reserved at the worst case (a full stack of nested labels)
+    // rather than however many this particular event actually used, so the
+    // title never needs to know that number to know where to sit.
+    let title_bottom = marker_rect.top() - MAX_NESTED_LABEL_ROWS as f32 * NESTED_LABEL_ROW_HEIGHT - 4.0;
+    let ly_top = title_bottom - rows_needed as f32 * LABEL_ROW_HEIGHT;
+    if ly_top < lane_top - LABEL_ROW_HEIGHT {
+        return;
+    }
+    let lrect = Rect::from_min_size(Pos2::new(lx, ly_top), Vec2::new(w, rows_needed as f32 * LABEL_ROW_HEIGHT));
+
+    if selected {
+        p.rect_filled(
+            lrect.expand2(Vec2::new(4.0, 2.0)),
+            CornerRadius::same(3),
+            with_alpha(theme.selection, 40),
+        );
+    }
+    p.line_segment(
+        [Pos2::new(label_x, y - 2.0), Pos2::new(label_x, lrect.bottom())],
+        Stroke::new(1.0, with_alpha(lane_color, 70)),
+    );
+    for (i, galley) in line_galleys.into_iter().enumerate() {
+        p.galley(Pos2::new(lx, ly_top + i as f32 * LABEL_ROW_HEIGHT), galley, theme.text);
+    }
+    hits.push(Hit {
+        rect: lrect,
+        sel: Selection::Event(ev.id),
+    });
+}
+
+/// However deep a hand-edited file nests events, never recurse the on-band
+/// segment painting below this many levels — a chain that deep is unreadable
+/// at this scale regardless, and every level shares the very same bar height
+/// so deeper segments would be indistinguishable from their parent anyway.
+const MAX_NESTED_SEGMENT_DEPTH: usize = 4;
+/// A floating nested-child label that would collide with a sibling's steps
+/// up to a further row above the bar instead of overlapping it, up to this
+/// many rows — a small, fixed cap since there is no lane-height reservation
+/// backing this the way top-level label rows have; run out and the label is
+/// dropped, same as a top-level label that runs out of `MAX_LABEL_ROWS`.
+const MAX_NESTED_LABEL_ROWS: usize = 3;
+const NESTED_LABEL_ROW_HEIGHT: f32 = 13.0;
+
+/// Paint events nested inside `parent` — "Archidamischer Krieg" inside
+/// "Peloponnesischer Krieg" — directly on the parent's own bar rather than in
+/// a row below it: a nested range event becomes a colour-coded segment
+/// spanning `parent_rect`'s own height, exactly like an epoch painted on a
+/// timeline's band; a nested point event becomes a small marker sitting on
+/// that same bar. The parent's bar behaves like its own small, exactly
+/// parallel mini-timeline. Recurses into a range child's own segment rect for
+/// grandchildren (capped at `MAX_NESTED_SEGMENT_DEPTH`), but only the first
+/// nesting level gets a floating title — any deeper and titles from a level
+/// and its own children would float at the same height and collide, so those
+/// still paint (and are still clickable) but fall back to the hover tooltip
+/// for their name, the same "dense clusters" tradeoff the top level accepts.
+/// `labels_allowed` additionally suppresses every label at every depth when
+/// `false` — used when `parent` itself lost the race for its own stacked
+/// slot (see `paint_long_event`) and shares one with an unrelated event, so
+/// this call's own independent `LabelPacker` cannot tell the two apart.
+/// Markers and segments still paint and stay clickable either way; only the
+/// text is dropped.
 #[allow(clippy::too_many_arguments)]
 fn paint_nested_events(
     p: &egui::Painter,
@@ -1050,112 +1325,149 @@ fn paint_nested_events(
     parent_rect: Rect,
     axis: &TimeAxis,
     lane_color: Color32,
-    lane_bottom_limit: f32,
     theme: &Theme,
     depth: usize,
+    labels_allowed: bool,
     hits: &mut Vec<Hit>,
 ) {
-    if depth > MAX_NESTED_ROWS {
+    if depth > MAX_NESTED_SEGMENT_DEPTH {
         return;
     }
     let children: Vec<&Event> = doc
         .child_events(parent.id)
         .into_iter()
         .filter(|e| event_visible(e, filters, axis.ppy))
+        // Only a child whose own span actually overlaps the parent's is drawn
+        // on the parent's bar — one that doesn't belongs to a data mistake,
+        // not a "start/end of the mini-timeline" edge case worth clipping to.
+        .filter(|e| e.span.t1() >= parent.span.t0() && e.span.t0() <= parent.span.t1())
         .collect();
     if children.is_empty() {
         return;
     }
 
-    let row_top = parent_rect.bottom() + 3.0;
-    let row_h = (NESTED_ROW_HEIGHT - 5.0).max(6.0);
-    if row_top + row_h > lane_bottom_limit {
-        return; // Out of reserved room — deeper nesting is dropped, not overlapped.
-    }
+    // The parent's own bar is already lightened (`shade(lane_color, 0.15)` in
+    // `paint_range`) — a child needs to go the *other* way, darker, or it
+    // would paint in the exact same colour and disappear into the bar behind
+    // it. Each nesting level darkens a little further, so a grandchild
+    // segment still reads as visually "deeper" than its parent even though
+    // both sit at the very same bar height.
+    let shade_amount = -0.3 - (depth - 1) as f32 * 0.15;
+    // Scoped to exactly this call's own children (i.e. one sibling group at
+    // a time) — only ever actually consulted at depth 1, since deeper
+    // labels are never drawn, but harmless to always create.
+    let mut label_packer = LabelPacker::new();
 
     for child in children {
         let alpha = importance_alpha(child.importance);
         let selected = app.selection == Some(Selection::Event(child.id));
-        let fill = with_alpha(shade(lane_color, 0.2), alpha);
+        let fill = with_alpha(shade(lane_color, shade_amount), alpha);
+        let show_label = doc.view.show_labels && depth == 1 && labels_allowed;
 
-        let rect = if child.span.is_range() {
-            let x0 = axis.x(child.span.t0());
-            let x1 = axis.x(child.span.t1()).max(x0 + 3.0);
-            Rect::from_min_max(Pos2::new(x0, row_top), Pos2::new(x1, row_top + row_h))
+        if child.span.is_range() && !range_collapsed(child, axis.ppy) {
+            let x0 = axis.x(child.span.t0()).max(parent_rect.left());
+            let x1 = axis.x(child.span.t1()).min(parent_rect.right()).max(x0 + 2.0);
+            let rect = Rect::from_min_max(Pos2::new(x0, parent_rect.top()), Pos2::new(x1, parent_rect.bottom()));
+            if rect.right() <= parent_rect.left() || rect.left() >= parent_rect.right() {
+                continue; // Scrolled entirely past the parent's own visible bar.
+            }
+
+            if selected {
+                p.rect_filled(rect.expand(2.0), CornerRadius::same(2), with_alpha(theme.selection, 100));
+            }
+            p.rect_filled(rect, CornerRadius::same(2), fill);
+            p.rect_stroke(
+                rect,
+                CornerRadius::same(2),
+                Stroke::new(1.0, with_alpha(shade(lane_color, -0.3), alpha)),
+                StrokeKind::Outside,
+            );
+            hits.push(Hit { rect: rect.expand(2.0), sel: Selection::Event(child.id) });
+
+            if show_label {
+                nested_child_label(
+                    p,
+                    &mut label_packer,
+                    &child.title,
+                    rect.center().x,
+                    (rect.width() - 4.0).max(20.0),
+                    parent_rect.top(),
+                    alpha,
+                    theme,
+                );
+            }
+
+            paint_nested_events(p, app, doc, filters, child, rect, axis, lane_color, theme, depth + 1, labels_allowed, hits);
         } else {
             let cx = axis.x(child.span.t0());
-            Rect::from_center_size(
-                Pos2::new(cx, row_top + row_h * 0.5),
-                Vec2::splat(row_h * 0.8),
-            )
-        };
+            if cx < parent_rect.left() - 20.0 || cx > parent_rect.right() + 20.0 {
+                continue; // Scrolled well off screen — not worth painting.
+            }
+            let center = Pos2::new(cx, parent_rect.center().y);
+            let r = (parent_rect.height() * 0.5).clamp(2.5, 5.0);
 
-        // A tether ties the child back to the parent bar it belongs to.
-        let tether_x = rect.center().x.clamp(parent_rect.left(), parent_rect.right());
-        p.line_segment(
-            [Pos2::new(tether_x, parent_rect.bottom()), Pos2::new(tether_x, rect.top())],
-            Stroke::new(1.0, with_alpha(lane_color, 100)),
-        );
+            if selected {
+                p.circle_filled(center, r + 3.0, with_alpha(theme.selection, 110));
+            }
+            p.circle_filled(center, r + 1.0, with_alpha(theme.canvas_bg, 235));
+            p.circle_filled(center, r, fill);
+            p.circle_stroke(center, r, Stroke::new(1.0, with_alpha(shade(lane_color, -0.4), alpha)));
 
-        if selected {
-            p.rect_filled(rect.expand(2.0), CornerRadius::same(2), with_alpha(theme.selection, 100));
-        }
-        p.rect_filled(rect, CornerRadius::same(2), fill);
-        p.rect_stroke(
-            rect,
-            CornerRadius::same(2),
-            Stroke::new(1.0, with_alpha(shade(lane_color, -0.3), alpha)),
-            StrokeKind::Outside,
-        );
+            hits.push(Hit {
+                rect: Rect::from_center_size(center, Vec2::splat(r * 2.0 + 4.0)),
+                sel: Selection::Event(child.id),
+            });
 
-        hits.push(Hit {
-            rect: rect.expand(2.0),
-            sel: Selection::Event(child.id),
-        });
-
-        // A short title next to the marker when there is obviously room for
-        // one; dense clusters fall back to the hover tooltip instead of
-        // fighting over space the way top-level labels do.
-        if doc.view.show_labels {
-            let font = FontId::proportional((row_h - 2.0).max(9.0));
-            let color = with_alpha(theme.text_dim, alpha);
-            let galley = p.layout_no_wrap(child.title.clone(), font, color);
-            let pos = Pos2::new(rect.right() + 3.0, rect.top());
-            // A nested row sits right at the top-level band's own height for
-            // a range event whose bar hugs the band closely, so its title
-            // was landing directly on the band's own colour with nothing to
-            // guarantee contrast — an opaque backing, like every other
-            // on-canvas label already has, fixes that regardless of hue.
-            p.rect_filled(
-                Rect::from_min_size(pos, galley.size()).expand2(Vec2::new(2.0, 1.0)),
-                CornerRadius::same(2),
-                theme.canvas_bg,
-            );
-            p.galley(pos, galley, theme.text_dim);
-        }
-
-        // Same collapse rule as the top level: a nested range event zoomed
-        // down to a sliver stops offering up its own further sub-detail —
-        // e.g. once "Archidamischer Krieg" itself is too thin to read, its
-        // "429 v. Chr.: Einfall der Spartaner in Attika" sub-event should not
-        // still be drawn in an even tinier row underneath it.
-        if !range_collapsed(child, axis.ppy) {
-            paint_nested_events(
-                p,
-                app,
-                doc,
-                filters,
-                child,
-                rect,
-                axis,
-                lane_color,
-                lane_bottom_limit,
-                theme,
-                depth + 1,
-                hits,
-            );
+            if show_label {
+                nested_child_label(p, &mut label_packer, &child.title, cx, 170.0, parent_rect.top(), alpha, theme);
+            }
         }
     }
+}
+
+/// A short title floated just above `top_y`, centred on `anchor_x` — used for
+/// both a nested point-child's marker and a nested range-child's own segment,
+/// so a title never has to fit inside a bar only a few pixels tall (the same
+/// idea as an epoch's name overlaid on its timeline band, just floated
+/// entirely above it rather than centred within it, since a nested bar is
+/// far thinner than a timeline's own). `packer` — shared across every
+/// sibling in the same call — pushes a label that would otherwise overlap
+/// its neighbour up onto a further row instead, the same idea as top-level
+/// labels stacking in `LabelPacker` rows, just with a small fixed cap of its
+/// own rather than a lane-height reservation behind it; a title that still
+/// doesn't fit within `MAX_NESTED_LABEL_ROWS` is silently dropped and falls
+/// back to the hover tooltip.
+#[allow(clippy::too_many_arguments)]
+fn nested_child_label(
+    p: &egui::Painter,
+    packer: &mut LabelPacker,
+    name: &str,
+    anchor_x: f32,
+    max_width: f32,
+    top_y: f32,
+    alpha: u8,
+    theme: &Theme,
+) {
+    if name.trim().is_empty() {
+        return;
+    }
+    let font = FontId::proportional(9.5);
+    let color = with_alpha(theme.text_dim, alpha);
+    let fitted = fit_text(p, name, &font, color, max_width);
+    let galley = p.layout_no_wrap(fitted, font, color);
+    let w = galley.size().x;
+    let x_min = anchor_x - w * 0.5;
+    let Some(row) = packer.place_rows(x_min, x_min + w, 1, MAX_NESTED_LABEL_ROWS) else {
+        return;
+    };
+    let pos = Pos2::new(x_min, top_y - galley.size().y - 2.0 - row as f32 * NESTED_LABEL_ROW_HEIGHT);
+    // Fully opaque — see the comment on `junction_label`'s identical fix.
+    p.rect_filled(
+        Rect::from_min_size(pos, galley.size()).expand2(Vec2::new(2.0, 1.0)),
+        CornerRadius::same(2),
+        theme.canvas_bg,
+    );
+    p.galley(pos, galley, color);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1210,24 +1522,58 @@ fn paint_point(
     Rect::from_center_size(center, Vec2::splat(r * 2.0 + 6.0))
 }
 
+/// Paints a range event's own bar, either above the band (a "long event"
+/// with its own nested content, possibly pushed further up by
+/// `stack_offset` if it shares the lane with an overlapping long event) or
+/// below it (an ordinary childless range, exactly mirroring the above case).
+/// `y` is always the actual band centre — needed regardless of `below`, so
+/// the connecting ticks at the range's start/end always reach the real band
+/// line rather than just the bar's own edge.
 #[allow(clippy::too_many_arguments)]
 fn paint_range(
     p: &egui::Painter,
     ev: &Event,
     axis: &TimeAxis,
     y: f32,
+    below: bool,
+    stack_offset: f32,
     lane_color: Color32,
     alpha: u8,
     ring: Option<Color32>,
     selected: bool,
+    has_children: bool,
+    content_rect: Rect,
     theme: &Theme,
 ) -> Rect {
-    let h = range_bar_height(ev.importance);
-    let x0 = axis.x(ev.span.t0());
-    let x1 = axis.x(ev.span.t1()).max(x0 + 3.0);
-    // Sits just above the band so it never hides the band itself.
-    let top = y - h - 9.0;
-    let r = Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, top + h));
+    // A bare bar only needs to read as "a range, not a point"; one with
+    // nested content on it needs enough of its own height for a child
+    // segment's fill and a marker to actually sit on, comfortably clear of
+    // the label rows beyond it (see the comment at this function's call
+    // site) — only ever the case for a bar above the band, since a
+    // below-the-band bar is by definition a childless, "plain" event.
+    let h = range_bar_height(ev.importance) + if has_children { 10.0 } else { 0.0 };
+    // Clamped to just past the visible edges rather than the raw (possibly
+    // enormous) pixel position a far-off-screen date maps to — a years-wide
+    // war zoomed in far enough that its own span is many screens wide used
+    // to hand the renderer a rect thousands of pixels past the clip rect on
+    // one or both sides, which reproducibly failed to paint *anything* at
+    // all rather than just clipping visibly, on this eframe/glow version.
+    // Clamping first sidesteps that rather than depending on a fix (or an
+    // explanation) landing upstream; a bar's edges rounding off screen is
+    // invisible to the user either way, since nothing out there was drawn
+    // precisely regardless.
+    let margin = 100.0;
+    let x0 = axis.x(ev.span.t0()).max(content_rect.left() - margin);
+    let x1 = axis.x(ev.span.t1()).min(content_rect.right() + margin).max(x0 + 3.0);
+    // The edge nearest the band sits a fixed gap away, pushed further out by
+    // `stack_offset` when this bar shares its lane with an overlapping long
+    // event stacked in front of it; the far edge is `h` beyond that, away
+    // from the band either way.
+    let dir: f32 = if below { 1.0 } else { -1.0 };
+    let near_edge = y + dir * (9.0 + stack_offset);
+    let far_edge = near_edge + dir * h;
+    let (top, bottom) = if below { (near_edge, far_edge) } else { (far_edge, near_edge) };
+    let r = Rect::from_min_max(Pos2::new(x0, top), Pos2::new(x1, bottom));
     let cr = CornerRadius::same((h * 0.5) as u8);
 
     if selected {
@@ -1237,10 +1583,11 @@ fn paint_range(
     if let Some(rc) = ring {
         p.rect_stroke(r, cr, Stroke::new(1.5, with_alpha(rc, alpha)), StrokeKind::Outside);
     }
-    // Ticks down to the band mark where the range starts and ends.
+    // Ticks to the band mark where the range starts and ends.
+    let band_edge = y + dir * 2.0;
     for x in [x0, x1] {
         p.line_segment(
-            [Pos2::new(x, r.bottom()), Pos2::new(x, y - 2.0)],
+            [Pos2::new(x, near_edge), Pos2::new(x, band_edge)],
             Stroke::new(1.0, with_alpha(lane_color, 120)),
         );
     }

@@ -410,6 +410,26 @@ fn fuse_period_tokens(s: &str) -> String {
     out.join(" ")
 }
 
+/// Splits a German ordinal day glued directly onto the following word
+/// ("1.Januar", "14.Jul") by inserting a space after any '.' immediately
+/// followed by a letter. Never after one followed by a digit, so the
+/// day.month.year numeric form ("14.07.1789", handled earlier in
+/// `parse_ymd` and never reaching this point) can't be affected — a '.'
+/// followed by a letter is never part of a numeric date separator, so this
+/// is safe to apply unconditionally rather than gating it like
+/// `fuse_period_tokens` has to.
+fn split_ordinal_dot(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 1);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '.' && chars.peek().is_some_and(|n| n.is_alphabetic()) {
+            out.push(' ');
+        }
+    }
+    out
+}
+
 /// Recognises a German season name — optionally "früh"/"spät" prefixed for
 /// early/late ("Frühherbst", "Spätsommer") — or a calendar quarter/half-year
 /// (after `fuse_period_tokens` has attached its ordinal, or the "q1".."q4"/
@@ -445,13 +465,17 @@ fn month_from_period(tok: &str) -> Option<u8> {
         }
     }
 
-    const PERIODS: [(&str, u8); 18] = [
+    const PERIODS: [(&str, u8); 21] = [
         ("quartal1", 2), ("vierteljahr1", 2), ("q1", 2),
         ("quartal2", 5), ("vierteljahr2", 5), ("q2", 5),
         ("quartal3", 8), ("vierteljahr3", 8), ("q3", 8),
         ("quartal4", 11), ("vierteljahr4", 11), ("q4", 11),
         ("hälfte1", 4), ("halbjahr1", 4), ("h1", 4),
         ("hälfte2", 10), ("halbjahr2", 10), ("h2", 10),
+        // "Anfang 1789" / "Ende 1789" — placed at the year's first or last
+        // month, same as how a table import spells an approximate date.
+        ("anfang", 1), ("beginn", 1),
+        ("ende", 12),
     ];
     PERIODS.iter().find(|(k, _)| *k == tok).map(|(_, m)| *m)
 }
@@ -495,6 +519,12 @@ fn parse_ymd(s: &str) -> Option<(i32, Option<u8>, Option<u8>, bool)> {
         }
     }
 
+    // A German ordinal day glued straight onto the next word with no space
+    // ("1.Januar") would otherwise tokenise as one indivisible, unparseable
+    // blob — split it apart first.
+    let split = split_ordinal_dot(s);
+    let s: &str = &split;
+
     // Quarter/half-year expressions ("1. Quartal 1789") contain a literal
     // '.' that would otherwise look like the day.month.year separator just
     // above, so they're normalised — ordinal fused onto the keyword, '.'
@@ -525,7 +555,14 @@ fn parse_ymd(s: &str) -> Option<(i32, Option<u8>, Option<u8>, bool)> {
     let mut is_period = false;
     let mut numbers: Vec<i32> = Vec::new();
     for tok in tokens {
-        let tok = tok.trim_end_matches(',');
+        // A German ordinal day ("1.", "14.") keeps its trailing '.' once we
+        // reach here — the day.month.year numeric form above only handles a
+        // *bare* dotted date, so "1. Januar 1789" falls through to this
+        // per-token loop with the period still attached, where it used to
+        // make the day token fail `str::parse::<i32>` and reject the whole
+        // date. A trailing '.' on a month abbreviation ("jul.") is likewise
+        // safe to drop here — `month_from_name` already strips it itself.
+        let tok = tok.trim_end_matches([',', '.']);
         if let Some(m) = month_from_name(tok) {
             month = Some(m);
         } else if let Some(m) = month_from_period(tok) {
@@ -1566,6 +1603,30 @@ mod tests {
     }
 
     #[test]
+    fn a_german_ordinal_day_before_a_spelled_out_month_still_parses() {
+        // "1. Januar 1789" used to return None outright: the day.month.year
+        // numeric form just above only handles a *bare* dotted date, so this
+        // fell through to the per-token loop with the day's ordinal '.'
+        // still attached, where `"1.".parse::<i32>()` fails and the whole
+        // date was rejected — not just misread, rejected entirely.
+        let want = Some(HDate {
+            month: Some(1),
+            day: Some(1),
+            ..HDate::year(-413)
+        });
+        assert_eq!(HDate::parse("1. Januar 413 v. Chr."), want);
+        assert_eq!(HDate::parse("1.Januar 413 v. Chr."), want);
+        assert_eq!(
+            HDate::parse("14. Juli 1789"),
+            Some(HDate {
+                month: Some(7),
+                day: Some(14),
+                ..HDate::year(1789)
+            })
+        );
+    }
+
+    #[test]
     fn parses_german_seasons_with_early_late_prefixes_in_chronological_order() {
         // Within one year, each season's early/mid/late variant must land in
         // a month that keeps the whole sequence in order — a season is
@@ -1620,6 +1681,28 @@ mod tests {
         assert!(q[0] < h1 && h1 < q[2], "H1 should sit between Q1 and Q3");
 
         assert_eq!(HDate::parse("2. Halbjahr 1789").unwrap().month, Some(h2));
+    }
+
+    #[test]
+    fn parses_anfang_and_ende_as_the_first_or_last_month_of_the_year() {
+        // "Anfang 1789" / "Ende 1789" place the date at the year's start or
+        // end, same as an import row that only gives an approximate edge —
+        // hence the automatic `Circa`, just like seasons and quarters.
+        let want_start = Some(HDate {
+            month: Some(1),
+            qualifier: DateQualifier::Circa,
+            ..HDate::year(1789)
+        });
+        let want_end = Some(HDate {
+            month: Some(12),
+            qualifier: DateQualifier::Circa,
+            ..HDate::year(1789)
+        });
+        assert_eq!(HDate::parse("Anfang 1789"), want_start);
+        assert_eq!(HDate::parse("Beginn 1789"), want_start);
+        assert_eq!(HDate::parse("1789 Anfang"), want_start);
+        assert_eq!(HDate::parse("Ende 1789"), want_end);
+        assert_eq!(HDate::parse("1789 Ende"), want_end);
     }
 
     #[test]

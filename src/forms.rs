@@ -7,7 +7,7 @@
 use crate::app::{Confirm, Selection, TimelineApp};
 use crate::model::*;
 use egui::Color32;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 pub enum Dialog {
     None,
@@ -1836,24 +1836,72 @@ fn resolve_import_categories(doc: &mut Document, row_category: Option<&str>, bul
 /// column nobody wants). There is no separate "ignore this column" control:
 /// any column simply never chosen in the pickers below is already ignored,
 /// this grid just makes that visible before you go looking for one.
-fn preview_grid(ui: &mut egui::Ui, table: &crate::import::ParsedTable) {
-    egui::ScrollArea::horizontal().id_salt("import_preview_scroll").show(ui, |ui| {
+/// Row 1-based numbers (matching `build_event_drafts`/`build_biography_drafts`'s
+/// `skipped` output) that fail to parse, with the reason — computed only once
+/// the columns feeding a required field are actually chosen, since before
+/// that every row would trivially "fail".
+fn compute_import_skips(form: &ImportForm, table: &crate::import::ParsedTable) -> HashMap<usize, String> {
+    match form.target {
+        ImportTarget::Events => {
+            let (Some(title), Some(date)) = (form.col_title, form.col_date) else {
+                return HashMap::new();
+            };
+            let map = crate::import::EventColumnMap {
+                title,
+                date,
+                end_date: form.col_end_date,
+                description: form.col_description,
+                category: form.col_category,
+            };
+            let (_, skipped) = crate::import::build_event_drafts(table, &map);
+            skipped.into_iter().collect()
+        }
+        ImportTarget::Biographies => {
+            let (Some(name), Some(birth)) = (form.col_name, form.col_birth) else {
+                return HashMap::new();
+            };
+            let map = crate::import::BiographyColumnMap {
+                name,
+                birth,
+                death: form.col_death,
+                category: form.col_category,
+                culture: form.col_culture,
+            };
+            let (_, skipped) = crate::import::build_biography_drafts(table, &map);
+            skipped.into_iter().collect()
+        }
+    }
+}
+
+/// A row highlighted here still shows up in the preview — its cells just
+/// gain a red tint and a tooltip with the reason — so the user can find and
+/// fix it directly in the pasted text above rather than guessing which of
+/// possibly hundreds of rows was the problem.
+fn preview_grid(ui: &mut egui::Ui, table: &crate::import::ParsedTable, skipped: &HashMap<usize, String>) {
+    egui::ScrollArea::both().id_salt("import_preview_scroll").max_height(220.0).show(ui, |ui| {
         egui::Grid::new("import_preview_grid").striped(true).show(ui, |ui| {
             for h in &table.headers {
                 ui.label(egui::RichText::new(h).strong());
             }
             ui.end_row();
-            for row in table.rows.iter().take(5) {
+            for (i, row) in table.rows.iter().enumerate() {
+                let reason = skipped.get(&(i + 1));
                 for cell in row {
-                    ui.label(cell);
+                    let text = egui::RichText::new(cell);
+                    let text = if reason.is_some() {
+                        text.background_color(Color32::from_rgba_unmultiplied(225, 120, 110, 70))
+                    } else {
+                        text
+                    };
+                    let resp = ui.label(text);
+                    if let Some(reason) = reason {
+                        resp.on_hover_text(reason);
+                    }
                 }
                 ui.end_row();
             }
         });
     });
-    if table.rows.len() > 5 {
-        ui.weak(format!("… und {} weitere Zeile(n)", table.rows.len() - 5));
-    }
 }
 
 fn import_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut ImportForm) -> bool {
@@ -1939,7 +1987,8 @@ fn import_dialog(app: &mut TimelineApp, ctx: &egui::Context, form: &mut ImportFo
                 guess_columns(form, &table.headers);
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(format!("{} Spalten erkannt · {} Zeilen", table.headers.len(), table.rows.len())).strong());
-                preview_grid(ui, &table);
+                let skips = compute_import_skips(form, &table);
+                preview_grid(ui, &table, &skips);
                 ui.add_space(6.0);
 
                 match form.target {

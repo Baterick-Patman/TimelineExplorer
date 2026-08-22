@@ -41,8 +41,11 @@ pub fn bio_thickness(ppy: f64, enlarged: bool) -> f32 {
 /// Horizontal length, in pixels, of a merge/split curve. Expressed in pixels so
 /// the curve keeps the same shape at every zoom level.
 pub const TRANSITION_PX: f64 = 110.0;
-/// Vertical gap left above a band for its event labels.
+/// Vertical gap left above a band for its long-event slots.
 pub const LABEL_BAND_TOP: f32 = 6.0;
+/// Vertical gap left below a band for its plain-event labels — mirrors
+/// `LABEL_BAND_TOP`.
+pub const LABEL_BAND_BOTTOM: f32 = 6.0;
 
 /// Zoom limits: from ~4000 years across a 1000px viewport, in to individual
 /// days — `tick_step`'s finest step (a single day) only actually gets
@@ -337,8 +340,15 @@ pub struct Lane {
     pub center: f32,
     pub top: f32,
     pub bottom: f32,
-    /// Rows of label space reserved above the band.
-    pub label_rows: usize,
+    /// Stacked slots of space reserved *above* the band for "long events" —
+    /// a range event with its own visible nested content, drawn as its own
+    /// small parallel mini-timeline. Several long events overlapping in
+    /// time each claim their own slot rather than drawing on top of one
+    /// another; see `canvas::paint_lane_events`.
+    pub above_slots: usize,
+    /// Rows of label space reserved *below* the band, for every other
+    /// (plain point, or childless range) event's marker-plus-label.
+    pub below_rows: usize,
 }
 
 impl Lane {
@@ -350,13 +360,13 @@ impl Lane {
 /// What a lane needs at the current zoom, measured before placement.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LaneDemand {
-    /// Rows of labels the lane wants.
-    pub rows: usize,
+    /// Rows of labels the lane's plain events want below the band.
+    pub below_rows: usize,
+    /// Stacked slots the lane's long events (see `Lane::above_slots`) want
+    /// above the band.
+    pub above_slots: usize,
     /// Whether the lane has anything at all in the visible window.
     pub active: bool,
-    /// Deepest chain of visible events nested inside one of this lane's
-    /// events, e.g. an event inside an event inside a range event is 2.
-    pub nested_rows: usize,
 }
 
 /// Height of a lane with nothing in the current window. Kept visible but slim,
@@ -413,27 +423,27 @@ pub const LABEL_ROW_HEIGHT: f32 = 25.0;
 pub const LANE_BOTTOM_PAD: f32 = 10.0;
 /// Never grow a lane beyond this many label rows, however dense the data.
 pub const MAX_LABEL_ROWS: usize = 14;
-/// Height of one row of nested events, stacked below the band.
-pub const NESTED_ROW_HEIGHT: f32 = 15.0;
-/// However deep a hand-edited file nests events, never reserve room for more
-/// than this many rows — a chain that long is unreadable anyway.
-pub const MAX_NESTED_ROWS: usize = 4;
-
-/// Deepest chain of *visible* events nested inside `parent`, or 0 if it has
-/// none. Bounded so a corrupt parent cycle cannot hang the UI.
-pub fn nested_depth(doc: &Document, filters: &Filters, ppy: f64, parent: Id, guard: usize) -> usize {
-    if guard > 64 {
-        return 0;
-    }
-    doc.child_events(parent)
-        .into_iter()
-        .filter(|e| event_visible(e, filters, ppy))
-        .map(|e| 1 + nested_depth(doc, filters, ppy, e.id, guard + 1))
-        .max()
-        .unwrap_or(0)
-}
+/// Height reserved for one stacked "long event" slot above a band: room for
+/// the event's own title, a nested child's label floating above its bar,
+/// and the bar itself. Sized for the worst case (a two-line title plus a
+/// full `MAX_NESTED_LABEL_ROWS` stack of nested labels), the same
+/// size-for-the-maximum approach `LABEL_ROW_HEIGHT` already takes.
+pub const LONG_EVENT_SLOT_HEIGHT: f32 = 140.0;
+/// However many long events overlap in time at once, never stack more than
+/// this many slots — a hand-edited file with more than a handful of
+/// overlapping wars is an extreme edge case; further ones share the
+/// topmost slot rather than growing the lane without bound.
+pub const MAX_LONG_EVENT_STACK: usize = 4;
 
 /// Height a lane needs for the given demand.
+///
+/// Nested events (an event inside a range event) reserve no extra space of
+/// their own here — they paint directly onto their parent's own bar as
+/// colour-coded segments/markers (see `paint_nested_events` in `canvas.rs`),
+/// exactly like an epoch on a timeline's band. What *is* reserved here is
+/// room for that parent bar itself: one `LONG_EVENT_SLOT_HEIGHT` per
+/// overlapping "long event" above the band, and one `LABEL_ROW_HEIGHT` per
+/// row of plain-event labels below it.
 pub fn lane_height(plan: &LanePlan, demand: LaneDemand) -> f32 {
     if plan.header_only {
         return 26.0;
@@ -441,8 +451,9 @@ pub fn lane_height(plan: &LanePlan, demand: LaneDemand) -> f32 {
     if !demand.active {
         return DORMANT_LANE_HEIGHT;
     }
-    let nested = demand.nested_rows.min(MAX_NESTED_ROWS) as f32 * NESTED_ROW_HEIGHT;
-    demand.rows as f32 * LABEL_ROW_HEIGHT + LABEL_BAND_TOP + plan.thickness + nested + LANE_BOTTOM_PAD
+    let above = demand.above_slots as f32 * LONG_EVENT_SLOT_HEIGHT;
+    let below = demand.below_rows as f32 * LABEL_ROW_HEIGHT;
+    above + LABEL_BAND_TOP + plan.thickness + LABEL_BAND_BOTTOM + below + LANE_BOTTOM_PAD
 }
 
 /// Which entities' events belong on a lane.
@@ -581,17 +592,19 @@ pub fn place_lanes(plans: &[LanePlan], demands: &[LaneDemand], top: f32) -> Vec<
     let mut lanes = Vec::with_capacity(plans.len());
     for (i, plan) in plans.iter().enumerate() {
         let mut demand = demands.get(i).copied().unwrap_or_default();
-        demand.rows = if demand.rows == 0 {
+        demand.below_rows = if demand.below_rows == 0 {
             0
         } else {
-            demand.rows.max(plan.min_rows).min(MAX_LABEL_ROWS)
+            demand.below_rows.max(plan.min_rows).min(MAX_LABEL_ROWS)
         };
+        demand.above_slots = demand.above_slots.min(MAX_LONG_EVENT_STACK);
         let h = lane_height(plan, demand);
-        let label_rows = if demand.active { demand.rows } else { 0 };
+        let above_slots = if demand.active { demand.above_slots } else { 0 };
+        let below_rows = if demand.active { demand.below_rows } else { 0 };
         let center = if plan.header_only || !demand.active {
             y + h * 0.5
         } else {
-            y + label_rows as f32 * LABEL_ROW_HEIGHT + LABEL_BAND_TOP + plan.thickness * 0.5
+            y + above_slots as f32 * LONG_EVENT_SLOT_HEIGHT + LABEL_BAND_TOP + plan.thickness * 0.5
         };
         lanes.push(Lane {
             kind: plan.kind,
@@ -604,7 +617,8 @@ pub fn place_lanes(plans: &[LanePlan], demands: &[LaneDemand], top: f32) -> Vec<
             center,
             top: y,
             bottom: y + h,
-            label_rows,
+            above_slots,
+            below_rows,
         });
         y += h;
     }
@@ -1006,22 +1020,36 @@ impl LabelPacker {
         Self::default()
     }
 
-    /// Claim a row for a label spanning `[x_min, x_max]`.
+    /// Claim `rows_needed` *consecutive* rows for a label spanning
+    /// `[x_min, x_max]` — a title that wraps onto a second line needs both
+    /// rows it actually occupies reserved, not just the one its first line
+    /// starts in, or the packer could still hand the row directly above it
+    /// to some other label and the two would overlap.
     ///
-    /// Returns the row index, or `None` if every allowed row is taken.
-    pub fn place(&mut self, x_min: f32, x_max: f32, max_rows: usize) -> Option<usize> {
+    /// Returns the index of the first (nearest-the-band) row claimed, or
+    /// `None` if no run of `rows_needed` consecutive free rows exists within
+    /// `max_rows`.
+    pub fn place_rows(&mut self, x_min: f32, x_max: f32, rows_needed: usize, max_rows: usize) -> Option<usize> {
+        if rows_needed == 0 || rows_needed > max_rows {
+            return None;
+        }
         let pad = 6.0;
-        for row in 0..max_rows {
-            if self.rows.len() <= row {
-                self.rows.push(Vec::new());
+        'start: for start in 0..=(max_rows - rows_needed) {
+            for row in start..start + rows_needed {
+                if self.rows.len() <= row {
+                    self.rows.push(Vec::new());
+                }
+                let free = self.rows[row]
+                    .iter()
+                    .all(|(a, b)| x_max + pad < *a || x_min - pad > *b);
+                if !free {
+                    continue 'start;
+                }
             }
-            let free = self.rows[row]
-                .iter()
-                .all(|(a, b)| x_max + pad < *a || x_min - pad > *b);
-            if free {
+            for row in start..start + rows_needed {
                 self.rows[row].push((x_min, x_max));
-                return Some(row);
             }
+            return Some(start);
         }
         None
     }
@@ -1717,33 +1745,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_event_with_no_children_has_zero_nested_depth() {
-        let mut doc = Document::default();
-        doc.events.push(nested_event(Id(1), None, 3));
-        assert_eq!(nested_depth(&doc, &Filters::default(), 2.0, Id(1), 0), 0);
-    }
-
-    #[test]
-    fn nested_depth_counts_the_longest_chain() {
-        let mut doc = Document::default();
-        doc.events.push(nested_event(Id(1), None, 3));
-        doc.events.push(nested_event(Id(2), Some(Id(1)), 3));
-        doc.events.push(nested_event(Id(3), Some(Id(2)), 3));
-        assert_eq!(nested_depth(&doc, &Filters::default(), 2.0, Id(1), 0), 2);
-    }
-
-    #[test]
-    fn nested_depth_ignores_children_hidden_by_filters_or_zoom() {
-        let mut doc = Document::default();
-        doc.events.push(nested_event(Id(1), None, 3));
-        // Importance 1 needs to be zoomed in a long way to survive the
-        // zoom-dependent importance threshold.
-        doc.events.push(nested_event(Id(2), Some(Id(1)), 1));
-        assert_eq!(nested_depth(&doc, &Filters::default(), 0.1, Id(1), 0), 0);
-        assert_eq!(nested_depth(&doc, &Filters::default(), 50.0, Id(1), 0), 1);
-    }
-
     fn ranged_event(id: Id, start: i32, end: i32) -> Event {
         Event {
             id,
@@ -1835,19 +1836,12 @@ mod tests {
     /// Plan + place with no measured label demand, i.e. minimum lane sizes.
     fn build_lanes(doc: &Document, top: f32, filters: &Filters) -> Vec<Lane> {
         let plans = plan_lanes(doc, filters);
-        let demands = vec![
-            LaneDemand {
-                rows: 0,
-                active: true,
-                nested_rows: 0,
-            };
-            plans.len()
-        ];
+        let demands = vec![LaneDemand { below_rows: 0, above_slots: 0, active: true }; plans.len()];
         place_lanes(&plans, &demands, top)
     }
 
     fn demands(n: usize, rows: usize) -> Vec<LaneDemand> {
-        vec![LaneDemand { rows, active: true, nested_rows: 0 }; n]
+        vec![LaneDemand { below_rows: rows, above_slots: 0, active: true }; n]
     }
 
     fn lane_doc() -> Document {
@@ -2342,7 +2336,7 @@ mod tests {
             dense[0].bottom - dense[0].top > sparse[0].bottom - sparse[0].top,
             "a lane with many labels must get more room, not drop them"
         );
-        assert_eq!(dense[0].label_rows, 8);
+        assert_eq!(dense[0].below_rows, 8);
     }
 
     #[test]
@@ -2350,7 +2344,7 @@ mod tests {
         let doc = lane_doc();
         let plans = plan_lanes(&doc, &Filters::default());
         let lanes = place_lanes(&plans, &demands(plans.len(), 9_999), 0.0);
-        assert_eq!(lanes[0].label_rows, MAX_LABEL_ROWS);
+        assert_eq!(lanes[0].below_rows, MAX_LABEL_ROWS);
     }
 
     #[test]
@@ -2359,34 +2353,75 @@ mod tests {
         let plans = plan_lanes(&doc, &Filters::default());
         // One label's worth of demand still gets the timeline minimum.
         let lanes = place_lanes(&plans, &demands(plans.len(), 1), 0.0);
-        assert!(lanes[0].label_rows >= 2, "timelines reserve label space");
+        assert!(lanes[0].below_rows >= 2, "timelines reserve label space");
     }
 
     #[test]
     fn a_lane_with_no_labels_reserves_no_label_space() {
         // A band that exists in the window but has no events in it should not
-        // leave a tall empty gap above itself.
+        // leave a tall empty gap below itself.
         let doc = lane_doc();
         let plans = plan_lanes(&doc, &Filters::default());
         let empty = place_lanes(&plans, &demands(plans.len(), 0), 0.0);
         let labelled = place_lanes(&plans, &demands(plans.len(), 1), 0.0);
-        assert_eq!(empty[0].label_rows, 0);
+        assert_eq!(empty[0].below_rows, 0);
         assert!(empty[0].bottom - empty[0].top < labelled[0].bottom - labelled[0].top);
     }
 
     #[test]
-    fn label_space_sits_above_the_band_in_every_lane() {
+    fn label_space_sits_below_the_band_in_every_lane() {
         let doc = lane_doc();
         let plans = plan_lanes(&doc, &Filters::default());
         let lanes = place_lanes(&plans, &demands(plans.len(), 4), 0.0);
         for l in &lanes {
-            let band_top = l.center - l.thickness * 0.5;
+            let band_bottom = l.center + l.thickness * 0.5;
             assert!(
-                band_top - l.top >= l.label_rows as f32 * LABEL_ROW_HEIGHT,
+                l.bottom - band_bottom >= l.below_rows as f32 * LABEL_ROW_HEIGHT,
                 "lane {} does not reserve room for its labels",
                 l.name
             );
             assert!(l.bottom >= l.center + l.thickness * 0.5);
+        }
+    }
+
+    fn above_demands(n: usize, slots: usize) -> Vec<LaneDemand> {
+        vec![LaneDemand { below_rows: 0, above_slots: slots, active: true }; n]
+    }
+
+    #[test]
+    fn lanes_grow_to_fit_stacked_long_events_above_the_band() {
+        let doc = lane_doc();
+        let plans = plan_lanes(&doc, &Filters::default());
+        let one = place_lanes(&plans, &above_demands(plans.len(), 1), 0.0);
+        let two = place_lanes(&plans, &above_demands(plans.len(), 2), 0.0);
+        assert!(
+            two[0].bottom - two[0].top > one[0].bottom - one[0].top,
+            "a second overlapping long event must get its own slot, not share the first's"
+        );
+        assert_eq!(one[0].above_slots, 1);
+        assert_eq!(two[0].above_slots, 2);
+    }
+
+    #[test]
+    fn long_event_stacking_is_capped_so_it_cannot_grow_without_bound() {
+        let doc = lane_doc();
+        let plans = plan_lanes(&doc, &Filters::default());
+        let lanes = place_lanes(&plans, &above_demands(plans.len(), 9_999), 0.0);
+        assert_eq!(lanes[0].above_slots, MAX_LONG_EVENT_STACK);
+    }
+
+    #[test]
+    fn stacked_slot_space_sits_above_the_band_in_every_lane() {
+        let doc = lane_doc();
+        let plans = plan_lanes(&doc, &Filters::default());
+        let lanes = place_lanes(&plans, &above_demands(plans.len(), 2), 0.0);
+        for l in &lanes {
+            let band_top = l.center - l.thickness * 0.5;
+            assert!(
+                band_top - l.top >= l.above_slots as f32 * LONG_EVENT_SLOT_HEIGHT,
+                "lane {} does not reserve room for its stacked long events",
+                l.name
+            );
         }
     }
 
@@ -2415,7 +2450,7 @@ mod tests {
         let awake = place_lanes(&plans, &demands(plans.len(), 3), 0.0);
         let asleep = place_lanes(
             &plans,
-            &vec![LaneDemand { rows: 3, active: false, nested_rows: 0 }; plans.len()],
+            &vec![LaneDemand { below_rows: 3, above_slots: 0, active: false }; plans.len()],
             0.0,
         );
         assert!(asleep[0].bottom - asleep[0].top < awake[0].bottom - awake[0].top);
@@ -2455,11 +2490,7 @@ mod tests {
         let doc = lane_doc();
         let plans = plan_lanes(&doc, &Filters::default());
         let rows: Vec<LaneDemand> = (0..plans.len())
-            .map(|i| LaneDemand {
-                rows: i * 3,
-                active: i % 2 == 0,
-                nested_rows: 0,
-            })
+            .map(|i| LaneDemand { below_rows: i * 3, above_slots: 0, active: i % 2 == 0 })
             .collect();
         let lanes = place_lanes(&plans, &rows, 5.0);
         for w in lanes.windows(2) {
@@ -2472,16 +2503,38 @@ mod tests {
     #[test]
     fn overlapping_labels_are_pushed_to_further_rows() {
         let mut p = LabelPacker::new();
-        assert_eq!(p.place(0.0, 100.0, 3), Some(0));
-        assert_eq!(p.place(50.0, 150.0, 3), Some(1));
-        assert_eq!(p.place(60.0, 160.0, 3), Some(2));
-        assert_eq!(p.place(70.0, 170.0, 3), None, "should run out of rows");
+        assert_eq!(p.place_rows(0.0, 100.0, 1, 3), Some(0));
+        assert_eq!(p.place_rows(50.0, 150.0, 1, 3), Some(1));
+        assert_eq!(p.place_rows(60.0, 160.0, 1, 3), Some(2));
+        assert_eq!(p.place_rows(70.0, 170.0, 1, 3), None, "should run out of rows");
     }
 
     #[test]
     fn non_overlapping_labels_share_the_first_row() {
         let mut p = LabelPacker::new();
-        assert_eq!(p.place(0.0, 100.0, 3), Some(0));
-        assert_eq!(p.place(200.0, 300.0, 3), Some(0));
+        assert_eq!(p.place_rows(0.0, 100.0, 1, 3), Some(0));
+        assert_eq!(p.place_rows(200.0, 300.0, 1, 3), Some(0));
+    }
+
+    #[test]
+    fn a_two_row_label_reserves_both_rows_it_occupies() {
+        let mut p = LabelPacker::new();
+        // A wrapped, two-line label claims rows 0 and 1 together...
+        assert_eq!(p.place_rows(0.0, 100.0, 2, 4), Some(0));
+        // ...so an overlapping single-line label must skip past both of
+        // them rather than landing on row 1 and colliding with the second
+        // line of the label above it.
+        assert_eq!(p.place_rows(0.0, 100.0, 1, 4), Some(2));
+        // A non-overlapping label is free to still use row 0 or row 1.
+        assert_eq!(p.place_rows(200.0, 300.0, 1, 4), Some(0));
+    }
+
+    #[test]
+    fn a_two_row_label_is_rejected_once_too_few_consecutive_rows_remain() {
+        let mut p = LabelPacker::new();
+        assert_eq!(p.place_rows(0.0, 100.0, 1, 3), Some(0));
+        assert_eq!(p.place_rows(0.0, 100.0, 1, 3), Some(1));
+        // Only row 2 is left free — not enough for a two-row label.
+        assert_eq!(p.place_rows(0.0, 100.0, 2, 3), None);
     }
 }

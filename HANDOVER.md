@@ -148,17 +148,77 @@ of a wide range; and the ruler now labels ticks down to individual days —
 original whole-year floor. `MAX_PPY` raised from 4,000 to 60,000 so day-level
 ticks are actually reachable, not just mathematically defined.
 
-**Deliberately not done in this pass** — each is a substantial feature in
+**Deliberately not done in that pass** — each was a substantial feature in
 its own right, and squeezing it in alongside everything above risked doing
 it half-right: nested events that are themselves ranges (e.g. "Archidamischer
-Krieg" inside "Peloponnesischer Krieg") still render as small rows below
+Krieg" inside "Peloponnesischer Krieg") still rendered as small rows below
 their parent rather than as an epoch-style coloured segment *on* the
-parent's own bar; there is no dedicated fast-zoom slider next to the detail
-bias slider; and the top-left search does not yet parse a typed date and
-jump to it directly.
+parent's own bar; there was no dedicated fast-zoom slider next to the detail
+bias slider; and the top-left search did not yet parse a typed date and
+jump to it directly. The first and third of those are done now (next
+paragraph); the fast-zoom slider is still the one open item — see §7.
 
-- **~13,020 lines** of Rust across 14 files in `src/`.
-- **159 tests**, all passing, no compiler warnings (5 pre-existing clippy
+The very next round of hands-on testing (still same major version, no
+release cut between the two) produced an eight-item batch, all now done:
+the sidebar group-label bug turned out to still reproduce — `measure_lanes`
+computed `active` as `plan.header_only || lane_active(...)`, which forced an
+*expanded* group's own header row to always report itself active regardless
+of whether anything under it was actually in view, so its sticky name never
+disappeared the way a dormant timeline's already did; removing the
+`header_only ||` short-circuit was the whole fix (`lane_height` and
+`paint_lane_events` already gate on `header_only` independently, so nothing
+else needed to change). Nested events now render directly **on** their
+parent's own bar instead of in rows underneath it — the redesign promised
+above — see the dedicated section below. Import gained "Anfang"/"Beginn"/
+"Ende" + a year (placing the date at that year's first or last month,
+`Circa`-qualified, the same pattern as seasons/quarters) and a visual
+red-tint + tooltip on any preview row that fails to parse, so a bad row can
+be found and fixed in the pasted text without guessing which of possibly
+hundreds of rows it was. The top-left search now parses a typed date
+directly (leaning entirely on the existing `HDate::parse` — no new format
+support was needed, just a place to feed it a date instead of only a name)
+and can also find and jump to an epoch or a biography's life phase, not just
+events/timelines/biographies/groups. A long event title now wraps onto a
+second line instead of immediately ellipsising once it will not fit
+verbatim — see the section below on `LabelPacker::place_rows`.
+
+The screenshots that came back from testing that batch were all still taken
+against the *previous* release — every one of them showed exactly the
+pre-fix behaviour (the group label still not disappearing, the nested event
+still drawn in a row below rather than as a segment on the parent's own bar,
+search-by-date visibly doing nothing), which is expected since nothing above
+had been released yet. Genuinely new out of that same round, though: two
+real, previously-unnoticed date-parsing bugs, a biography life-phase label
+visibility fix, and two follow-on refinements to the nested-events-on-band
+redesign once a closer look at a denser dataset showed it needed them —
+covered in their own dedicated sections below.
+
+Asked to "implement everything" immediately after, including the one item
+flagged above as explicitly not attempted: the canvas is now reorganised so
+a long event with its own sub-structure gets a dedicated stacked slot
+*above* its timeline's band, plain single events moved *below* it, and
+several overlapping long events stack progressively higher, each pushing
+`layout::lane_height`/`place_lanes` to reserve more room, which — for free,
+since lanes already stack sequentially — pushes every following
+timeline/group lane further down to make room. This did end up touching
+`LaneDemand`/`lane_height`/`place_lanes` exactly as predicted; see the
+dedicated section below for the full design and its tradeoffs.
+
+With the feature list essentially complete, the round after that was an
+explicit pre-1.0 QA pass rather than a new request: a deliberately
+stress-heavy throwaway document (deep nesting, several mutually-overlapping
+long events, a single absurdly long word, a zero-duration range, the BC/AD
+boundary, a collapsed group, an open-ended biography) screenshotted across
+many zoom levels and pan positions. Found and fixed four more real bugs, all
+of them in the two features built earlier this session under load neither
+had actually been tested against — see the dedicated section below,
+"A pre-1.0 QA pass found four more real bugs." Light mode was checked once,
+found readable, and explicitly deprioritised for further scrutiny per
+direct instruction — don't read the lack of deeper light-mode testing here
+as "it's broken," just as "not this round's focus." **v1.0.0.**
+
+- **~13,600 lines** of Rust across 14 files in `src/`.
+- **163 tests**, all passing, no compiler warnings (5 pre-existing clippy
   style lints — `derivable_impls`, `collapsible_if`,
   `field_reassign_with_default` — left as-is, not regressions).
 - Release binary: `target/release/timeline_explorer.exe`, single file, ~9 MB
@@ -353,7 +413,7 @@ internal state without a console. Extend it the same way when debugging.
 
 ```bash
 cargo build            # debug
-cargo test             # 92 tests, ~0.2s, all pure logic — no window needed
+cargo test             # 159 tests, ~0.2s, all pure logic — no window needed
 cargo build --release  # the shippable single exe
 ```
 
@@ -376,16 +436,16 @@ Rough dependency order — `model` and `layout` are the load-bearing parts.
 
 | File | Lines | What it owns |
 | --- | --- | --- |
-| `model.rs` | 1724 | Data model + serde. Dates, spans, timelines, groups, biographies, events, categories, filters. **No UI, no geometry.** |
-| `layout.rs` | 2091 | Time axis, tick steps, visibility rules, lane planning/placement, band curves, label packing. **No painting** — that's why it holds the largest share of the tests. |
-| `forms.rs` | 2206 | Modal editors for group/timeline/biography/event/categories/export/import. |
-| `app.rs` | 1328 | `TimelineApp` state, undo/redo, autosave, menus, keyboard shortcuts, top-level layout. |
-| `canvas.rs` | 1308 | All painting of the timeline surface + canvas input handling. |
-| `panels.rs` | 1262 | Sidebar (group tree, biographies, filters) and inspector. |
+| `layout.rs` | 2540 | Time axis, tick steps, visibility rules, lane planning/placement, band curves, label packing. **No painting** — that's why it holds the largest share of the tests. |
+| `forms.rs` | 2299 | Modal editors for group/timeline/biography/event/categories/export/import. |
+| `model.rs` | 2052 | Data model + serde. Dates, spans, timelines, groups, biographies, events, categories, filters. **No UI, no geometry.** |
+| `canvas.rs` | 1818 | All painting of the timeline surface + canvas input handling. **No test module at all** — see §6. |
+| `app.rs` | 1392 | `TimelineApp` state, undo/redo, autosave, menus, keyboard shortcuts, top-level layout, jump targets. |
+| `panels.rs` | 1255 | Sidebar (group tree, biographies, filters) and inspector. |
 | `example.rs` | 604 | The optional worked example dataset. |
-| `store.rs` | 416 | Load/save, atomic replace, rotating backups. |
+| `store.rs` | 477 | Load/save, atomic replace, rotating backups. |
 | `export.rs` | 410 | PNG/PDF export by driving the real canvas painter and capturing a screenshot. |
-| `theme.rs` | 353 | Palette, importance→size/opacity encoding, egui `Visuals` override. |
+| `theme.rs` | 360 | Palette, importance→size/opacity encoding, egui `Visuals` override. |
 | `import.rs` | 345 | Bulk import: table parsing, HTML table extraction, column-guessing, lenient draft-building. The only file with network code (`fetch_url`, opt-in). |
 | `main.rs` | 44 | Entry point, window options. |
 
@@ -588,6 +648,49 @@ already-visible one (shown as `Lane` despite having a culture, say) must not
 be silently switched to `Inline` just because jumping to it noticed it has
 one.
 
+### `JumpTarget` grew an `Epoch` and a `Date` variant — neither is a `Selection`
+
+The doc comment above `JumpTarget` had, from the start, explicitly left room
+for "a jump target later that isn't a valid `Selection` (an epoch, say)" —
+this is that. `Epoch(OwnerRef, usize)` addresses one of a timeline's
+`epochs` or a biography's `life_phases` by its owner plus index (`Epoch`
+itself carries no `Id` — it is only ever edited as a `Vec<EpochRow>` inside
+its owner's form), and `Date(HDate)` represents a date typed straight into
+the search field rather than any existing name match.
+
+The old `impl From<JumpTarget> for Selection` could not survive this as-is —
+a bare typed date has no sensible `Selection` at all. It became an inherent
+`JumpTarget::selection(self) -> Option<Selection>` instead: an `Epoch`
+selects its *owning* timeline/biography (there being no dedicated inspector
+view for an epoch on its own), `Date` selects nothing (`None`, which clears
+whatever was selected before — deliberate, since jumping to a bare date
+while an unrelated inspector stays open would be confusing). `jump_anchor`
+and `reveal_jump_target` both grew matching arms — a `Date` needs no
+revealing at all (nothing is hidden about a bare point in time) and anchors
+directly at `d.decimal()`; an `Epoch` reveals its owner exactly like an
+`Event` does. `JumpTarget` also lost its `Eq` derive (kept `PartialEq`) —
+`HDate` itself doesn't derive `Eq`, so `Date(HDate)` would have broken it;
+nothing in the codebase compared `JumpTarget`s for equality outside its own
+struct-literal tests, so this cost nothing.
+
+The top-left search field's candidate list (`app.rs`, inside the toolbar's
+`ui.horizontal` closure building `Suche:`) now also chains in every
+timeline's epochs and every biography's life phases, each mapped to
+`JumpTarget::Epoch`. Separately — outside the name-matching `suggestions()`
+popup entirely — if nothing matched by name at all, the trimmed query is
+tried through `HDate::parse` directly; on success a small hint
+(`↵ Enter: springe zu …`) appears and Enter jumps straight to that date via
+`JumpTarget::Date`. Deliberately gated on "no name matches" rather than
+always overriding the name-match path: a short numeric query like `14` is
+both a plausible bare-year date *and* plausibly a substring someone is
+searching for in a longer title (`"...1914..."`), and preferring the
+existing name-suggestion behaviour whenever it has anything to offer avoids
+silently changing what Enter already did for every non-date search. No new
+date-format parsing was needed for this — `HDate::parse` already understood
+every format asked for (spelled/numeric month, seasons, `v. Chr.`/`n. Chr.`
+with or without a space, `BC`/`AD`); the field just never tried feeding it a
+date before.
+
 ### The suggestion dropdown is a real `egui::Popup`, not an inline list
 
 `panels::suggestions` anchors a floating popup below the search field via
@@ -720,16 +823,14 @@ already threaded its parent through explicitly and needed no change.
 `layout::range_collapsed(event, ppy)` — `true` once a range event's own
 on-screen width (`(t1 - t0) * ppy`) drops below `RANGE_COLLAPSE_PX` (18px).
 `canvas::paint_lane_events` uses it to decide, per event, whether to paint
-the elaborate `paint_range` bar (rounded caps, ticks, room for nested rows
-underneath) or fall back to the plain `paint_point` marker every ordinary
-event gets — and, critically, whether to descend into `paint_nested_events`
-at all. A years-long war is worth its own visible bar up close; zoomed out
-far enough that the bar would be a couple of pixels wide, showing it (and
-its own sub-phases, in even tinier rows) adds noise instead of clarity, so
+the elaborate `paint_range` bar (rounded caps, ticks, plus whatever nests
+inside it — see the next section) or fall back to the plain `paint_point`
+marker every ordinary event gets — and, critically, whether to descend into
+`paint_nested_events` at all. A years-long war is worth its own visible bar
+up close; zoomed out far enough that the bar would be a couple of pixels
+wide, showing it (and its own sub-phases) adds noise instead of clarity, so
 it instead reads exactly like any other single event: a marker and a label.
-`canvas::measure_lanes`'s nested-row reservation uses the same check, so a
-lane does not keep reserving vertical space for sub-rows nobody is going to
-see. The same collapse check also gates the *recursive* call inside
+The same collapse check also gates the *recursive* call inside
 `paint_nested_events` — a nested range event (e.g. "Archidamischer Krieg"
 inside "Peloponnesischer Krieg") stops offering up its own further
 sub-detail once **it** has zoomed down far enough, independent of whatever
@@ -737,6 +838,360 @@ its parent is doing. This is orthogonal to the existing zoom-dependent
 *importance* threshold (`event_visible`) that already hides low-importance
 events entirely at low zoom — that one is about "is this worth showing at
 all," this one is about "is this specific bar's own duration still legible."
+
+### Nested events render on their parent's own bar now, not in rows below it
+
+This replaces the "small rows stacked underneath the parent bar" approach
+described in the previous section's earlier form. It was reported twice as
+not matching how the app already treats epochs: "Archidamischer Krieg"
+nested inside "Peloponnesischer Krieg" should show as a coloured segment
+*on* the war's own bar, the same way a timeline's epochs sit on its band,
+and a plain nested point event should show as a small marker on that same
+bar — the parent behaving like its own small, exactly parallel mini-timeline,
+for both its range-children and its point-children, at whatever depth they
+nest.
+
+`canvas::paint_nested_events` was rewritten around that idea rather than
+patched. A nested range child is painted as a filled rect spanning exactly
+`parent_rect`'s own height (`Rect::from_min_max` at `parent_rect.top()`/
+`bottom()`, x clamped to the parent's own visible span), so at every nesting
+depth the segment sits at the *same* height as the top-level bar — recursion
+for a grandchild reuses the child's own rect as the new `parent_rect`,
+capped at `MAX_NESTED_SEGMENT_DEPTH` (4). A nested point child is a small
+circle centred on `parent_rect.center().y`, radius derived from the bar's
+own height rather than the child's importance (`(parent_rect.height() *
+0.5).clamp(2.5, 5.0)`) since importance-scaled marker sizes assume a full
+band's worth of room a nested bar does not have. A child whose own span does
+not overlap the parent's real span at all is skipped outright, rather than
+clipped to the parent's edge and drawn as a misleading sliver — that only
+happens from a genuine data mistake, not a "the mini-timeline's start/end"
+edge case worth rendering.
+
+**The one bug this went through before it looked right**: a nested child's
+fill was first written as `shade(lane_color, 0.15)` — the exact same amount
+`paint_range` already uses for the *parent's own* bar fill. `theme::shade`'s
+sign convention is "positive lightens, negative darkens" (see its own doc
+comment/test), so identical positive amounts on both parent and child
+produced identical colours — the child segment was painted, at the right
+position, with a title floating correctly above it, but was completely
+invisible against the parent bar behind it, because the two rects were
+pixel-for-pixel the same colour. Confirmed by a local screenshot showing the
+title with nothing visibly under it. Fixed by darkening children instead —
+`shade(lane_color, -0.3 - (depth-1) * 0.15)` — so a nested segment always
+reads as visually "cut into" the lighter parent bar, and each further
+nesting level darkens a bit more on top of that. **If you touch nested-event
+colouring again, double check the sign** — it is easy to reach for the same
+magnitude as the parent's own shade and get an invisible result rather than
+an obviously-wrong one, since nothing crashes and the hit-testing/label
+still work; only a screenshot catches it.
+
+Titles only float above the bar for **depth-1** children (`show_label = ...
+&& depth == 1`) via the new `nested_child_label` (shared between the segment
+and point branches) — a grandchild's title is deliberately not drawn, since
+every nesting level shares the exact same `parent_rect.top()` as its
+floating anchor, so a child's own label and its grandchild's label would
+land at the same height and collide. A depth-2+ item is still painted, still
+clickable, and still shows its title via the hover tooltip (`tooltip_text`,
+already wired through `handle_picking` for any `Selection::Event` hit) — the
+same "dense clusters fall back to the tooltip" tradeoff the top level
+already accepted, just pushed one level deeper.
+
+Because nesting no longer needs any vertical space *below* the band,
+`LaneDemand.nested_rows`, `layout::nested_depth`, and the
+`NESTED_ROW_HEIGHT`/`MAX_NESTED_ROWS` constants were removed outright rather
+than left in place unused — `layout::lane_height` no longer reserves
+anything beyond a lane's label rows and its own band thickness for a range
+event's nested content, whatever depth it goes to.
+
+Verified with a throwaway local `Document` (a war spanning 431–404 BC with a
+nested range child 431–421 BC, a nested point child one year into it, a
+nested-inside-the-nested-range point child, and a second nested range near
+the parent's end) written to a temp `library.json`, launched, and screenshotted
+via `PrintWindow` — this is not covered by an automated test, since
+`canvas.rs` paints and has no test module at all (see §6); if you change this
+code again, reach for the same throwaway-document-plus-screenshot approach
+rather than trusting it compiles and calling it done.
+
+**Two follow-on refinements**, both found by the same screenshot-based
+verification once tried against a denser dataset (a war with half a dozen
+nested children, one a nested range of its own):
+
+- **A range event with visible children now gets a taller bar.**
+  `range_bar_height(importance)` alone (4–9px) was tuned for a bare bar with
+  nothing on it; a nested segment's own fill plus a marker circle sitting on
+  that same height had no breathing room. `paint_lane_events` now checks
+  whether the event has any visible children (`doc.child_events` filtered
+  through `event_visible`) and, if so, passes `has_children: true` into
+  `paint_range`, which adds a flat `+10.0` to the bar height. This is a
+  fixed bonus, not proportional to how many children there are or how deep
+  they nest — deliberately conservative, since the bar's `top` moving
+  further up (`y - h - 9.0`) eats into the gap between it and row 0 of the
+  lane's own top-level label stack (`band_top - LABEL_BAND_TOP -
+  1 * LABEL_ROW_HEIGHT`); at the sizes involved there is still a
+  comfortable margin, but a much larger bonus would need that margin
+  checked explicitly rather than assumed.
+- **Nested-child labels now stagger onto further rows instead of
+  overlapping each other.** Several children close together in time — the
+  common case, since that is exactly when nesting is useful — used to all
+  float their titles at the identical height above the parent's bar
+  (`parent_rect.top()`), so titles ran into each other and became
+  unreadable fragments (confirmed directly in a screenshot: "Archidamischer
+  Krieg" clipped mid-word by the neighbouring "Schlacht von Pylos").
+  `nested_child_label` now takes a `&mut LabelPacker` — one freshly created
+  per call to `paint_nested_events`, so it is scoped to exactly one set of
+  siblings — and calls `place_rows(x_min, x_max, 1, MAX_NESTED_LABEL_ROWS)`
+  before drawing, stacking a colliding label `NESTED_LABEL_ROW_HEIGHT` (13px)
+  higher per row, up to `MAX_NESTED_LABEL_ROWS` (3) before giving up on that
+  particular label and falling back to the hover tooltip — the same
+  precedent already accepted for a dense cluster of top-level labels. This
+  reuses the *existing* `LabelPacker`/`place_rows` machinery (see the next
+  section) rather than inventing a second one; the only new thing here is
+  wiring a packer instance into a code path that didn't have one before.
+  **Not fixed**: a nested label can still collide with the parent event's
+  own top-level title, since that title is placed by a *different*
+  `LabelPacker` instance scoped to the whole lane, with no visibility into
+  what the nested-label packer is doing directly below it. Observed as
+  "Sizilische Expedition" (a nested child) touching "Peloponnesischer Krieg"
+  (the parent's own title) in the same screenshot pass. Unifying the two
+  would mean threading one shared packer through both `measure_lanes` and
+  `paint_nested_events`, which reaches further than this pass had scope for.
+
+### A long event title wraps onto a second line before it ellipsises
+
+Previously `fit_text` ellipsised a title the instant it exceeded
+`EVENT_LABEL_MAX_PX` on one line — readable, but a title that was merely a
+little too long lost its second half unnecessarily. `canvas::wrap_two_lines`
+greedily fills a first line at word boundaries, puts whatever's left on a
+second line, and only reaches for `fit_text`'s ellipsis if that *second*
+line still overflows; a single word wider than the max width on its own
+still gets a line to itself rather than looping forever trying to shrink it.
+
+The marker itself never moves — only its label can now be two lines tall —
+which is what makes this safe to add without touching any positioning math
+for the marker/band itself, only the label's own row bookkeeping. (Written
+before the below-the-band reorganisation in the very next section: a plain
+event's label now floats *below* the band rather than above it, but the
+two-line wrapping described here works identically either way — only the
+direction the rows stack changed, not this mechanism.) That bookkeeping
+needed a real
+extension, not just a taller label: `layout::LabelPacker::place` (single-row)
+became
+`place_rows(x_min, x_max, rows_needed, max_rows)`, claiming `rows_needed`
+*consecutive* rows atomically (all-or-nothing — if any row in the run is
+occupied, it tries the next starting row rather than partially claiming).
+Both real call sites (`canvas::measure_lanes`'s reservation pass and
+`paint_lane_events`'s real placement) now pass `rows_needed = 1` for a title
+that fits on one line, `2` for one that needs to wrap — computed from the
+*unwrapped* text's measured width in both places, so the two passes agree on
+how many rows a given title needs without `measure_lanes` having to actually
+perform the word-wrap itself. The old single-row `place` wrapper was deleted
+rather than kept around once nothing outside its own tests called it —
+callers needing exactly one row now just pass `rows_needed = 1` to
+`place_rows` directly.
+
+### Plain events moved below the band, long events stack above it in their own slots
+
+The most structurally significant change in this project so far. Requested
+with a hand-drawn sketch: a long event with its own nested sub-structure
+(a war with phases and battles) should get dedicated space *above* its
+timeline's band — its own title, its bar with colour-coded sections, event
+markers with their own labels — while a plain event (no nested content)
+sits *below* the band instead of competing with that space above it.
+Several long events overlapping in time should stack progressively higher
+rather than drawing over one another, and every other lane should
+automatically make room.
+
+**The core insight that made this tractable**: "several long events
+overlapping in time claim non-overlapping stack levels" is exactly the same
+problem `LabelPacker` already solves for text labels — an interval-packing
+problem, just claiming an event's *date span* instead of a label's *pixel
+width*. No new packing algorithm was needed, just a second `LabelPacker`
+instance per lane, fed spans instead of label boxes. Likewise, "every other
+lane makes room automatically" needed no new mechanism at all: lanes already
+stack sequentially top-to-bottom by height (`place_lanes`), so a lane that
+now reports it needs more vertical space simply pushes every lane after it
+further down for free — the *only* thing that had to change was correctly
+computing how much space one lane needs.
+
+**`is_long_event(doc, filters, ppy, ev)`** (`canvas.rs`) is the single
+predicate everything else is built on: a range, not currently
+`range_collapsed`, with at least one currently-visible child. Whether an
+event counts as "long" is therefore zoom-dependent by construction — as you
+zoom out, a war's children fall below the importance threshold one by one,
+and the moment none are left visible any more the war itself demotes back to
+a plain event (bar below the band, no stacking, no title-above-sections
+treatment) purely as a side effect of this one predicate re-evaluating, with
+no special "collapse" logic written for it. This is also what makes the
+sketch's "sections disappear on zoom-out, the bar goes back to one colour"
+requirement fall out for free — that was already `paint_nested_events`'s and
+`range_collapsed`'s job from the earlier redesign; nothing new was needed
+here beyond routing through the same predicate consistently.
+
+**Layout (`layout.rs`)**: `LaneDemand.rows` split into two differently-typed
+demands, and `Lane.label_rows` likewise:
+
+- `below_rows` — plain-event label rows, exactly the old `rows`/`label_rows`
+  concept, just anchored below the band now instead of above.
+- `above_slots` — stacked long-event slots above the band, each
+  `LONG_EVENT_SLOT_HEIGHT` (140px — sized for the worst case: a two-line
+  title, a full `MAX_NESTED_LABEL_ROWS` stack of nested labels, and the bar
+  itself, the same "size for the maximum" approach `LABEL_ROW_HEIGHT` already
+  took), capped at `MAX_LONG_EVENT_STACK` (4).
+
+`lane_height` sums both: `above_slots * LONG_EVENT_SLOT_HEIGHT +
+LABEL_BAND_TOP + thickness + LABEL_BAND_BOTTOM + below_rows *
+LABEL_ROW_HEIGHT + LANE_BOTTOM_PAD` (`LABEL_BAND_BOTTOM` is new, mirroring
+the existing `LABEL_BAND_TOP`). `place_lanes` derives `center` from
+`above_slots` the same way it used to derive it from `rows` — the band still
+sits right after however much "above" space is reserved, with "below" space
+simply falling in the remainder before the next lane starts. `LanePlan`'s
+existing `min_rows` (a timeline's guaranteed breathing room even with just
+one event) now clamps `below_rows`, since that is where an ordinary
+timeline's own event labels live now.
+
+**Measuring (`canvas::measure_lanes`)**: partitions each lane's root events
+through `is_long_event`, runs a `LabelPacker` over the long ones' *spans* to
+count `above_slots` (`place_rows(x0, x1, 1, MAX_LONG_EVENT_STACK)`,
+following the exact same importance/date sort order `visible_events` already
+produces), and runs the existing text-label packing exactly as before but
+now scoped to only the plain events, to produce `below_rows`. Both passes
+must iterate the *same* events in the *same* order as the real paint pass
+below, or the stack level a long event gets measured for and the one it
+actually paints at would disagree — same requirement measuring text labels
+already had, just extended to event spans too.
+
+**Painting (`canvas::paint_lane_events` / `paint_long_event`)**: the main
+loop now branches on `is_long_event` per root event. A plain event is
+painted almost exactly as before, mirrored: `paint_point` is unchanged
+(the marker was always exactly on the band and still is), but a childless
+range's bar and every label's row math both flip from "grow upward from
+`band_top`" to "grow downward from `band_bottom`," including the leader
+line, which now points up from the label to the marker instead of down.
+A long event is painted by the new `paint_long_event`, which:
+
+1. Claims a stack slot from a `LabelPacker` shared across the whole lane
+   (created once per `paint_lane_events` call, matching `measure_lanes`'s
+   own instance) via the event's own `[x0, x1]` span. A degenerate overlap
+   of more long events than `MAX_LONG_EVENT_STACK` allows falls back to
+   sharing the topmost slot rather than dropping the event — a rare visual
+   overlap is preferable to an event vanishing outright.
+2. Paints the bar via a generalised `paint_range` (see below) at that
+   slot's height, then everything nested on it exactly as the earlier
+   nested-events-on-band redesign already does — `paint_nested_events`
+   needed no changes at all, since it was already relative to "the bar's own
+   rect," which is all that moved.
+3. Paints the event's own title *above* a fixed, worst-case reservation for
+   the nested-label area (`MAX_NESTED_LABEL_ROWS * NESTED_LABEL_ROW_HEIGHT`)
+   above the bar — deliberately not measured from how many nested labels
+   this particular event actually used, so the title never needs that
+   number to know where it sits, at the cost of some wasted space when an
+   event has fewer nested labels than the worst case.
+
+**`paint_range` generalised** to serve both directions from one
+implementation rather than duplicating it: it now takes `below: bool` and
+`stack_offset: f32` alongside the actual band centre `y` (still needed in
+both cases, so the connecting ticks at the range's start/end always reach
+the real band line, not just the bar's own edge). `dir = if below { 1.0 }
+else { -1.0 }` turns "which side" into a sign, and the bar's near edge
+(closest to the band) sits at `y + dir * (9.0 + stack_offset)` — `9.0` is
+the original fixed gap, unchanged for an unstacked long event or any plain
+range, so this is an exact behavioural no-op for every case that existed
+before stacking was added; `stack_offset` (always `0.0` below the band,
+since a plain range never stacks) is the only thing that pushes a bar
+further out.
+
+**Known limitations, accepted rather than chased further**: a long event's
+own title can still collide with a *different* long event's nested-child
+label if they sit in adjacent stack levels near a shared boundary — the two
+are positioned by entirely separate mechanisms (the title by
+`paint_long_event` directly, nested labels by their own `LabelPacker` inside
+`paint_nested_events`) with no visibility into each other. `LONG_EVENT_SLOT_HEIGHT`
+is a flat 140px regardless of how simple or complex a given long event's own
+content actually is — a war with a single nested point event reserves the
+same worst-case space as one with a dozen nested ranges. Both are the same
+kind of tradeoff already accepted in the nested-events-on-band redesign
+itself (see the note there about a nested label colliding with the parent's
+own top-level title) — unifying every one of these into a single shared
+packer would be a real project of its own, not a quick follow-up.
+
+Verified with a throwaway local `Document` (two overlapping "long" wars
+sharing one timeline, plus a plain point event and a plain childless range
+scrolled into view separately) written to a temp `library.json`, launched,
+and screenshotted via `PrintWindow` — confirmed the second war stacks
+visibly above the first rather than overlapping it, and that both plain
+events render below the band with their labels below them. Not covered by
+an automated test beyond the pure `layout.rs` sizing logic
+(`lanes_grow_to_fit_stacked_long_events_above_the_band`,
+`long_event_stacking_is_capped_so_it_cannot_grow_without_bound`,
+`stacked_slot_space_sits_above_the_band_in_every_lane`) — `canvas.rs` still
+has no test module at all (see §6); reach for the same
+throwaway-document-plus-screenshot approach if you touch this again.
+
+### A pre-1.0 QA pass found four more real bugs, all in the reorganisation above
+
+Aiming for a 1.0.0 release, the next round was a deliberate stress-testing
+pass rather than a specific feature request: a throwaway document built to
+exercise as many edge cases at once as reasonably possible (deeply nested
+events, several mutually overlapping long events, a single word too long
+for any line, a zero-duration range, the BC/AD boundary, a collapsed group,
+light mode, an open-ended biography), screenshotted across a range of zoom
+levels and pan positions. All four findings trace back to the two features
+from this same session — the on-band nested-events redesign and the
+above/below reorganisation — under load neither had actually been tested
+against.
+
+- **`wrap_two_lines` didn't truncate an oversized first word.** A single
+  word wider than `max_width` (with no space to break at) is deliberately
+  allowed onto `line1` anyway, so the loop always places at least one word
+  rather than looping forever — but the function then returned that line
+  completely unchecked, so a title that was one very long word ("Donau­dampf­
+  schiff­fahrts­gesellschafts­kapitäns­patent­prüfungs­ordnungs­entwurf",
+  chosen precisely to be absurd) rendered at full width, running clean off
+  the screen, instead of ellipsising like every other overlong label. Fixed
+  by re-checking `line1`'s width after the loop and running it through
+  `fit_text` if it still overflows — covers both this path and the
+  structurally identical one where `line1` alone (not just the leftover
+  `rest`) is the function's only return value.
+- **The long-event stack-overflow fallback produced garbled, run-together
+  text**, in two different ways, once a lane actually had more overlapping
+  long events than `MAX_LONG_EVENT_STACK` (a genuinely realistic amount —
+  five mutually-overlapping wars, deliberately chosen as a stress case,
+  triggered it immediately): two full titles, or two independent sets of
+  nested-child labels, landing in the exact same shared slot with no
+  coordination between them read as illegible mashed-together text (e.g.
+  "Nebenkrieg4Nebenkrieg 5"). `paint_long_event` now tracks whether it got a
+  genuine slot or the shared fallback one; on fallback it still paints the
+  bar (a rare visual overlap beats a dropped event) but skips its own title,
+  and passes a new `labels_allowed: bool` into `paint_nested_events` so that
+  call's nested children still paint (and stay clickable) but never draw
+  their own labels either — both are still fully reachable via a click or
+  the hover tooltip, same as any other "dense cluster" tradeoff already
+  accepted elsewhere in this file.
+- **A bar spanning far more pixels than the visible window failed to paint
+  at all**, reproducibly, once zoomed in far enough that a single long
+  event's own multi-decade span was several screens wide — not just
+  clipped at the edges as expected, but completely absent, and this
+  silently took its nested content and label down with it. Confirmed with a
+  bisection: the *identical* two-event document rendered perfectly at a
+  more moderate zoom, and rendered perfectly again at the same extreme zoom
+  once the window was widened enough that neither bar's edges actually
+  exceeded the clip rect — strongly pointing at however this particular
+  eframe/glow version handles a shape whose bounds run thousands of pixels
+  past its clip rect, rather than at anything specific to this app's own
+  layout math (which measured out correctly at every step along the way).
+  Rather than chase that upstream, `paint_range` now clamps both edges to
+  `content_rect`'s bounds plus a 100px margin before ever constructing the
+  rect — a bar's true edges rounding off screen were never going to be
+  drawn precisely anyway, so there is no visible cost to capping how far
+  past the edge the shape passed to the renderer is allowed to reach.
+  Re-verified with the same bisection dataset at the same extreme zoom:
+  every event, title, and nested child now renders correctly regardless of
+  how far its real span extends past either edge.
+
+None of these four are covered by an automated test (`canvas.rs` still has
+no test module — see §6); each was caught and confirmed fixed the same way
+as the previous round, with a throwaway `Document` and `PrintWindow`
+screenshots at the specific zoom/pan combination that reproduced it.
 
 ### Table import can nest straight into an existing event, not just onto a timeline's top level
 
@@ -791,6 +1246,105 @@ inherently approximate (a season or a quarter is months wide), which is why
 `parse_ymd` reports the date came from one of these — unless the user
 already gave an explicit qualifier of their own (`vor Sommer 1789` keeps
 `Before`, it is not overridden).
+
+`"Anfang"`/`"Beginn"`/`"Ende"` + a year (`"Anfang 1789"` → January,
+`"Ende 1789"` → December, both `Circa`) reuse this exact same lookup table —
+three more entries in `month_from_period`'s `PERIODS` array, no new parsing
+path — since they need no ordinal-fusing step at all (unlike `"1. Quartal"`,
+they're already single bare words once split on whitespace). The one thing
+worth knowing if you touch this array again: **its length annotation
+(`[(&str, u8); N]`) is a manually-maintained count, not inferred** — adding
+entries without bumping `N` is a compile error, not a silent bug, but it is
+an easy one to hit typing the diff by hand.
+
+### A German ordinal day before a spelled-out month used to be rejected outright
+
+Reported via the new search-by-date field: typing `"1. Januar 413 v. Chr."`
+did nothing at all — not "jumped to the wrong place," genuinely nothing,
+because `HDate::parse` returned `None` for it. Two distinct bugs, found by
+tracing `parse_ymd` by hand once a quick regression test reproduced it:
+
+1. The day.month.year *numeric* form at the top of `parse_ymd` only handles
+   a bare dotted date (`"14.07.1789"`) and correctly declines anything with
+   a letter in it, so `"1. Januar 413"` falls through to the ordinary
+   per-token loop below — correctly. But once there, the token `"1."` still
+   carried its trailing ordinal period, and `"1.".parse::<i32>()` fails, so
+   the token loop's catch-all `else { return None }` rejected the whole
+   date. Fixed by extending the existing `trim_end_matches(',')` (already
+   there for a trailing comma, e.g. `"July 14, 1789"`) to also strip a
+   trailing `.` — safe unconditionally at this point in the function, since
+   anything reaching the per-token loop with a `.` still on it is either
+   this ordinal-day case or a month abbreviation's own trailing period
+   (`"jul."`), which `month_from_name` already strips itself anyway.
+2. That alone still wasn't enough for `"1.Januar 413 v. Chr."` (no space
+   after the ordinal's period) — `split_whitespace` treats `"1.Januar"` as
+   one single token, which is neither a number nor a month name, so the
+   catch-all still rejects it. `model::split_ordinal_dot` now runs
+   unconditionally right before the existing `PERIOD_KEYWORDS` fusing step:
+   it inserts a space after any `.` that is immediately followed by a
+   *letter* — never one followed by a digit, so it cannot touch the numeric
+   day.month.year form (which has already had its own chance to match, and
+   returned early, before this code even runs). A `.` followed by a letter
+   is never legitimately a numeric separator, which is what makes this safe
+   to apply unconditionally rather than gating it the way
+   `fuse_period_tokens` has to.
+
+Both are covered by
+`model::tests::a_german_ordinal_day_before_a_spelled_out_month_still_parses`.
+If you add another purely-textual normalisation step to `parse_ymd`, put it
+*after* the numeric-form check and *before* the token loop, same as both of
+these — that ordering is what lets each step assume "whatever reaches me
+here is not a bare numeric date" without re-deriving it itself.
+
+### A biography's own name used to be able to paint over its life-phase label
+
+Reported as a life-phase name (e.g. "Stratege Athens", covering most of the
+person's life in the reproduction case) needing to be reliably legible,
+"im Vordergrund" — in the foreground, not obscured by anything else.
+`phase_segment_label` already used an opaque background and a neutral text
+colour, so the actual cause was paint order: `paint_biography_name` (the
+person's own name, also centred on the band) is called from
+`paint_lane_names`, which — before this fix — ran *before*
+`paint_segment_labels`. Whenever the two labels' centred positions
+overlapped (routine for a phase spanning most of the lifespan, since both
+centre on their own span's midpoint), the person's name painted second and
+covered the phase name. `draw()` now calls `paint_lane_names` *before*
+`paint_segment_labels` instead, so a phase label — the more specific of the
+two at that exact spot — always wins where they'd otherwise collide. This
+also moved the life-phase-label call itself out of `paint_biography_band`
+(the early "bands" pass) into the shared `paint_segment_labels` final pass,
+renamed from `paint_epoch_labels` to reflect that it now covers both a
+timeline's epochs and a biography's life phases — same reasoning as the
+already-existing epoch-label pass being separate from `paint_timeline_band`
+(see the section on that above): whatever paints last wins, so anything
+that needs to reliably stay on top belongs in that last pass, not inline
+with the band it happens to sit on.
+
+Checked that this reorder does not reintroduce the *opposite* problem for
+timelines: a timeline's own name lives in a fixed left-edge gutter tab
+(`paint_lane_names`'s non-biography branch), which never shares screen
+position with an epoch label floating elsewhere along the band, so
+reordering the two calls has no effect there — the risk this reorder
+carries is scoped to biographies only, where both labels genuinely compete
+for the same centred position.
+
+### A failing import row is now flagged directly in the preview, not just counted
+
+`build_event_drafts`/`build_biography_drafts` already returned
+`(Vec<Draft>, Vec<(row_number, reason)>)` for skipped rows — the dialog only
+ever showed a *count* ("3 Zeile(n) übersprungen"), leaving the user to guess
+which of possibly hundreds of pasted rows were the problem.
+`forms::compute_import_skips` runs the same draft-building the "ready to
+import" count already does, but keyed into a `HashMap<row_number, reason>`
+that `preview_grid` uses to tint a failing row's cells red
+(`Color32::from_rgba_unmultiplied(225, 120, 110, 70)`, an alpha over
+`BAD_RED`) and attach the reason as a hover tooltip. Only computed once the
+column mapping actually names a required field (title/date, or name/birth) —
+before that, every row would trivially "fail" and the whole preview would
+light up red for no useful reason. `preview_grid` also gained its own
+`ScrollArea::both().max_height(220.0)` and dropped the old `.take(5)` cap, so
+a flagged row further down a long pasted table is actually reachable instead
+of being silently excluded from the preview entirely.
 
 ### An epoch/life-phase label's visibility is now driven by duration, not by its own name's length
 
@@ -921,7 +1475,7 @@ their library, with no error message pointing at the cause.
 
 ## 6. Testing approach
 
-All 142 tests are pure logic and run in well under a second without opening a
+All 163 tests are pure logic and run in well under a second without opening a
 window — `layout` and `model` hold the largest share (axis maths, zoom
 clamping, tick steps, filters, lane stacking, band convergence geometry,
 dormant lanes, label packing, date parsing, colour-segment gap-filling), with
@@ -945,21 +1499,28 @@ via `ctx.run_ui()` — see `theme::hover_stability`. Remember to
 
 ## 7. If you pick up the loose ends
 
-Roughly in order of likely value:
+Roughly in order of likely value. (Export to image/PDF, month/day ticks at
+extreme zoom, a group-ordering UI, and the long-event-above/plain-event-below
+canvas reorganisation — all previously listed here — are done; see §1.)
 
-1. **Export to image/PDF** — the one open item from the planning document. An SVG
-   or PNG dump of the current canvas view is the obvious form; the painting code
-   is already centralised in `canvas.rs`.
-2. **Month/day ticks at extreme zoom.** `tick_step()` bottoms out at 1 year. The
-   data model already carries month and day, so events place correctly within a
-   year, but the ruler cannot label finer than a year.
-3. **Drag to reorder** timelines and groups in the sidebar. Currently Up/Down
-   buttons only (`panels::reorder`, which correctly scopes movement to siblings
-   within a group).
-4. **Group ordering UI.** Groups have an `order` field and are sorted by it, but
-   nothing in the UI changes it yet.
-5. Undo depth is 60 full `Document` clones (`app::UNDO_DEPTH`). Fine for personal
+1. **A dedicated fast-zoom slider**, next to the existing detail-bias slider —
+   requested twice now (once alongside the day/month tick ladder, again
+   folded into the batch that produced the nested-events-on-band redesign)
+   and still not done. The zoom itself (`TimeAxis.ppy`, `MIN_PPY`..`MAX_PPY`,
+   now a 60,000:1 range) already supports jumping straight to any level; what's
+   missing is a widget to do it other than the scroll wheel/`+`/`-` keys.
+2. **Drag to reorder** timelines and groups in the sidebar. Currently Up/Down
+   buttons only (`panels::reorder`/`reorder_group`, which correctly scope
+   movement to siblings within a group).
+3. Undo depth is 60 full `Document` clones (`app::UNDO_DEPTH`). Fine for personal
    datasets; if libraries get very large, switch to a diff-based approach.
+4. The two "known limitations, accepted rather than chased further" noted at
+   the end of the above/below reorganisation's own section: a long event's
+   title can still collide with a different long event's nested-child label
+   across adjacent stack levels, and `LONG_EVENT_SLOT_HEIGHT` is a flat
+   worst-case reservation regardless of how much a given long event actually
+   needs. Both would need a single packer shared across everything currently
+   using its own separate one.
 
 ---
 

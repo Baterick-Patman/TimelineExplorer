@@ -29,26 +29,36 @@ pub enum Selection {
 }
 
 /// Something a search suggestion can point at and jump the canvas to.
-/// Distinct from `Selection`, even though the variants line up one to one:
+/// Distinct from `Selection`, even though most variants line up one to one:
 /// a `Selection` is "what the inspector currently shows", a `JumpTarget` is
-/// "what to reveal and frame" — keeping them separate leaves room for a
-/// jump target that isn't selectable (an epoch, say) without disturbing
-/// `Selection` itself.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// "what to reveal and frame" — keeping them separate leaves room for jump
+/// targets that aren't selectable in their own right: an epoch (selecting
+/// its owning timeline/biography instead) or a bare typed date (selecting
+/// nothing at all).
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum JumpTarget {
     Group(Id),
     Timeline(Id),
     Biography(Id),
     Event(Id),
+    /// One of a timeline's or biography's own colour-coded epochs/phases,
+    /// addressed by its owner and index into that owner's `epochs`/
+    /// `life_phases` list.
+    Epoch(OwnerRef, usize),
+    /// A date typed straight into the search field rather than a name match.
+    Date(HDate),
 }
 
-impl From<JumpTarget> for Selection {
-    fn from(t: JumpTarget) -> Self {
-        match t {
-            JumpTarget::Group(id) => Selection::Group(id),
-            JumpTarget::Timeline(id) => Selection::Timeline(id),
-            JumpTarget::Biography(id) => Selection::Biography(id),
-            JumpTarget::Event(id) => Selection::Event(id),
+impl JumpTarget {
+    fn selection(self) -> Option<Selection> {
+        match self {
+            JumpTarget::Group(id) => Some(Selection::Group(id)),
+            JumpTarget::Timeline(id) => Some(Selection::Timeline(id)),
+            JumpTarget::Biography(id) => Some(Selection::Biography(id)),
+            JumpTarget::Event(id) => Some(Selection::Event(id)),
+            JumpTarget::Epoch(OwnerRef::Timeline(id), _) => Some(Selection::Timeline(id)),
+            JumpTarget::Epoch(OwnerRef::Biography(id), _) => Some(Selection::Biography(id)),
+            JumpTarget::Date(_) => None,
         }
     }
 }
@@ -116,6 +126,12 @@ fn reveal_jump_target(doc: &mut Document, target: JumpTarget) {
                 }
             }
         }
+        JumpTarget::Epoch(owner, _) => match owner {
+            OwnerRef::Timeline(t) => reveal_timeline(doc, t),
+            OwnerRef::Biography(b) => reveal_biography(doc, b),
+        },
+        // A bare date isn't attached to anything hidden — nothing to reveal.
+        JumpTarget::Date(_) => {}
     }
 }
 
@@ -433,7 +449,7 @@ impl TimelineApp {
         self.doc.view.left_year = date - (width as f64 / ppy) * 0.4;
         self.doc.view.filters.detail_bias = self.doc.view.filters.detail_bias.max(needed_bias);
         self.y_offset = 0.0;
-        self.selection = Some(target.into());
+        self.selection = target.selection();
         self.mark_dirty();
     }
 
@@ -459,6 +475,13 @@ impl TimelineApp {
                 .map(|(lo, _)| lo)
                 .fold(None, |acc: Option<f64>, lo| Some(acc.map_or(lo, |a: f64| a.min(lo))))
                 .map(|lo| (lo, IMPORTANCE_MAX)),
+            JumpTarget::Epoch(OwnerRef::Timeline(id), idx) => {
+                self.doc.timeline(id).and_then(|t| t.epochs.get(idx)).map(|e| (e.t0(), IMPORTANCE_MAX))
+            }
+            JumpTarget::Epoch(OwnerRef::Biography(id), idx) => {
+                self.doc.biography(id).and_then(|b| b.life_phases.get(idx)).map(|e| (e.t0(), IMPORTANCE_MAX))
+            }
+            JumpTarget::Date(d) => Some((d.decimal(), IMPORTANCE_MAX)),
         }
     }
 
@@ -981,8 +1004,8 @@ impl TimelineApp {
             }
 
             // Suggestions jump straight to the match — searching for an
-            // event or person and landing on an unchanged view would defeat
-            // the point of searching at all.
+            // event, person, or epoch and landing on an unchanged view would
+            // defeat the point of searching at all.
             let candidates = self
                 .doc
                 .events
@@ -990,13 +1013,37 @@ impl TimelineApp {
                 .map(|e| (e.title.clone(), JumpTarget::Event(e.id)))
                 .chain(self.doc.biographies.iter().map(|b| (b.name.clone(), JumpTarget::Biography(b.id))))
                 .chain(self.doc.timelines.iter().map(|t| (t.name.clone(), JumpTarget::Timeline(t.id))))
-                .chain(self.doc.groups.iter().map(|g| (g.name.clone(), JumpTarget::Group(g.id))));
-            let picked =
-                panels::suggestions(&resp, "top_search_suggest", &self.doc.view.filters.search, candidates, 8);
+                .chain(self.doc.groups.iter().map(|g| (g.name.clone(), JumpTarget::Group(g.id))))
+                .chain(self.doc.timelines.iter().flat_map(|t| {
+                    let tid = t.id;
+                    t.epochs
+                        .iter()
+                        .enumerate()
+                        .map(move |(i, e)| (e.name.clone(), JumpTarget::Epoch(OwnerRef::Timeline(tid), i)))
+                }))
+                .chain(self.doc.biographies.iter().flat_map(|b| {
+                    let bid = b.id;
+                    b.life_phases
+                        .iter()
+                        .enumerate()
+                        .map(move |(i, e)| (e.name.clone(), JumpTarget::Epoch(OwnerRef::Biography(bid), i)))
+                }));
+            let query = self.doc.view.filters.search.clone();
+            let picked = panels::suggestions(&resp, "top_search_suggest", &query, candidates, 8);
             if let Some(target) = picked {
                 let width = self.last_width.unwrap_or(1200.0);
                 self.doc.view.filters.search.clear();
                 self.jump_to(target, width);
+            } else if let Some(d) = HDate::parse(query.trim()) {
+                // Nothing matched by name — try reading the query as a date
+                // directly, so "Anfang 1789" or "431 v. Chr." still jump
+                // somewhere instead of the field silently doing nothing.
+                ui.weak(format!("↵ Enter: springe zu {}", d.label()));
+                if resp.has_focus() && resp.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let width = self.last_width.unwrap_or(1200.0);
+                    self.doc.view.filters.search.clear();
+                    self.jump_to(JumpTarget::Date(d), width);
+                }
             }
 
             if !self.doc.view.filters.search.is_empty() && ui.button("Leeren").clicked() {
