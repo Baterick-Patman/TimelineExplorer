@@ -217,7 +217,7 @@ found readable, and explicitly deprioritised for further scrutiny per
 direct instruction — don't read the lack of deeper light-mode testing here
 as "it's broken," just as "not this round's focus." **v1.0.0.**
 
-- **~13,600 lines** of Rust across 14 files in `src/`.
+- **~13,700 lines** of Rust across 14 files in `src/`.
 - **163 tests**, all passing, no compiler warnings (5 pre-existing clippy
   style lints — `derivable_impls`, `collapsible_if`,
   `field_reassign_with_default` — left as-is, not regressions).
@@ -436,10 +436,10 @@ Rough dependency order — `model` and `layout` are the load-bearing parts.
 
 | File | Lines | What it owns |
 | --- | --- | --- |
-| `layout.rs` | 2540 | Time axis, tick steps, visibility rules, lane planning/placement, band curves, label packing. **No painting** — that's why it holds the largest share of the tests. |
+| `layout.rs` | 2575 | Time axis, tick steps, visibility rules, lane planning/placement, band curves, label packing. **No painting** — that's why it holds the largest share of the tests. |
 | `forms.rs` | 2299 | Modal editors for group/timeline/biography/event/categories/export/import. |
 | `model.rs` | 2052 | Data model + serde. Dates, spans, timelines, groups, biographies, events, categories, filters. **No UI, no geometry.** |
-| `canvas.rs` | 1818 | All painting of the timeline surface + canvas input handling. **No test module at all** — see §6. |
+| `canvas.rs` | 1896 | All painting of the timeline surface + canvas input handling. **No test module at all** — see §6. |
 | `app.rs` | 1392 | `TimelineApp` state, undo/redo, autosave, menus, keyboard shortcuts, top-level layout, jump targets. |
 | `panels.rs` | 1255 | Sidebar (group tree, biographies, filters) and inspector. |
 | `example.rs` | 604 | The optional worked example dataset. |
@@ -896,6 +896,12 @@ already wired through `handle_picking` for any `Selection::Event` hit) — the
 same "dense clusters fall back to the tooltip" tradeoff the top level
 already accepted, just pushed one level deeper.
 
+**Superseded below** — reported as a real gap once someone actually tried a
+two-level nest (a section *inside* a long event, with its own events inside
+*that*): depth-2 got its own label after all, stacked in its own row block
+above depth-1's. See "A depth-2 nested label was still tooltip-only" further
+down for the follow-up design.
+
 Because nesting no longer needs any vertical space *below* the band,
 `LaneDemand.nested_rows`, `layout::nested_depth`, and the
 `NESTED_ROW_HEIGHT`/`MAX_NESTED_ROWS` constants were removed outright rather
@@ -1032,13 +1038,16 @@ demands, and `Lane.label_rows` likewise:
 
 - `below_rows` — plain-event label rows, exactly the old `rows`/`label_rows`
   concept, just anchored below the band now instead of above.
-- `above_slots` — stacked long-event slots above the band, each
-  `LONG_EVENT_SLOT_HEIGHT` (140px — sized for the worst case: a two-line
-  title, a full `MAX_NESTED_LABEL_ROWS` stack of nested labels, and the bar
-  itself, the same "size for the maximum" approach `LABEL_ROW_HEIGHT` already
-  took), capped at `MAX_LONG_EVENT_STACK` (4).
+- `above_slots` — stacked long-event slots above the band, capped at
+  `MAX_LONG_EVENT_STACK` (4). Originally each a single flat
+  `LONG_EVENT_SLOT_HEIGHT` (140px, later 180px once the depth-2 labelling
+  fix below needed room for a second nested-label depth); since split into
+  a per-lane `above_slot_height` sized to whichever of
+  `LONG_EVENT_SLOT_HEIGHT_SHALLOW`/`_DEEP` that lane's own long events
+  actually need — see "A long event's stacked slot is now sized to what it
+  actually nests" further down.
 
-`lane_height` sums both: `above_slots * LONG_EVENT_SLOT_HEIGHT +
+`lane_height` sums both: `above_slots * above_slot_height +
 LABEL_BAND_TOP + thickness + LABEL_BAND_BOTTOM + below_rows *
 LABEL_ROW_HEIGHT + LANE_BOTTOM_PAD` (`LABEL_BAND_BOTTOM` is new, mirroring
 the existing `LABEL_BAND_TOP`). `place_lanes` derives `center` from
@@ -1081,11 +1090,13 @@ A long event is painted by the new `paint_long_event`, which:
    needed no changes at all, since it was already relative to "the bar's own
    rect," which is all that moved.
 3. Paints the event's own title *above* a fixed, worst-case reservation for
-   the nested-label area (`MAX_NESTED_LABEL_ROWS * NESTED_LABEL_ROW_HEIGHT`)
+   the nested-label area (`canvas::max_nested_label_reserved_height()`)
    above the bar — deliberately not measured from how many nested labels
    this particular event actually used, so the title never needs that
    number to know where it sits, at the cost of some wasted space when an
-   event has fewer nested labels than the worst case.
+   event has fewer nested labels than the worst case. (Originally one fixed
+   row block regardless of depth; see "A depth-2 nested label was still
+   tooltip-only" further down for why it now varies by depth.)
 
 **`paint_range` generalised** to serve both directions from one
 implementation rather than duplicating it: it now takes `below: bool` and
@@ -1192,6 +1203,118 @@ None of these four are covered by an automated test (`canvas.rs` still has
 no test module — see §6); each was caught and confirmed fixed the same way
 as the previous round, with a throwaway `Document` and `PrintWindow`
 screenshots at the specific zoom/pan combination that reproduced it.
+
+### A depth-2 nested label was still tooltip-only
+
+Reported directly against the sketch this whole redesign was built from:
+"Peloponnesischer Krieg" → "Archidamischer Krieg" (a nested *section*) →
+"Schlacht bei Solygeia" (an event nested *inside that section*) — three
+levels deep — showed the section's own name but not the event's; the event
+was only reachable by clicking its bare marker. Confirmed as depth-specific,
+not a general regression: a *plain* one-level nest (long event → event,
+no intermediate section) already showed its label correctly. This is
+exactly the limitation the original nested-events-on-band redesign flagged
+as deliberate ("only the first nesting level gets a floating title... any
+deeper and titles... would float at the same height and collide") — it
+turned out to be a real gap in practice, not just a theoretical one, the
+first time someone actually nested two levels deep.
+
+Fixed by making the *reservation* depth-aware instead of flat. What used to
+be one constant (`MAX_NESTED_LABEL_ROWS`, one row block, one font size,
+shared by whichever depth happened to be `== 1`) is now three small
+functions in `canvas.rs`:
+
+- `nested_label_style(depth) -> (font_size, row_height)` — depth 1 (a
+  "section" like "Archidamischer Krieg") gets a visibly larger face (11pt,
+  16px rows) than depth 2 (an individual event like "Schlacht bei
+  Solygeia", 9.5pt, 13px rows) — the same heading-over-detail hierarchy the
+  top-level title already has over everything nested beneath it, now
+  carried one level further in.
+- `nested_label_base_offset(depth)` — sums every *deeper* labelled depth's
+  own row-block height, so a shallower depth's rows always start above all
+  of that combined rather than overlapping it. Depth 2 (the deepest
+  labelled level) sits at offset 0, right above the bar; depth 1 sits above
+  the whole of depth 2's block.
+- `max_nested_label_reserved_height()` — the total across every labelled
+  depth, which is what `paint_long_event` now clears when placing the
+  parent's own title (replacing the old flat `MAX_NESTED_LABEL_ROWS *
+  NESTED_LABEL_ROW_HEIGHT`), and what `LONG_EVENT_SLOT_HEIGHT` (bumped
+  140px → 180px) has to fit above the bar alongside everything else.
+
+`MAX_LABELED_NESTED_DEPTH` (2) is the cap — depth 3 and deeper still paint
+their marker/segment and stay clickable, but fall back to the hover
+tooltip for their name, same tradeoff as before, just pushed one level
+further down than it originally was. Nobody has yet reported needing a
+third labelled level; if that changes, the three functions above already
+generalise to any depth — `MAX_LABELED_NESTED_DEPTH` is the only number
+that would need to move, since `nested_label_base_offset`'s sum and
+`nested_label_style`'s `if depth <= 1` branch (worth turning into a proper
+match or table at that point) both already read from it rather than
+hardcoding "2" anywhere.
+
+Verified with the exact reported scenario (a war, a nested section within
+it, two events nested inside that section) via a throwaway `Document` and a
+`PrintWindow` screenshot: both events now show their own label, visibly
+smaller than and sitting just below the section's own name, which is
+itself visibly smaller than and sitting below the war's own title — the
+same three-tier hierarchy the original sketch called for.
+
+### A long event's stacked slot is now sized to what it actually contains, not a flat worst case
+
+Reported directly after the fix above shipped its own extra vertical cost:
+with several timelines each showing their own long event, the reserved
+space above each band (`LONG_EVENT_SLOT_HEIGHT`, bumped to 180px by the
+depth-2 fix to fit *two* labelled nesting depths) pushed everything below
+it — the next timeline, the next group heading — noticeably further down
+than felt warranted, especially since most long events only ever nest *one*
+level deep and most titles are one line, not the two-line worst case the
+flat constant always assumed.
+
+Went through two iterations before landing on the final design. The first
+cut split the single constant into two fixed tiers
+(`LONG_EVENT_SLOT_HEIGHT_SHALLOW` 120px / `_DEEP` 160px, picked by whether
+`ev` has a labelled grandchild) — a real improvement, but still assumed a
+worst-case two-line title on every long event regardless of what it's
+actually called. Reported again against the exact same screenshot before
+that first cut had even shipped (the report crossed with the fix in
+transit), so the second cut went further: `canvas::long_event_slot_height`
+now *measures* `ev`'s own title at the current zoom (`wrap_two_lines`'s
+same one-line/two-line split) instead of assuming the worst case, and adds
+that to a nested-label reservation that still varies by depth (both
+labelled row blocks if `ev` has a labelled grandchild, just depth-1's own
+otherwise) plus the bar itself. The two fixed tier constants were removed
+entirely once nothing but the tests still referenced them — replaced there
+by one arbitrary literal (`TEST_SLOT_HEIGHT`) standing in for whatever the
+real computation would produce, since those tests are about `place_lanes`/
+`lane_height` correctly turning a *given* height into reserved space, not
+about validating the measurement itself.
+
+`measure_lanes` takes the *maximum* of this across every long event on a
+given lane (all slots in one lane still share a single height, since any of
+them could end up holding any of that lane's long events depending on how
+the stack packer assigns them) and stores it on `LaneDemand`/`Lane` as
+`above_slot_height`; `lane_height`, `place_lanes`, and `paint_long_event`
+all read this per-lane value back rather than any constant. Measured
+against the exact scenario from the report (a five-word war title, a
+one-level-deep second war sharing its lane, both italicised further by
+their own nested sections/events): the shared slot height dropped to
+~121px — noticeably less than either the flat 180px original or the
+120/160px tiered attempt, since neither title in the reported case actually
+needed a second line.
+
+A third look at the same screenshot caught one more spot the old worst-case
+habit had survived: `paint_long_event` positioned an event's own title
+*unconditionally* `max_nested_label_reserved_height()` above its bar,
+regardless of whether that particular event had one labelled nesting depth
+or two — so a one-level-deep long event's title still floated as far above
+its bar as a two-level one's, even though `long_event_slot_height` (sizing
+the lane's slot) already knew better. The `has_grandchild` check and the
+resulting height pick were duplicated logic waiting to disagree; pulled out
+into one shared `nested_reservation_for(doc, filters, ppy, ev)`, called from
+both places, so a title now sits only as far from its own bar as its own
+nesting actually warrants. This is a per-event gap, independent of the
+lane-wide slot height above it — a shallower event simply leaves some of its
+shared slot's headroom unused above its title rather than needing it.
 
 ### Table import can nest straight into an existing event, not just onto a timeline's top level
 

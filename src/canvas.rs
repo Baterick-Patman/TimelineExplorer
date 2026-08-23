@@ -905,7 +905,7 @@ fn measure_lanes(
             // anything for them — it only fixes what "active" itself means).
             let active = lane_active(doc, plan.kind, filters, axis.ppy, view_from, view_to);
             if plan.header_only || !active {
-                return LaneDemand { below_rows: 0, above_slots: 0, active };
+                return LaneDemand { below_rows: 0, above_slots: 0, above_slot_height: 0.0, active };
             }
 
             let roots = visible_events(doc, plan.kind, filters, axis, view_from, view_to);
@@ -913,19 +913,25 @@ fn measure_lanes(
             // Long events stack purely by time overlap — reusing
             // `LabelPacker` again, just claiming an event's own date span
             // instead of a label's pixel width, exactly the way
-            // `paint_lane_events` will when it actually draws them.
+            // `paint_lane_events` will when it actually draws them. Every
+            // slot in the lane shares one height, so it has to be tall
+            // enough for whichever long event ends up needing the most —
+            // no lane pays for the deep tier just because *one* event on it
+            // happens to nest two levels while the rest only nest one.
             let mut stack_packer = LabelPacker::new();
             let mut above_slots = 0usize;
+            let mut above_slot_height = 0.0f32;
             for ev in roots.iter().filter(|e| is_long_event(doc, filters, axis.ppy, e)) {
                 let x0 = axis.x(ev.span.t0());
                 let x1 = axis.x(ev.span.t1()).max(x0 + 3.0);
                 if let Some(row) = stack_packer.place_rows(x0, x1, 1, MAX_LONG_EVENT_STACK) {
                     above_slots = above_slots.max(row + 1);
                 }
+                above_slot_height = above_slot_height.max(long_event_slot_height(p, doc, filters, axis.ppy, ev));
             }
 
             if !doc.view.show_labels {
-                return LaneDemand { below_rows: 0, above_slots, active };
+                return LaneDemand { below_rows: 0, above_slots, above_slot_height, active };
             }
 
             let mut packer = LabelPacker::new();
@@ -964,9 +970,51 @@ fn measure_lanes(
                 let t0 = fanned.get(&ev.id).copied().unwrap_or_else(|| ev.span.t0());
                 claim(&ev.title, ev.importance, axis.x(t0));
             }
-            LaneDemand { below_rows: used, above_slots, active }
+            LaneDemand { below_rows: used, above_slots, above_slot_height, active }
         })
         .collect()
+}
+
+/// Vertical space one stacked slot needs for `ev`'s own content: `ev`'s own
+/// title measured at however many lines it actually wraps to (see
+/// `wrap_two_lines`; most titles are one line, so this is usually much less
+/// than the two-line worst case), plus one nested-label row block per
+/// labelled depth `ev` actually reaches (`MAX_LABELED_NESTED_DEPTH`, both if
+/// `ev` has a labelled grandchild, just depth-1's own otherwise), plus the
+/// bar itself. Called only from `measure_lanes`, which stores the result on
+/// `Lane::above_slot_height` for `paint_lane_events`/`paint_long_event` to
+/// read back later in the same frame — the two never call this function
+/// independently, so they can't disagree on the value.
+fn long_event_slot_height(p: &egui::Painter, doc: &Document, filters: &Filters, ppy: f64, ev: &Event) -> f32 {
+    let nested = nested_reservation_for(doc, filters, ppy, ev);
+    // This event's *own* title, measured rather than assumed — most titles
+    // are one line, so reserving for a worst-case two-line title on every
+    // long event regardless of what it's actually called wasted real space
+    // in a library with several stacked long events.
+    let title_font = FontId::proportional(label_font_size(ev.importance, ppy));
+    let title_w = p.layout_no_wrap(ev.title.clone(), title_font, Color32::WHITE).size().x;
+    let title_rows = if title_w <= EVENT_LABEL_MAX_PX { 1.0 } else { 2.0 };
+    let bar_h = range_bar_height(ev.importance) + 10.0; // the "has_children" bonus `paint_range` always adds here.
+    title_rows * LABEL_ROW_HEIGHT + 4.0 + nested + bar_h + 9.0 + 6.0
+}
+
+/// How much nested-label row space `ev` itself actually needs above its bar:
+/// both labelled depths' row blocks if it has a labelled grandchild, just
+/// depth-1's own block otherwise. Shared by `long_event_slot_height` (sizing
+/// the lane's reserved slot) and `paint_long_event` (placing this event's own
+/// title) so the two never disagree about how far a title sits from content
+/// that, for this particular event, was never going to be there.
+fn nested_reservation_for(doc: &Document, filters: &Filters, ppy: f64, ev: &Event) -> f32 {
+    let has_grandchild = doc
+        .child_events(ev.id)
+        .into_iter()
+        .filter(|c| event_visible(c, filters, ppy))
+        .any(|c| doc.child_events(c.id).into_iter().any(|gc| event_visible(gc, filters, ppy)));
+    if has_grandchild {
+        max_nested_label_reserved_height()
+    } else {
+        NESTED_LABEL_ROWS_PER_DEPTH as f32 * nested_label_style(1).1
+    }
 }
 
 /// Paints every root event on a lane, split into two groups that live on
@@ -1062,6 +1110,7 @@ fn paint_lane_events(
                 selected,
                 &mut stack_packer,
                 max_above_slots,
+                lane.above_slot_height,
                 content_rect,
                 view_from,
                 view_to,
@@ -1198,6 +1247,7 @@ fn paint_long_event(
     selected: bool,
     stack_packer: &mut LabelPacker,
     max_above_slots: usize,
+    above_slot_height: f32,
     content_rect: Rect,
     view_from: f64,
     view_to: f64,
@@ -1221,7 +1271,7 @@ fn paint_long_event(
         Some(row) => (row, true),
         None => (max_above_slots.saturating_sub(1), false),
     };
-    let stack_offset = slot as f32 * LONG_EVENT_SLOT_HEIGHT;
+    let stack_offset = slot as f32 * above_slot_height;
 
     let marker_rect =
         paint_range(p, ev, axis, y, false, stack_offset, lane_color, alpha, ring, selected, true, content_rect, theme);
@@ -1254,10 +1304,11 @@ fn paint_long_event(
         .max(content_rect.left() + 2.0)
         .min(content_rect.right() - w - 2.0);
 
-    // Always reserved at the worst case (a full stack of nested labels)
-    // rather than however many this particular event actually used, so the
-    // title never needs to know that number to know where to sit.
-    let title_bottom = marker_rect.top() - MAX_NESTED_LABEL_ROWS as f32 * NESTED_LABEL_ROW_HEIGHT - 4.0;
+    // Only as much nested-label space as this event itself actually reaches
+    // — a long event with just direct children sits closer to its own bar
+    // than one whose nesting goes a level deeper, exactly like the slot
+    // height above already accounts for.
+    let title_bottom = marker_rect.top() - nested_reservation_for(doc, filters, axis.ppy, ev) - 4.0;
     let ly_top = title_bottom - rows_needed as f32 * LABEL_ROW_HEIGHT;
     if ly_top < lane_top - LABEL_ROW_HEIGHT {
         return;
@@ -1289,13 +1340,53 @@ fn paint_long_event(
 /// at this scale regardless, and every level shares the very same bar height
 /// so deeper segments would be indistinguishable from their parent anyway.
 const MAX_NESTED_SEGMENT_DEPTH: usize = 4;
-/// A floating nested-child label that would collide with a sibling's steps
-/// up to a further row above the bar instead of overlapping it, up to this
-/// many rows — a small, fixed cap since there is no lane-height reservation
-/// backing this the way top-level label rows have; run out and the label is
-/// dropped, same as a top-level label that runs out of `MAX_LABEL_ROWS`.
-const MAX_NESTED_LABEL_ROWS: usize = 3;
-const NESTED_LABEL_ROW_HEIGHT: f32 = 13.0;
+/// How many nesting levels below the parent get their own floating label at
+/// all — "Peloponnesischer Krieg" → "Archidamischer Krieg" (depth 1) →
+/// "Schlacht bei Solygeia" (depth 2) both get one. Any deeper and a label
+/// would have nowhere left to sit without colliding with its own parent's —
+/// it still paints (and stays clickable) but falls back to the hover
+/// tooltip for its name, the same "dense clusters" tradeoff the top level
+/// already accepts.
+const MAX_LABELED_NESTED_DEPTH: usize = 2;
+/// A floating nested-child label that would collide with a sibling steps up
+/// to a further row within its own depth's block instead of overlapping it,
+/// up to this many rows — a small, fixed cap since there is no lane-height
+/// reservation backing this the way top-level label rows have; run out and
+/// the label is dropped, same as a top-level label that runs out of
+/// `MAX_LABEL_ROWS`.
+const NESTED_LABEL_ROWS_PER_DEPTH: usize = 2;
+
+/// Font size and row height for a nested label at the given depth. A
+/// shallower depth (closer to the parent's own title) reads as a heading
+/// over the deeper depth's more numerous, smaller event labels — the same
+/// visual hierarchy the top-level title already sets up over everything
+/// nested beneath it (e.g. a section name like "Archidamischer Krieg"
+/// written a size larger than the individual events inside it).
+fn nested_label_style(depth: usize) -> (f32, f32) {
+    if depth <= 1 {
+        (11.0, 16.0)
+    } else {
+        (9.5, 13.0)
+    }
+}
+
+/// How far above the bar a given depth's own row block starts: every depth
+/// *deeper* than it reserves its own block of rows closer to the bar
+/// first, so a shallower depth's rows sit above all of those combined
+/// rather than overlapping them.
+fn nested_label_base_offset(depth: usize) -> f32 {
+    ((depth + 1)..=MAX_LABELED_NESTED_DEPTH)
+        .map(|d| NESTED_LABEL_ROWS_PER_DEPTH as f32 * nested_label_style(d).1)
+        .sum()
+}
+
+/// Total vertical space every labelled nesting depth's rows need together —
+/// what a long event's own title must clear above the bar.
+fn max_nested_label_reserved_height() -> f32 {
+    (1..=MAX_LABELED_NESTED_DEPTH)
+        .map(|d| NESTED_LABEL_ROWS_PER_DEPTH as f32 * nested_label_style(d).1)
+        .sum()
+}
 
 /// Paint events nested inside `parent` — "Archidamischer Krieg" inside
 /// "Peloponnesischer Krieg" — directly on the parent's own bar rather than in
@@ -1304,11 +1395,13 @@ const NESTED_LABEL_ROW_HEIGHT: f32 = 13.0;
 /// timeline's band; a nested point event becomes a small marker sitting on
 /// that same bar. The parent's bar behaves like its own small, exactly
 /// parallel mini-timeline. Recurses into a range child's own segment rect for
-/// grandchildren (capped at `MAX_NESTED_SEGMENT_DEPTH`), but only the first
-/// nesting level gets a floating title — any deeper and titles from a level
-/// and its own children would float at the same height and collide, so those
-/// still paint (and are still clickable) but fall back to the hover tooltip
-/// for their name, the same "dense clusters" tradeoff the top level accepts.
+/// grandchildren (capped at `MAX_NESTED_SEGMENT_DEPTH`), and the first
+/// `MAX_LABELED_NESTED_DEPTH` levels each get their own floating label, one
+/// row block per depth, shallower depths sitting above deeper ones — any
+/// deeper still and a label would have nowhere left to sit without colliding
+/// with its own parent's, so it still paints (and is still clickable) but
+/// falls back to the hover tooltip for its name, the same "dense clusters"
+/// tradeoff the top level accepts.
 /// `labels_allowed` additionally suppresses every label at every depth when
 /// `false` — used when `parent` itself lost the race for its own stacked
 /// slot (see `paint_long_event`) and shares one with an unrelated event, so
@@ -1362,7 +1455,7 @@ fn paint_nested_events(
         let alpha = importance_alpha(child.importance);
         let selected = app.selection == Some(Selection::Event(child.id));
         let fill = with_alpha(shade(lane_color, shade_amount), alpha);
-        let show_label = doc.view.show_labels && depth == 1 && labels_allowed;
+        let show_label = doc.view.show_labels && depth <= MAX_LABELED_NESTED_DEPTH && labels_allowed;
 
         if child.span.is_range() && !range_collapsed(child, axis.ppy) {
             let x0 = axis.x(child.span.t0()).max(parent_rect.left());
@@ -1393,6 +1486,7 @@ fn paint_nested_events(
                     (rect.width() - 4.0).max(20.0),
                     parent_rect.top(),
                     alpha,
+                    depth,
                     theme,
                 );
             }
@@ -1419,24 +1513,27 @@ fn paint_nested_events(
             });
 
             if show_label {
-                nested_child_label(p, &mut label_packer, &child.title, cx, 170.0, parent_rect.top(), alpha, theme);
+                nested_child_label(p, &mut label_packer, &child.title, cx, 170.0, parent_rect.top(), alpha, depth, theme);
             }
         }
     }
 }
 
-/// A short title floated just above `top_y`, centred on `anchor_x` — used for
-/// both a nested point-child's marker and a nested range-child's own segment,
-/// so a title never has to fit inside a bar only a few pixels tall (the same
-/// idea as an epoch's name overlaid on its timeline band, just floated
-/// entirely above it rather than centred within it, since a nested bar is
-/// far thinner than a timeline's own). `packer` — shared across every
-/// sibling in the same call — pushes a label that would otherwise overlap
-/// its neighbour up onto a further row instead, the same idea as top-level
-/// labels stacking in `LabelPacker` rows, just with a small fixed cap of its
-/// own rather than a lane-height reservation behind it; a title that still
-/// doesn't fit within `MAX_NESTED_LABEL_ROWS` is silently dropped and falls
-/// back to the hover tooltip.
+/// A short title floated above `top_y`, centred on `anchor_x` — used for both
+/// a nested point-child's marker and a nested range-child's own segment, so a
+/// title never has to fit inside a bar only a few pixels tall (the same idea
+/// as an epoch's name overlaid on its timeline band, just floated entirely
+/// above it rather than centred within it, since a nested bar is far thinner
+/// than a timeline's own). `depth` picks this label's own row block — see
+/// `nested_label_style`/`nested_label_base_offset` — so a depth-1 "section"
+/// label reads as a heading sitting above every depth-2 "event" label rather
+/// than colliding with them. `packer` — shared across every sibling *at this
+/// depth* in the same call — pushes a label that would otherwise overlap its
+/// neighbour onto a further row within that same block instead, the same
+/// idea as top-level labels stacking in `LabelPacker` rows, just with a small
+/// fixed cap of its own rather than a lane-height reservation behind it; a
+/// title that still doesn't fit within `NESTED_LABEL_ROWS_PER_DEPTH` is
+/// silently dropped and falls back to the hover tooltip.
 #[allow(clippy::too_many_arguments)]
 fn nested_child_label(
     p: &egui::Painter,
@@ -1446,21 +1543,24 @@ fn nested_child_label(
     max_width: f32,
     top_y: f32,
     alpha: u8,
+    depth: usize,
     theme: &Theme,
 ) {
     if name.trim().is_empty() {
         return;
     }
-    let font = FontId::proportional(9.5);
+    let (font_size, row_h) = nested_label_style(depth);
+    let font = FontId::proportional(font_size);
     let color = with_alpha(theme.text_dim, alpha);
     let fitted = fit_text(p, name, &font, color, max_width);
     let galley = p.layout_no_wrap(fitted, font, color);
     let w = galley.size().x;
     let x_min = anchor_x - w * 0.5;
-    let Some(row) = packer.place_rows(x_min, x_min + w, 1, MAX_NESTED_LABEL_ROWS) else {
+    let Some(row) = packer.place_rows(x_min, x_min + w, 1, NESTED_LABEL_ROWS_PER_DEPTH) else {
         return;
     };
-    let pos = Pos2::new(x_min, top_y - galley.size().y - 2.0 - row as f32 * NESTED_LABEL_ROW_HEIGHT);
+    let offset = nested_label_base_offset(depth) + row as f32 * row_h;
+    let pos = Pos2::new(x_min, top_y - galley.size().y - 2.0 - offset);
     // Fully opaque — see the comment on `junction_label`'s identical fix.
     p.rect_filled(
         Rect::from_min_size(pos, galley.size()).expand2(Vec2::new(2.0, 1.0)),

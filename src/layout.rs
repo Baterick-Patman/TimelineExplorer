@@ -346,6 +346,10 @@ pub struct Lane {
     /// time each claim their own slot rather than drawing on top of one
     /// another; see `canvas::paint_lane_events`.
     pub above_slots: usize,
+    /// Height of one `above_slots` slot in this lane — the tallest a stacked
+    /// long event on it actually needs, measured per event and taken as a
+    /// maximum across the lane; see `canvas::long_event_slot_height`.
+    pub above_slot_height: f32,
     /// Rows of label space reserved *below* the band, for every other
     /// (plain point, or childless range) event's marker-plus-label.
     pub below_rows: usize,
@@ -365,6 +369,9 @@ pub struct LaneDemand {
     /// Stacked slots the lane's long events (see `Lane::above_slots`) want
     /// above the band.
     pub above_slots: usize,
+    /// Height one such slot needs — see `Lane::above_slot_height`. Ignored
+    /// (and left at its `Default` of `0.0`) when `above_slots` is `0`.
+    pub above_slot_height: f32,
     /// Whether the lane has anything at all in the visible window.
     pub active: bool,
 }
@@ -423,12 +430,6 @@ pub const LABEL_ROW_HEIGHT: f32 = 25.0;
 pub const LANE_BOTTOM_PAD: f32 = 10.0;
 /// Never grow a lane beyond this many label rows, however dense the data.
 pub const MAX_LABEL_ROWS: usize = 14;
-/// Height reserved for one stacked "long event" slot above a band: room for
-/// the event's own title, a nested child's label floating above its bar,
-/// and the bar itself. Sized for the worst case (a two-line title plus a
-/// full `MAX_NESTED_LABEL_ROWS` stack of nested labels), the same
-/// size-for-the-maximum approach `LABEL_ROW_HEIGHT` already takes.
-pub const LONG_EVENT_SLOT_HEIGHT: f32 = 140.0;
 /// However many long events overlap in time at once, never stack more than
 /// this many slots — a hand-edited file with more than a handful of
 /// overlapping wars is an extreme edge case; further ones share the
@@ -441,8 +442,13 @@ pub const MAX_LONG_EVENT_STACK: usize = 4;
 /// their own here — they paint directly onto their parent's own bar as
 /// colour-coded segments/markers (see `paint_nested_events` in `canvas.rs`),
 /// exactly like an epoch on a timeline's band. What *is* reserved here is
-/// room for that parent bar itself: one `LONG_EVENT_SLOT_HEIGHT` per
-/// overlapping "long event" above the band, and one `LABEL_ROW_HEIGHT` per
+/// room for that parent bar itself: one `demand.above_slot_height` per
+/// overlapping "long event" above the band (a single height shared by every
+/// slot in this lane, sized by `canvas::long_event_slot_height` to whatever
+/// the *most demanding* long event actually on this lane needs — its own
+/// title's real line count, plus a nested-label row block per labelled
+/// depth it actually reaches — since every slot has to be tall enough for
+/// whichever event ends up stacked into it), and one `LABEL_ROW_HEIGHT` per
 /// row of plain-event labels below it.
 pub fn lane_height(plan: &LanePlan, demand: LaneDemand) -> f32 {
     if plan.header_only {
@@ -451,7 +457,7 @@ pub fn lane_height(plan: &LanePlan, demand: LaneDemand) -> f32 {
     if !demand.active {
         return DORMANT_LANE_HEIGHT;
     }
-    let above = demand.above_slots as f32 * LONG_EVENT_SLOT_HEIGHT;
+    let above = demand.above_slots as f32 * demand.above_slot_height;
     let below = demand.below_rows as f32 * LABEL_ROW_HEIGHT;
     above + LABEL_BAND_TOP + plan.thickness + LABEL_BAND_BOTTOM + below + LANE_BOTTOM_PAD
 }
@@ -604,7 +610,7 @@ pub fn place_lanes(plans: &[LanePlan], demands: &[LaneDemand], top: f32) -> Vec<
         let center = if plan.header_only || !demand.active {
             y + h * 0.5
         } else {
-            y + above_slots as f32 * LONG_EVENT_SLOT_HEIGHT + LABEL_BAND_TOP + plan.thickness * 0.5
+            y + above_slots as f32 * demand.above_slot_height + LABEL_BAND_TOP + plan.thickness * 0.5
         };
         lanes.push(Lane {
             kind: plan.kind,
@@ -618,6 +624,7 @@ pub fn place_lanes(plans: &[LanePlan], demands: &[LaneDemand], top: f32) -> Vec<
             top: y,
             bottom: y + h,
             above_slots,
+            above_slot_height: demand.above_slot_height,
             below_rows,
         });
         y += h;
@@ -1836,12 +1843,13 @@ mod tests {
     /// Plan + place with no measured label demand, i.e. minimum lane sizes.
     fn build_lanes(doc: &Document, top: f32, filters: &Filters) -> Vec<Lane> {
         let plans = plan_lanes(doc, filters);
-        let demands = vec![LaneDemand { below_rows: 0, above_slots: 0, active: true }; plans.len()];
+        let demands =
+            vec![LaneDemand { below_rows: 0, above_slots: 0, above_slot_height: 0.0, active: true }; plans.len()];
         place_lanes(&plans, &demands, top)
     }
 
     fn demands(n: usize, rows: usize) -> Vec<LaneDemand> {
-        vec![LaneDemand { below_rows: rows, above_slots: 0, active: true }; n]
+        vec![LaneDemand { below_rows: rows, above_slots: 0, above_slot_height: 0.0, active: true }; n]
     }
 
     fn lane_doc() -> Document {
@@ -2384,8 +2392,24 @@ mod tests {
         }
     }
 
+    // Arbitrary but realistic stand-in for whatever `canvas::long_event_slot_height`
+    // would actually compute for a given event — these tests are about
+    // whether `place_lanes`/`lane_height` correctly turn a *given*
+    // `above_slot_height` into reserved space, not about validating that
+    // computation itself (which lives in, and is tested informally
+    // alongside, `canvas.rs`).
+    const TEST_SLOT_HEIGHT: f32 = 120.0;
+
     fn above_demands(n: usize, slots: usize) -> Vec<LaneDemand> {
-        vec![LaneDemand { below_rows: 0, above_slots: slots, active: true }; n]
+        vec![
+            LaneDemand {
+                below_rows: 0,
+                above_slots: slots,
+                above_slot_height: TEST_SLOT_HEIGHT,
+                active: true,
+            };
+            n
+        ]
     }
 
     #[test]
@@ -2418,7 +2442,7 @@ mod tests {
         for l in &lanes {
             let band_top = l.center - l.thickness * 0.5;
             assert!(
-                band_top - l.top >= l.above_slots as f32 * LONG_EVENT_SLOT_HEIGHT,
+                band_top - l.top >= l.above_slots as f32 * TEST_SLOT_HEIGHT,
                 "lane {} does not reserve room for its stacked long events",
                 l.name
             );
@@ -2450,7 +2474,7 @@ mod tests {
         let awake = place_lanes(&plans, &demands(plans.len(), 3), 0.0);
         let asleep = place_lanes(
             &plans,
-            &vec![LaneDemand { below_rows: 3, above_slots: 0, active: false }; plans.len()],
+            &vec![LaneDemand { below_rows: 3, above_slots: 0, above_slot_height: 0.0, active: false }; plans.len()],
             0.0,
         );
         assert!(asleep[0].bottom - asleep[0].top < awake[0].bottom - awake[0].top);
@@ -2490,7 +2514,7 @@ mod tests {
         let doc = lane_doc();
         let plans = plan_lanes(&doc, &Filters::default());
         let rows: Vec<LaneDemand> = (0..plans.len())
-            .map(|i| LaneDemand { below_rows: i * 3, above_slots: 0, active: i % 2 == 0 })
+            .map(|i| LaneDemand { below_rows: i * 3, above_slots: 0, above_slot_height: 0.0, active: i % 2 == 0 })
             .collect();
         let lanes = place_lanes(&plans, &rows, 5.0);
         for w in lanes.windows(2) {
