@@ -218,7 +218,7 @@ direct instruction — don't read the lack of deeper light-mode testing here
 as "it's broken," just as "not this round's focus." **v1.0.0.**
 
 - **~13,700 lines** of Rust across 14 files in `src/`.
-- **163 tests**, all passing, no compiler warnings (5 pre-existing clippy
+- **167 tests**, all passing, no compiler warnings (5 pre-existing clippy
   style lints — `derivable_impls`, `collapsible_if`,
   `field_reassign_with_default` — left as-is, not regressions).
 - Release binary: `target/release/timeline_explorer.exe`, single file, ~9 MB
@@ -413,7 +413,7 @@ internal state without a console. Extend it the same way when debugging.
 
 ```bash
 cargo build            # debug
-cargo test             # 159 tests, ~0.2s, all pure logic — no window needed
+cargo test             # 167 tests, ~0.2s, all pure logic — no window needed
 cargo build --release  # the shippable single exe
 ```
 
@@ -1316,6 +1316,108 @@ nesting actually warrants. This is a per-event gap, independent of the
 lane-wide slot height above it — a shallower event simply leaves some of its
 shared slot's headroom unused above its title rather than needing it.
 
+### A biography's importance now affects its zoom behaviour, thickness and name size, not just events'
+
+Reported against a screenshot of nine Greek-antiquity figures (poets,
+playwrights, philosophers) all marked with different `Biography::importance`
+levels in the sidebar, but all rendering identically on the canvas — same
+lifeline thickness, same name size, and, unlike an event of the same
+importance, no tendency to disappear while zooming out. `event_visible`
+already gates an event's own visibility on `importance_threshold(ppy,
+detail_bias)`; `biography_visible` (checked once, when the lane plan is
+built) and `bio_thickness`/`paint_biography_name` (checked every frame) had
+simply never been wired to `Biography::importance` at all — the field only
+ever showed up read-only in the inspector panel.
+
+Three call sites, three fixes:
+
+- **Zoom retraction.** `lane_active`'s `LaneKind::Biography` arm now also
+  requires `b.importance >= importance_threshold(ppy, filters.detail_bias)`
+  (a search overrides it, same as `event_visible`) before falling through to
+  its existing time-overlap check. This reuses the *lane* machinery rather
+  than removing entries from `plan_lanes` outright — a biography below the
+  current threshold just goes dormant (the same slim row a biography scrolled
+  outside the visible date range already collapses to) instead of reflowing
+  the whole layout by vanishing entirely.
+- **Thickness.** `bio_thickness(ppy, enlarged, importance)` gained an
+  `importance` parameter: the whole thickness curve (`BIO_BAND_THICKNESS`,
+  `_MIN`, `_ENLARGED`) is scaled by `range_bar_height(importance) /
+  range_bar_height(3)` — reusing the same per-importance spread nested event
+  bars use rather than inventing a second one, and `/ range_bar_height(3)`
+  specifically so importance 3 (the default) reproduces the exact old fixed
+  thickness with no visible change for the common case.
+- **Name size.** `paint_biography_name`'s hardcoded `11.5`/`13.5` (nested vs.
+  promoted-to-own-lane) became `label_font_size(bio.importance, axis.ppy) -
+  (2.0 if nested else 0.0)` — the same function an event's own title already
+  uses, so a biography's name now grows with both its importance and the
+  current zoom instead of sitting at one fixed size regardless of either.
+
+Fixing the first point surfaced a latent bug in `paint_lane_names`: its
+`LaneKind::Biography` branch called `paint_biography_name` unconditionally,
+never checking `lane.active` at all (the sibling branch just below it, for
+every other lane kind, already does). This had been silently correct before
+only because the *one* existing way a biography's lane went dormant —
+scrolling past its own lifespan — also made `paint_biography_name`'s own
+internal `to <= from` check bail out for the exact same reason, so the two
+never visibly disagreed. Importance-driven dormancy broke that coincidence:
+a biography still on screen but below the current importance threshold kept
+painting a floating name with no band underneath it, since `lane.active`
+being false no longer implied "scrolled out of view" too. Fixed by gating
+the branch on `lane.active` explicitly, same as the sibling branch already
+does.
+
+Verified with a throwaway nine-biography Greek-antiquity document
+(importance 2 through 5) at three zoom levels: at a middle zoom the
+importance-5 figures (Sokrates, Platon, Aristoteles) show visibly thicker
+lines and larger names than the importance-3/4 ones, while the sole
+importance-2 entry (Alkman) has already gone dormant; zoomed in further
+everyone is visible; zoomed out far enough to raise the threshold to 5, only
+the three importance-5 figures remain on screen at all.
+
+### A dormant biography now collapses to nothing, not a placeholder row — merge curves were paying for the difference
+
+Reported against a screenshot of "Griechische Antike" merging into "Römische
+Antike" with a curve so steep it looked broken: `band_center_at` eases a
+merging timeline's band onto the target timeline's own centre over a fixed
+horizontal window (`TRANSITION_PX`, a constant pixel width regardless of
+zoom), so the curve's steepness is *entirely* a function of the vertical
+distance between the two timelines' lane centres — and that distance is
+whatever `place_lanes` stacked in between them.
+
+`plan_group` lists every one of a timeline's inline biographies as its own
+`LanePlan` row unconditionally — visible or not, relevant to the current
+scroll position or not. `lane_height` already collapsed a *dormant* lane to
+a slim `DORMANT_LANE_HEIGHT` (24px) placeholder rather than its full size,
+but a placeholder is still 24px, and a rich timeline can easily carry a
+couple dozen biographies. Every one of them dormant at once (exactly the
+case right at a merge transition, where whichever figures belong to the
+*source* timeline are rarely also relevant at the merge date) still added
+up to several hundred pixels of dead space between the two bands — which
+the fixed-width transition curve then had no choice but to traverse at a
+steep angle, since it has no idea any of that space is meaningless
+placeholder padding rather than real content.
+
+The 24px floor makes sense for a timeline or group — there are only ever a
+handful of those, so paying a few pixels each to keep the scroll position
+stable while panning past one is a good trade. It never made sense at
+biography scale. Fixed by branching `lane_height`'s dormant case on
+`plan.kind`: a dormant `LaneKind::Biography` now returns `0.0` outright
+instead of `DORMANT_LANE_HEIGHT`, while `Timeline`/`Group` keep the existing
+placeholder unchanged. `place_lanes`' existing math already handles a
+zero-height lane correctly with no further changes — `top == center ==
+bottom` at that lane's position, and since painting anything for an inactive
+lane was already gated on `lane.active` everywhere (including the
+`paint_lane_names` fix two sections up), a zero-height dormant biography
+lane simply contributes nothing, visually or spatially.
+
+Verified with a two-timeline document ("Griechische Antike" merging into
+"Römische Antike" at 146 BC) carrying eight inline biographies, all from
+centuries before the merge date and so all dormant once the view is panned
+to the transition itself: before this fix the merge curve stretched across
+the accumulated placeholder rows; after, the two bands sit directly
+adjacent and the curve is the short, gentle transition `TRANSITION_PX` was
+always meant to produce.
+
 ### Table import can nest straight into an existing event, not just onto a timeline's top level
 
 `ImportForm::nest_under: Option<Id>` — when importing Events, an optional
@@ -1598,7 +1700,7 @@ their library, with no error message pointing at the cause.
 
 ## 6. Testing approach
 
-All 163 tests are pure logic and run in well under a second without opening a
+All 167 tests are pure logic and run in well under a second without opening a
 window — `layout` and `model` hold the largest share (axis maths, zoom
 clamping, tick steps, filters, lane stacking, band convergence geometry,
 dormant lanes, label packing, date parsing, colour-segment gap-filling), with

@@ -1,6 +1,6 @@
 [package]
 name = "timeline_explorer"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Timeline Explorer - multi-timeline comparison tool"
 

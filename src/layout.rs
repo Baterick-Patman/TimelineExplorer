@@ -26,17 +26,25 @@ const BIO_ZOOM_REFERENCE_PPY: f64 = 15.0;
 /// stays at this thickness regardless of zoom, so it keeps standing out.
 pub const BIO_BAND_THICKNESS_ENLARGED: f32 = 20.0;
 
-/// A biography lane's thickness at the current zoom. Eases down toward a
-/// legible minimum as the view zooms out, so a crowd of biographies does not
-/// turn into an unreadable wall of thin colour; a lane the user has pinned
-/// open (see `TimelineApp::enlarged_biographies`) ignores zoom entirely and
-/// stays large so it can be picked out even from far away.
-pub fn bio_thickness(ppy: f64, enlarged: bool) -> f32 {
+/// A biography lane's thickness at the current zoom and importance. Eases
+/// down toward a legible minimum as the view zooms out, so a crowd of
+/// biographies does not turn into an unreadable wall of thin colour; a lane
+/// the user has pinned open (see `TimelineApp::enlarged_biographies`)
+/// ignores zoom entirely and stays large so it can be picked out even from
+/// far away. `importance` scales the whole curve — a more significant life
+/// gets a visibly thicker line at every zoom level, not just a longer one —
+/// reusing `range_bar_height`'s per-importance spread so a biography's line
+/// reads on the same "how major is this" scale a nested event's bar does;
+/// at the default importance (3) this is exactly the old fixed thickness.
+pub fn bio_thickness(ppy: f64, enlarged: bool, importance: u8) -> f32 {
+    let scale = crate::theme::range_bar_height(importance) / crate::theme::range_bar_height(3);
     if enlarged {
-        return BIO_BAND_THICKNESS_ENLARGED;
+        return BIO_BAND_THICKNESS_ENLARGED * scale;
     }
+    let min = BIO_BAND_THICKNESS_MIN * scale;
+    let normal = BIO_BAND_THICKNESS * scale;
     let t = (ppy / BIO_ZOOM_REFERENCE_PPY).clamp(0.0, 1.0) as f32;
-    BIO_BAND_THICKNESS_MIN + (BIO_BAND_THICKNESS - BIO_BAND_THICKNESS_MIN) * t
+    min + (normal - min) * t
 }
 /// Horizontal length, in pixels, of a merge/split curve. Expressed in pixels so
 /// the curve keeps the same shape at every zoom level.
@@ -398,7 +406,12 @@ pub fn lane_active(
             .is_some_and(|(lo, hi)| overlaps(lo, hi)),
         LaneKind::Biography(id) => doc.biography(id).is_some_and(|b| {
             let s = b.span();
-            overlaps(s.t0(), s.t1())
+            // Same "hide the minor ones first" rule zoomed-out events already
+            // follow — a search overrides it, same reasoning as `event_visible`.
+            let searching = !filters.search.trim().is_empty();
+            let important_enough =
+                searching || b.importance >= importance_threshold(ppy, filters.detail_bias);
+            important_enough && overlaps(s.t0(), s.t1())
         }),
         LaneKind::Group(id) => doc.group_timelines(id).iter().any(|t| {
             doc.timeline(*t)
@@ -455,7 +468,20 @@ pub fn lane_height(plan: &LanePlan, demand: LaneDemand) -> f32 {
         return 26.0;
     }
     if !demand.active {
-        return DORMANT_LANE_HEIGHT;
+        // A dormant timeline or group keeps a slim placeholder row — with only
+        // a handful of those ever in play, panning past one and back is worth
+        // a stable scroll position more than the few extra pixels it costs.
+        // A biography is a different story: a single timeline can carry a
+        // couple dozen of them, and each one still costing a placeholder row
+        // adds up into real, pointless vertical distance between it and whatever
+        // comes next — which is exactly what stretches a merge transition's
+        // curve into an ugly, steep one it has no reason to be. A biography
+        // going dormant collapses to nothing instead.
+        return if matches!(plan.kind, LaneKind::Biography(_)) {
+            0.0
+        } else {
+            DORMANT_LANE_HEIGHT
+        };
     }
     let above = demand.above_slots as f32 * demand.above_slot_height;
     let below = demand.below_rows as f32 * LABEL_ROW_HEIGHT;
@@ -1699,18 +1725,26 @@ mod tests {
 
     #[test]
     fn bio_thickness_eases_from_the_minimum_up_to_the_normal_size_as_you_zoom_in() {
-        assert_eq!(bio_thickness(0.0, false), BIO_BAND_THICKNESS_MIN);
-        assert_eq!(bio_thickness(BIO_ZOOM_REFERENCE_PPY, false), BIO_BAND_THICKNESS);
+        assert_eq!(bio_thickness(0.0, false, 3), BIO_BAND_THICKNESS_MIN);
+        assert_eq!(bio_thickness(BIO_ZOOM_REFERENCE_PPY, false, 3), BIO_BAND_THICKNESS);
         // Zooming in further must not overshoot the normal thickness.
-        assert_eq!(bio_thickness(BIO_ZOOM_REFERENCE_PPY * 10.0, false), BIO_BAND_THICKNESS);
-        let mid = bio_thickness(BIO_ZOOM_REFERENCE_PPY * 0.5, false);
+        assert_eq!(bio_thickness(BIO_ZOOM_REFERENCE_PPY * 10.0, false, 3), BIO_BAND_THICKNESS);
+        let mid = bio_thickness(BIO_ZOOM_REFERENCE_PPY * 0.5, false, 3);
         assert!(mid > BIO_BAND_THICKNESS_MIN && mid < BIO_BAND_THICKNESS);
     }
 
     #[test]
     fn a_pinned_open_biography_ignores_zoom_entirely() {
-        assert_eq!(bio_thickness(0.0, true), BIO_BAND_THICKNESS_ENLARGED);
-        assert_eq!(bio_thickness(1000.0, true), BIO_BAND_THICKNESS_ENLARGED);
+        assert_eq!(bio_thickness(0.0, true, 3), BIO_BAND_THICKNESS_ENLARGED);
+        assert_eq!(bio_thickness(1000.0, true, 3), BIO_BAND_THICKNESS_ENLARGED);
+    }
+
+    #[test]
+    fn a_more_important_biography_gets_a_thicker_line_at_every_zoom_and_pin_state() {
+        assert!(bio_thickness(0.0, false, 5) > bio_thickness(0.0, false, 3));
+        assert!(bio_thickness(0.0, false, 1) < bio_thickness(0.0, false, 3));
+        assert!(bio_thickness(BIO_ZOOM_REFERENCE_PPY, false, 5) > bio_thickness(BIO_ZOOM_REFERENCE_PPY, false, 3));
+        assert!(bio_thickness(0.0, true, 5) > bio_thickness(0.0, true, 3));
     }
 
     #[test]
@@ -2483,6 +2517,34 @@ mod tests {
     }
 
     #[test]
+    fn a_dormant_biography_collapses_to_nothing_instead_of_a_slim_row() {
+        // A timeline can carry a couple dozen biographies; each still costing
+        // a placeholder row the way a dormant timeline or group does would
+        // add real, pointless vertical distance — stretching, among other
+        // things, a merge transition's curve into an ugly, steep one it has
+        // no reason to be. Unlike a timeline or group, a biography going
+        // dormant should cost nothing at all.
+        let doc = lane_doc();
+        let plans = plan_lanes(&doc, &Filters::default());
+        let bio_index = plans
+            .iter()
+            .position(|p| matches!(p.kind, LaneKind::Biography(_)))
+            .expect("lane_doc has at least one biography");
+        assert!(!matches!(plans[0].kind, LaneKind::Biography(_)));
+        let asleep = place_lanes(
+            &plans,
+            &vec![LaneDemand { below_rows: 3, above_slots: 0, above_slot_height: 0.0, active: false }; plans.len()],
+            0.0,
+        );
+        assert_eq!(asleep[0].bottom - asleep[0].top, DORMANT_LANE_HEIGHT, "a timeline still keeps its slim row");
+        assert_eq!(
+            asleep[bio_index].bottom - asleep[bio_index].top,
+            0.0,
+            "a biography collapses fully instead"
+        );
+    }
+
+    #[test]
     fn an_event_outside_the_band_still_wakes_its_lane() {
         // A posthumous work sits past the end of a biography's lifeline; the
         // lane must not go dormant and hide it.
@@ -2507,6 +2569,37 @@ mod tests {
             -25.0,
             -15.0
         ));
+    }
+
+    #[test]
+    fn a_biography_lane_goes_dormant_when_zoomed_out_past_its_own_importance() {
+        // Cicero (lane_doc) is importance 4: visible once the zoom-derived
+        // threshold drops to 4, dormant while it still demands 5 — the same
+        // "less important fades first while zooming out" rule events follow.
+        let doc = lane_doc();
+        let bio = doc.biographies[0].id;
+        let filters = Filters::default();
+        assert_eq!(importance_threshold(0.1, 0), 5);
+        assert_eq!(importance_threshold(1.0, 0), 4);
+        assert!(
+            !lane_active(&doc, LaneKind::Biography(bio), &filters, 0.1, -106.0, -43.0),
+            "importance 4 should not survive a threshold of 5"
+        );
+        assert!(
+            lane_active(&doc, LaneKind::Biography(bio), &filters, 1.0, -106.0, -43.0),
+            "importance 4 should survive a threshold of 4"
+        );
+    }
+
+    #[test]
+    fn a_search_keeps_a_biography_lane_awake_regardless_of_importance() {
+        let doc = lane_doc();
+        let bio = doc.biographies[0].id;
+        let filters = Filters {
+            search: "anything".into(),
+            ..Filters::default()
+        };
+        assert!(lane_active(&doc, LaneKind::Biography(bio), &filters, 0.1, -106.0, -43.0));
     }
 
     #[test]

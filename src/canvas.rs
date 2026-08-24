@@ -55,7 +55,8 @@ pub fn draw(app: &mut TimelineApp, ui: &mut egui::Ui) {
         // a fixed size, so their lanes ease narrower as you zoom out — unless
         // pinned open (click, or Ctrl+click for several) to stay prominent.
         if let LaneKind::Biography(id) = plan.kind {
-            plan.thickness = bio_thickness(axis.ppy, app.enlarged_biographies.contains(&id));
+            let importance = app.doc.biography(id).map_or(3, |b| b.importance);
+            plan.thickness = bio_thickness(axis.ppy, app.enlarged_biographies.contains(&id), importance);
         }
     }
     let demands =
@@ -1819,8 +1820,17 @@ fn paint_lane_names(
             continue;
         }
         if let LaneKind::Biography(id) = lane.kind {
-            if let Some(bio) = doc.biography(id) {
-                paint_biography_name(p, bio, lane, axis, view_from, view_to, theme, hits);
+            // `lane_active` now also retracts a biography once the zoomed-out
+            // view no longer wants its importance level — previously the
+            // *only* way this lane went dormant was scrolling past its own
+            // lifespan, which `paint_biography_name`'s own view-window check
+            // below already caught on its own, so this check went unneeded
+            // until now: without it, an importance-dormant lane still painted
+            // a name with no band under it.
+            if lane.active {
+                if let Some(bio) = doc.biography(id) {
+                    paint_biography_name(p, bio, lane, axis, view_from, view_to, theme, hits);
+                }
             }
             continue;
         }
@@ -1893,7 +1903,12 @@ fn paint_biography_name(
     let seg_px = (axis.x(to) - axis.x(from)).max(0.0);
     let center = Pos2::new(axis.x((from + to) * 0.5), lane.center);
 
-    let size = if lane.is_nested() { 11.5 } else { 13.5 };
+    // Same per-importance/zoom scale an event's own title uses, so a more
+    // significant life reads at a visibly larger name — an inline biography
+    // (nested under its timeline) stays a touch smaller than one promoted to
+    // its own lane, same as before this took importance into account.
+    let base = label_font_size(bio.importance, axis.ppy);
+    let size = if lane.is_nested() { base - 2.0 } else { base };
     // Neutral text colour — see the comment in `paint_lane_events`; doubly
     // so here, since this name sits directly on top of the band's own fill.
     let color = theme.text;
