@@ -117,6 +117,7 @@ pub fn draw(app: &mut TimelineApp, ui: &mut egui::Ui) {
         &clip, &app.doc, &lanes, content_rect, &axis, view_from, view_to, &theme, &mut hits,
     );
     paint_segment_labels(&clip, &app.doc, &lanes, &centers, &axis, view_from, view_to, &theme);
+    paint_junction_labels(&clip, &app.doc, &lanes, &centers, &axis, view_from, view_to, &theme);
     paint_ruler(&painter, &axis, rect, &theme);
     paint_scroll_indicator(&painter, content_rect, app, &theme);
 
@@ -477,31 +478,79 @@ fn paint_timeline_band(
                 r + 2.0,
                 Stroke::new(1.5, with_alpha(theme.text, 160)),
             );
-            junction_label(p, &j.label, x + r + 5.0, y + r, theme);
         }
     }
-    if let Some(j) = &tl.origin {
-        let jt = j.date.decimal();
-        if jt >= view_from && jt <= view_to {
-            let x = axis.x(jt);
-            let y = band_center_at(tl, lane.center, centers, jt, axis.ppy);
-            junction_label(p, &j.label, x + r + 5.0, y + r, theme);
+    // Junction *labels* are painted in a separate, later pass — see
+    // `paint_junction_labels` — so several timelines merging into a tight
+    // cluster of dates (as at the end of a Successor kingdom, say) can
+    // stagger their labels instead of drawing over one another, and so the
+    // labels always win over an epoch tag crossing the same stretch of band.
+}
+
+/// Never stack more than this many junction labels on top of one another —
+/// several timelines merging within a few years of each other is already an
+/// edge case; beyond this they share the bottom row rather than growing the
+/// gap under the band without bound.
+const JUNCTION_LABEL_MAX_ROWS: usize = 4;
+/// Height of one stacked junction-label row.
+const JUNCTION_LABEL_ROW_HEIGHT: f32 = 16.0;
+
+/// Every visible timeline's origin/merge junction label, in one pass after
+/// everything else — including `paint_segment_labels` — so a junction label
+/// always wins where it would otherwise sit under an epoch tag's opaque
+/// background, and so several timelines merging into a tight cluster of
+/// dates (the end of a Successor kingdom, say) get staggered into their own
+/// rows via a shared `LabelPacker` instead of drawing over one another.
+/// Previously each label sat at a single fixed offset below the band with no
+/// awareness of anything else on screen — reliably too little clearance from
+/// an epoch tag centred on that same band, and no clearance at all from a
+/// second junction landing nearby.
+#[allow(clippy::too_many_arguments)]
+fn paint_junction_labels(
+    p: &egui::Painter,
+    doc: &Document,
+    lanes: &[Lane],
+    centers: &std::collections::HashMap<Id, f32>,
+    axis: &TimeAxis,
+    view_from: f64,
+    view_to: f64,
+    theme: &Theme,
+) {
+    let mut packer = LabelPacker::new();
+    for lane in lanes.iter().filter(|l| l.active) {
+        let LaneKind::Timeline(id) = lane.kind else { continue };
+        let Some(tl) = doc.timeline(id) else { continue };
+        let r = lane.thickness * 0.5;
+        for j in [&tl.merge, &tl.origin].into_iter().flatten() {
+            if j.label.trim().is_empty() {
+                continue;
+            }
+            let jt = j.date.decimal();
+            if jt < view_from || jt > view_to {
+                continue;
+            }
+            let x = axis.x(jt) + r + 5.0;
+            let y_base = band_center_at(tl, lane.center, centers, jt, axis.ppy) + r;
+            junction_label(p, &mut packer, &j.label, x, y_base, theme);
         }
     }
 }
 
-/// Junction labels sit just *below* the band. Centring them on the band put
-/// them straight over the ribbon, where they were unreadable.
-fn junction_label(p: &egui::Painter, label: &str, x: f32, y: f32, theme: &Theme) {
-    if label.trim().is_empty() {
-        return;
-    }
+fn junction_label(p: &egui::Painter, packer: &mut LabelPacker, label: &str, x: f32, y_base: f32, theme: &Theme) {
     let galley = p.layout_no_wrap(
         label.to_owned(),
         FontId::proportional(11.0),
         theme.text_dim,
     );
-    let pos = Pos2::new(x, y + 3.0);
+    let w = galley.size().x;
+    let row = packer
+        .place_rows(x, x + w, 1, JUNCTION_LABEL_MAX_ROWS)
+        .unwrap_or(JUNCTION_LABEL_MAX_ROWS - 1);
+    // The base offset (8px past the band's own edge) is deliberately more
+    // than the old fixed `+3.0` — enough to clear an epoch tag's pill, which
+    // is centred on the band and a couple of pixels taller than the band
+    // itself, rather than just barely touching it.
+    let pos = Pos2::new(x, y_base + 8.0 + row as f32 * JUNCTION_LABEL_ROW_HEIGHT);
     // Fully opaque — a semi-transparent label background lets whatever is
     // behind it (band colour, an event marker scrolled underneath) bleed
     // through and look like a rendering glitch rather than a deliberate
@@ -996,7 +1045,7 @@ fn long_event_slot_height(p: &egui::Painter, doc: &Document, filters: &Filters, 
     let title_w = p.layout_no_wrap(ev.title.clone(), title_font, Color32::WHITE).size().x;
     let title_rows = if title_w <= EVENT_LABEL_MAX_PX { 1.0 } else { 2.0 };
     let bar_h = range_bar_height(ev.importance) + 10.0; // the "has_children" bonus `paint_range` always adds here.
-    title_rows * LABEL_ROW_HEIGHT + 4.0 + nested + bar_h + 9.0 + 6.0
+    title_rows * LABEL_ROW_HEIGHT + TITLE_TO_NESTED_GAP + nested + bar_h + 9.0 + 6.0
 }
 
 /// How much nested-label row space `ev` itself actually needs above its bar:
@@ -1214,8 +1263,13 @@ fn paint_lane_events(
             [Pos2::new(label_x, band_bottom + 2.0), Pos2::new(label_x, lrect.top())],
             Stroke::new(1.0, with_alpha(lane_color, 70)),
         );
+        // Each line centred within the shared block rather than sharing one
+        // left edge — a two-line title rarely wraps into two equal-width
+        // lines, and left-aligning the shorter one under the wider one reads
+        // as off-centre from the marker it belongs to.
         for (i, galley) in line_galleys.into_iter().enumerate() {
-            p.galley(Pos2::new(lx, ly_top + i as f32 * LABEL_ROW_HEIGHT), galley, theme.text);
+            let line_x = lx + (w - galley.size().x) * 0.5;
+            p.galley(Pos2::new(line_x, ly_top + i as f32 * LABEL_ROW_HEIGHT), galley, theme.text);
         }
         hits.push(Hit {
             rect: lrect,
@@ -1309,7 +1363,7 @@ fn paint_long_event(
     // — a long event with just direct children sits closer to its own bar
     // than one whose nesting goes a level deeper, exactly like the slot
     // height above already accounts for.
-    let title_bottom = marker_rect.top() - nested_reservation_for(doc, filters, axis.ppy, ev) - 4.0;
+    let title_bottom = marker_rect.top() - nested_reservation_for(doc, filters, axis.ppy, ev) - TITLE_TO_NESTED_GAP;
     let ly_top = title_bottom - rows_needed as f32 * LABEL_ROW_HEIGHT;
     if ly_top < lane_top - LABEL_ROW_HEIGHT {
         return;
@@ -1327,8 +1381,11 @@ fn paint_long_event(
         [Pos2::new(label_x, y - 2.0), Pos2::new(label_x, lrect.bottom())],
         Stroke::new(1.0, with_alpha(lane_color, 70)),
     );
+    // Each line centred within the shared block — see the identical fix in
+    // `paint_lane_events`.
     for (i, galley) in line_galleys.into_iter().enumerate() {
-        p.galley(Pos2::new(lx, ly_top + i as f32 * LABEL_ROW_HEIGHT), galley, theme.text);
+        let line_x = lx + (w - galley.size().x) * 0.5;
+        p.galley(Pos2::new(line_x, ly_top + i as f32 * LABEL_ROW_HEIGHT), galley, theme.text);
     }
     hits.push(Hit {
         rect: lrect,
@@ -1356,6 +1413,15 @@ const MAX_LABELED_NESTED_DEPTH: usize = 2;
 /// the label is dropped, same as a top-level label that runs out of
 /// `MAX_LABEL_ROWS`.
 const NESTED_LABEL_ROWS_PER_DEPTH: usize = 2;
+/// Gap between a long event's own title and the nested-label block right
+/// below it (or the bar itself, if it has no labelled children at all).
+/// Shared by `long_event_slot_height` (reserving the room) and
+/// `paint_long_event` (placing the title within it) so the two can't drift
+/// apart. A hover tooltip for whatever is on the bar — a nested child's
+/// own name, say — floats independently of this layout and can still land
+/// close by, but a title sitting right on top of its own nested block with
+/// next to no breathing room made an already-tight reading harder still.
+const TITLE_TO_NESTED_GAP: f32 = 10.0;
 
 /// Font size and row height for a nested label at the given depth. A
 /// shallower depth (closer to the parent's own title) reads as a heading
@@ -1488,6 +1554,7 @@ fn paint_nested_events(
                     parent_rect.top(),
                     alpha,
                     depth,
+                    lane_color,
                     theme,
                 );
             }
@@ -1514,7 +1581,18 @@ fn paint_nested_events(
             });
 
             if show_label {
-                nested_child_label(p, &mut label_packer, &child.title, cx, 170.0, parent_rect.top(), alpha, depth, theme);
+                nested_child_label(
+                    p,
+                    &mut label_packer,
+                    &child.title,
+                    cx,
+                    170.0,
+                    parent_rect.top(),
+                    alpha,
+                    depth,
+                    lane_color,
+                    theme,
+                );
             }
         }
     }
@@ -1534,7 +1612,13 @@ fn paint_nested_events(
 /// idea as top-level labels stacking in `LabelPacker` rows, just with a small
 /// fixed cap of its own rather than a lane-height reservation behind it; a
 /// title that still doesn't fit within `NESTED_LABEL_ROWS_PER_DEPTH` is
-/// silently dropped and falls back to the hover tooltip.
+/// silently dropped and falls back to the hover tooltip. A thin leader line
+/// from the label straight down to `top_y` — the same idea `paint_lane_events`
+/// and a long event's own title already use — ties the label back to
+/// whichever marker or segment sits at `anchor_x`; with several siblings
+/// packed close together (a cluster of battles a few years apart, say), the
+/// horizontal centring alone stopped being enough to tell which label
+/// belonged to which dot once labels started stacking into further rows.
 #[allow(clippy::too_many_arguments)]
 fn nested_child_label(
     p: &egui::Painter,
@@ -1545,6 +1629,7 @@ fn nested_child_label(
     top_y: f32,
     alpha: u8,
     depth: usize,
+    lane_color: Color32,
     theme: &Theme,
 ) {
     if name.trim().is_empty() {
@@ -1562,6 +1647,10 @@ fn nested_child_label(
     };
     let offset = nested_label_base_offset(depth) + row as f32 * row_h;
     let pos = Pos2::new(x_min, top_y - galley.size().y - 2.0 - offset);
+    p.line_segment(
+        [Pos2::new(anchor_x, top_y), Pos2::new(anchor_x, pos.y + galley.size().y + 1.0)],
+        Stroke::new(1.0, with_alpha(lane_color, 70)),
+    );
     // Fully opaque — see the comment on `junction_label`'s identical fix.
     p.rect_filled(
         Rect::from_min_size(pos, galley.size()).expand2(Vec2::new(2.0, 1.0)),

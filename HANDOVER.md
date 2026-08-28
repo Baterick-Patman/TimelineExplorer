@@ -1418,6 +1418,142 @@ the accumulated placeholder rows; after, the two bands sit directly
 adjacent and the curve is the short, gentle transition `TRANSITION_PX` was
 always meant to produce.
 
+### Junction labels now stagger and paint last, instead of overlapping an epoch tag or each other
+
+Reported against a screenshot of an epoch tag ("Hellenismus") sitting right
+on top of unreadable, run-together text from several timelines merging into
+the same band at nearby dates (a Successor-kingdom cluster — several wars
+and titles all settling within a few years of each other). Two independent
+bugs, both stemming from `junction_label` (an origin/merge junction's own
+label, e.g. "Untergang der Ptolemaier-Dynastie") having zero awareness of
+anything else on screen:
+
+- It painted at a single fixed offset below the band (`+3.0` past the
+  band's own bottom edge) with no regard for `epoch_segment_label`'s pill,
+  which is centred *on* the band and — at a couple of pixels taller than the
+  band itself — already reaches almost as far past that same edge. 3px of
+  intended clearance was, in practice, close to none.
+- It painted inline from within `paint_timeline_band`, once per timeline,
+  independently of every other timeline's junction label — so two
+  timelines merging into the same target within a few years of each other
+  (exactly the historically common "several Successor kingdoms collapse
+  back into Greece around the same decades" shape) painted their labels at
+  the *same* fixed offset, directly on top of one another.
+
+Fixed by pulling the label-painting half of `junction_label` out of
+`paint_timeline_band` entirely (which still draws the merge-point marker
+circle itself) into a new `paint_junction_labels`, run in its own pass
+after everything else — including `paint_segment_labels` — the same
+"repaint on top, later, so this always wins" pattern `paint_segment_labels`
+itself already uses and documents. Inside that pass, every origin/merge
+label across every active timeline shares one `LabelPacker` (the same
+interval-packing structure used for below-band event labels and long-event
+stacking elsewhere in `canvas.rs`): each label claims a row by its own
+`[x, x+width]` span, so two that would overlap horizontally land on
+different rows (`JUNCTION_LABEL_ROW_HEIGHT` apart, capped at
+`JUNCTION_LABEL_MAX_ROWS` — beyond that, rare, they share the bottom row
+rather than growing the gap under the band without bound) instead of
+drawing over each other. The base offset past the band's edge also grew
+from `3.0` to `8.0`, enough to clear an epoch tag's pill outright rather
+than brushing against it.
+
+Verified with a document reproducing the reported scenario directly: one
+target timeline carrying a wide epoch, and four source timelines merging
+into it within a handful of years of the epoch tag's own on-screen
+position. Before the fix all four junction labels and the epoch tag
+overlapped into unreadable, stacked text; after, the four labels stack
+cleanly into their own rows, clear of the epoch tag above them.
+
+### A nested event's label now has a leader line back to its own marker
+
+Reported against a screenshot of a long event's nested children — several
+battles and political moves a year or two apart, clustered close together
+on the parent's own mini-timeline — where it was impossible to tell which
+floated label belonged to which dot: `nested_child_label` centred a label
+horizontally on its own marker's x, same as always, but with several
+siblings packed close together and `LabelPacker` staggering the crowded
+ones into a second row further from the bar, the horizontal centring alone
+stopped being enough once labels at different heights no longer sat
+directly above their own dot in any visually obvious way. The user's own
+suggested fix — "a box around the text and a line to its dot, connecting
+the two" — was exactly right, and is also exactly what two other label
+types already did elsewhere in the same file
+(`paint_lane_events`'s below-band event labels, and a long event's own
+title) — nested children were simply the one spot that pattern had never
+been extended to.
+
+Fixed by adding the same leader line: a thin `with_alpha(lane_color, 70)`
+stroke from `top_y` (the parent bar's own top edge) straight up to the
+label's bottom edge, at `anchor_x` — the marker's own x, the same point the
+label is already horizontally centred on — so the line and the centring
+now reinforce each other instead of the centring doing all the work alone.
+`nested_child_label` gained a `lane_color` parameter (threaded from its two
+call sites in `paint_nested_events`, which already had it in scope) to draw
+in the same colour the parent's own bar and marker use, tying the three
+together visually.
+
+Verified with a "Peloponnesischer Krieg" reproduction close to the reported
+screenshot: a "Sizilische Expedition" section with four child events within
+a year or two of each other. Before the fix, labels floated above the
+cluster with no way to tell which belonged to which of the closely-spaced
+dots; after, each label — including the section's own title — has a
+visible line running down to exactly the marker or segment it names.
+
+### A wrapped two-line label's second line was left-aligned under the first, not centred on the marker
+
+Reported against a screenshot where a below-band event's title wrapped
+across two lines of very different lengths ("Schaffung zweier neuer
+Prätorenstellen (Provinzen" / "Sicilia und Sardinia et Corsica)") — the
+shorter second line visibly hugged the left edge of the first instead of
+sitting centred under the point it belonged to. Both places that paint a
+wrapped, multi-line label (`paint_lane_events`'s below-band event labels,
+and a long event's own title in `paint_long_event`) computed one shared
+left edge (`lx`, from the *widest* line's width) and painted every line
+starting at that same x — correct for the widest line, since that is
+exactly where centring puts it, but wrong for every shorter line, which
+just inherited the widest line's left edge instead of being centred in its
+own right.
+
+Fixed in both places by keeping `lx`/`w` exactly as they were (the widest
+line still defines the shared bounding box used for the `LabelPacker` claim,
+the selection highlight, and the hit-test rect — all still correct, since
+that box is exactly what the lines collectively occupy once each is
+centred within it) but computing each line's own paint position as
+`lx + (w - line_width) * 0.5` instead of reusing `lx` directly — the same
+one-line change in each of the two loops.
+
+Verified with a reproduction of the exact reported title, plus a long
+event's own two-line title for good measure: both now show their shorter
+second line properly centred under the wider first line and the marker
+below, instead of sharing its left edge.
+
+### A long event's own title sat too close to its nested content to read comfortably
+
+Reported against a screenshot of "2. Römisch-Punischer Krieg" — a long
+event's own title — crowding right up against a nested child's hover
+tooltip just below it, to the point of being hard to read apart. The gap
+between the title and whatever sits right below it (either the nested-label
+block, or the bar itself if the event has no labelled children) was a bare
+`4.0` pixels in both `long_event_slot_height` (sizing the reservation) and
+`paint_long_event` (placing the title within it) — barely more than
+rounding slack, and tight enough that a title with no labelled grandchild
+(so only depth-1's own ~32px block stood between it and the bar) had
+almost no breathing room at all. A hover tooltip floats independently of
+this layout and can still land nearby regardless of any spacing here, but
+a title sitting nearly flush against its own nested block made an already
+tight read even harder.
+
+Fixed by pulling the repeated `4.0` out into one named
+`TITLE_TO_NESTED_GAP = 10.0`, used in both places so the reservation and
+the actual placement can't drift apart — the same "shared constant so two
+call sites can't disagree" pattern `nested_reservation_for` already
+established for the reservation itself.
+
+Verified with a "2. Römisch-Punischer Krieg" reproduction close to the
+reported screenshot (a single nested child, no grandchild, so the tight
+depth-1-only case): the title now sits with visibly more clearance above
+its nested content than before.
+
 ### Table import can nest straight into an existing event, not just onto a timeline's top level
 
 `ImportForm::nest_under: Option<Id>` — when importing Events, an optional
